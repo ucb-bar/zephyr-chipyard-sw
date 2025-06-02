@@ -6,3 +6,7 @@
 	path = third-party/executorch
 	url = git@github.com:ucb-bar/executorch.git
 	branch = zephyr
+[submodule "samples/drone_control/tinympc"]
+	path = samples/drone_control/tinympc
+	url = https://github.com/ucb-bar/Accelerated-TinyMPC
+	branch = zephyr
