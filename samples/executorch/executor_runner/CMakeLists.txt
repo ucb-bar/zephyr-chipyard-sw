@@ -10,7 +10,7 @@ add_compile_definitions(_POSIX_C_SOURCE=200809L)
 add_compile_definitions(__POSIX_VISIBLE=200809L)
 
 find_program(FLATC_EXECUTABLE flatc)
-set(ET_DIR_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third-party/executorch" CACHE PATH "Path to ExecuTorch dir")
+set(ET_DIR_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../third-party/executorch" CACHE PATH "Path to ExecuTorch dir")
 set(ET_BUILD_DIR_PATH "${ET_DIR_PATH}/cmake-out" CACHE PATH "Path to ExecuTorch build dir")
 set(ET_INCLUDE_PATH "${ET_DIR_PATH}/.." CACHE PATH "Path to ExecuTorch headers")
 
