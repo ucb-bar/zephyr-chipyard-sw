@@ -2,7 +2,7 @@
 
 cmake_minimum_required(VERSION 3.20.0)
 
-set(XNNPACK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../third-party/XNNPACK)
+set(XNNPACK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../third-party/XNNPACK)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(xnnpack)
