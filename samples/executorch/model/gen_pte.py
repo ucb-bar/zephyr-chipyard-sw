@@ -11,9 +11,9 @@ from executorch.backends.xnnpack.utils.configs import get_xnnpack_edge_compile_c
 from executorch.exir import EdgeProgramManager, ExecutorchProgramManager, to_edge
 from executorch.exir.backend.backend_api import to_backend
 
-from torchao.quantization.quant_api import Int8DynActInt4WeightQuantizer
+# from torchao.quantization.quant_api import Int8DynActInt4WeightQuantizer
 
-from model import GPT
+# from model import GPT
 from torch.export import export, export_for_training
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
