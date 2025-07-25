@@ -15,6 +15,8 @@ To use this repo, first install the Chipyard Zephyr fork, and then install this 
 ```
 # Create your zephyr workspace
 mkdir zephyr_ws
+cd zephyr_ws
+
 
 # Clone Chipyard's Zephyr fork
 git clone git@github.com:ucb-bar/zephyr.git
