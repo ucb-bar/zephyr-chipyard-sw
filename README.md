@@ -40,6 +40,7 @@ cd -
 git clone git@github.com:ucb-bar/zephyr-chipyard-sw.git
 cd zephyr-chipyard-sw
 git checkout dev
+git submodule update --init
 cd -
 
 ```
@@ -83,9 +84,13 @@ cd -
 cd ./third-party/executorch/backends/xnnpack/third-party/XNNPACK
 # git checkout zephyr
 git checkout e1515295a8fbd3a90a7264facc3703ae5c4463be # TODO have branch name
-./install_requirements.sh --pybind xnnpack # TODO just needs to install python deps, okay if there are CUDA errors
+cd -
+
+cd ./third-party/executorch/
+./install_requirements.sh
 cd -
 ```
+./install_requirements.sh --pybind xnnpack # TODO just needs to install python deps, okay if there are CUDA errors
 
 To test an example using Executorch, inside `zephyr-chipyard-sw`:
 
