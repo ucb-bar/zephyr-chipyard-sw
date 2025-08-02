@@ -1,0 +1,53 @@
+# ============================================================================
+# OBSOLETE: This Makefile is for Linux builds and is NO LONGER USED
+# ============================================================================
+#
+# This project has been converted to use Zephyr RTOS build system.
+# 
+# To build the RVV LQR Riccati implementation:
+#
+#   1. Use the Zephyr build script:
+#      ./build_zephyr.sh
+#
+#   2. Run on Spike simulator:
+#      ./run_spike.sh
+#
+#   3. Or use west directly:
+#      west build -p -b spike_riscv64 .
+#      spike -p4 --isa=rv64gcv_zicntr build/zephyr/zephyr.elf
+#
+# The implementation is now properly integrated with:
+# - Zephyr RTOS kernel
+# - Proper memory management (k_aligned_alloc/k_free)
+# - Zephyr timing subsystem
+# - Console output via printk()
+# - RISC-V Vector Extension support
+#
+# Files structure:
+# - CMakeLists.txt     : Zephyr build configuration
+# - prj.conf           : Project configuration
+# - src/main.cpp       : Zephyr application entry point
+# - build_zephyr.sh    : Build script
+# - run_spike.sh       : Spike execution script
+#
+# ============================================================================
+
+.PHONY: help
+help:
+	@echo "============================================================"
+	@echo "OBSOLETE MAKEFILE - USE ZEPHYR BUILD SYSTEM"
+	@echo "============================================================"
+	@echo ""
+	@echo "This Makefile is obsolete. Use the Zephyr build system:"
+	@echo ""
+	@echo "  Build:  ./build_zephyr.sh"
+	@echo "  Run:    ./run_spike.sh"
+	@echo ""
+	@echo "Or manually:"
+	@echo "  west build -p -b spike_riscv64 ."
+	@echo "  spike -p4 --isa=rv64gcv_zicntr build/zephyr/zephyr.elf"
+	@echo ""
+	@echo "============================================================"
+
+# Redirect all targets to help
+%: help

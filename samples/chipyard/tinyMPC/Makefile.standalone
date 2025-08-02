@@ -1,0 +1,180 @@
+# Makefile for RISC-V RVV LQR Riccati implementations (Standalone versions)
+# Targeted for Chipyard Saturn with RVV support
+# These versions do NOT require external matlib_rvv.h dependency
+
+# Compiler settings for RISC-V with RVV
+CXX = riscv64-unknown-linux-gnu-g++
+CC = riscv64-unknown-linux-gnu-gcc
+
+# RVV and optimization flags
+CXXFLAGS = -march=rv64gcv -mabi=lp64d -O3 -std=c++17
+CFLAGS = -march=rv64gcv -mabi=lp64d -O3 -std=c99
+
+# Include paths (minimal dependencies)
+INCLUDES = -I. -I../../../kris/matlib/include
+
+# Library paths (adjust as needed for your system)
+LIBPATH = -L../../../kris/matlib/lib
+
+# Libraries (minimal - only gemmini and math)
+LIBS = -lm -lgemmini
+
+# Source files (standalone versions)
+SOURCES_RVV_STANDALONE = lqr_riccati_rvv_standalone.cpp
+SOURCES_RVV_BASIC_STANDALONE = lqr_riccati_rvv_basic_standalone.cpp
+SOURCES_ORIG = lqr_riccati.cpp
+
+# Object files
+OBJECTS_RVV_STANDALONE = $(SOURCES_RVV_STANDALONE:.cpp=.o)
+OBJECTS_RVV_BASIC_STANDALONE = $(SOURCES_RVV_BASIC_STANDALONE:.cpp=.o)
+OBJECTS_ORIG = $(SOURCES_ORIG:.cpp=.o)
+
+# Executables
+TARGET_RVV_STANDALONE = lqr_riccati_rvv_standalone
+TARGET_RVV_BASIC_STANDALONE = lqr_riccati_rvv_basic_standalone
+TARGET_ORIG = lqr_riccati_orig
+
+# Default target
+all: $(TARGET_RVV_STANDALONE) $(TARGET_RVV_BASIC_STANDALONE) $(TARGET_ORIG)
+
+# RVV optimized standalone implementation
+$(TARGET_RVV_STANDALONE): $(OBJECTS_RVV_STANDALONE)
+	$(CXX) $(CXXFLAGS) $(OBJECTS_RVV_STANDALONE) -o $@ $(LIBPATH) $(LIBS)
+
+# RVV basic standalone implementation
+$(TARGET_RVV_BASIC_STANDALONE): $(OBJECTS_RVV_BASIC_STANDALONE)
+	$(CXX) $(CXXFLAGS) $(OBJECTS_RVV_BASIC_STANDALONE) -o $@ $(LIBPATH) $(LIBS)
+
+# Original implementation (for comparison)
+$(TARGET_ORIG): $(OBJECTS_ORIG)
+	$(CXX) $(CXXFLAGS) $(OBJECTS_ORIG) -o $@ $(LIBPATH) $(LIBS) -leigen3
+
+# Pattern rule for C++ files
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# Clean build artifacts
+clean:
+	rm -f $(OBJECTS_RVV_STANDALONE) $(OBJECTS_RVV_BASIC_STANDALONE) $(OBJECTS_ORIG)
+	rm -f $(TARGET_RVV_STANDALONE) $(TARGET_RVV_BASIC_STANDALONE) $(TARGET_ORIG)
+
+# Run all implementations and compare
+run_all: $(TARGET_RVV_STANDALONE) $(TARGET_RVV_BASIC_STANDALONE) $(TARGET_ORIG)
+	@echo "Running RVV optimized standalone implementation:"
+	./$(TARGET_RVV_STANDALONE) > results_rvv_standalone.csv
+	@echo "Running RVV basic standalone implementation:"
+	./$(TARGET_RVV_BASIC_STANDALONE) > results_rvv_basic_standalone.csv
+	@echo "Running original implementation:"
+	./$(TARGET_ORIG) > results_orig.csv
+	@echo "Results saved to results_*.csv files"
+
+# Performance comparison
+perf_compare: run_all
+	@echo "Performance comparison (cycles):"
+	@echo "Implementation,Average_Cycles"
+	@echo "RVV_Standalone,$(shell tail -n +2 results_rvv_standalone.csv | cut -d',' -f4 | awk '{sum+=$$1} END {print sum/NR}')"
+	@echo "RVV_Basic_Standalone,$(shell tail -n +2 results_rvv_basic_standalone.csv | cut -d',' -f4 | awk '{sum+=$$1} END {print sum/NR}')"
+	@echo "Original,$(shell tail -n +2 results_orig.csv | cut -d',' -f4 | awk '{sum+=$$1} END {print sum/NR}')"
+
+# Quick test - just build and run optimized standalone
+quick_test: $(TARGET_RVV_STANDALONE)
+	@echo "Running quick test with optimized standalone implementation:"
+	./$(TARGET_RVV_STANDALONE)
+
+# Install dependencies (minimal for standalone)
+install_deps:
+	@echo "Minimal dependencies for standalone versions:"
+	@echo "1. RISC-V toolchain with RVV support"
+	@echo "2. Gemmini library and headers"
+	@echo "3. riscv_vector.h header file"
+	@echo ""
+	@echo "NOT REQUIRED for standalone versions:"
+	@echo "- matlib_rvv library"
+	@echo "- Eigen3 library (except for comparison with original)"
+
+# Debug build
+debug: CXXFLAGS += -g -DDEBUG
+debug: $(TARGET_RVV_STANDALONE)
+
+# Test compilation only (no execution)
+compile_test: all
+	@echo "All standalone implementations compiled successfully!"
+	@ls -la $(TARGET_RVV_STANDALONE) $(TARGET_RVV_BASIC_STANDALONE)
+
+# Verify RVV instructions are being used
+check_rvv: $(OBJECTS_RVV_STANDALONE)
+	@echo "Checking for RVV instructions in object files:"
+	@objdump -d $(OBJECTS_RVV_STANDALONE) | grep -E "(vle|vse|vfmacc|vfadd|vfmul)" | head -10 || echo "No RVV instructions found (may be optimized away)"
+
+# Memory alignment test
+test_alignment: $(TARGET_RVV_STANDALONE)
+	@echo "Testing memory alignment requirements:"
+	@echo "Running with memory allocation debugging..."
+	@valgrind --tool=memcheck --leak-check=full ./$(TARGET_RVV_STANDALONE) 2>/dev/null || echo "Valgrind not available"
+
+# Size comparison
+size_compare: all
+	@echo "Executable sizes:"
+	@echo "Implementation,Size_KB"
+	@echo "RVV_Standalone,$(shell stat -c%s $(TARGET_RVV_STANDALONE) | awk '{print int($$1/1024)}')"
+	@echo "RVV_Basic_Standalone,$(shell stat -c%s $(TARGET_RVV_BASIC_STANDALONE) | awk '{print int($$1/1024)}')"
+	@echo "Original,$(shell stat -c%s $(TARGET_ORIG) | awk '{print int($$1/1024)}' 2>/dev/null || echo 'N/A')"
+
+# Profile guided optimization
+pgo_build: clean
+	$(MAKE) CXXFLAGS="$(CXXFLAGS) -fprofile-generate" $(TARGET_RVV_STANDALONE)
+	./$(TARGET_RVV_STANDALONE) > /dev/null
+	$(MAKE) clean
+	$(MAKE) CXXFLAGS="$(CXXFLAGS) -fprofile-use" $(TARGET_RVV_STANDALONE)
+	@echo "Profile-guided optimization build complete"
+
+# Static analysis
+static_analysis: $(SOURCES_RVV_STANDALONE) $(SOURCES_RVV_BASIC_STANDALONE)
+	@echo "Running static analysis:"
+	@cppcheck --enable=all --std=c++17 $(SOURCES_RVV_STANDALONE) $(SOURCES_RVV_BASIC_STANDALONE) 2>/dev/null || echo "cppcheck not available"
+
+# Documentation
+docs:
+	@echo "Standalone RVV LQR Riccati Implementation"
+	@echo "========================================="
+	@echo ""
+	@echo "This implementation includes all necessary RVV matrix operations"
+	@echo "directly in the source files, eliminating dependencies on:"
+	@echo "- matlib_rvv.h"
+	@echo "- External matrix libraries"
+	@echo ""
+	@echo "Key features:"
+	@echo "- Self-contained RVV matrix operations"
+	@echo "- Optimized memory management"
+	@echo "- Tiled matrix multiplication"
+	@echo "- Vectorized add/subtract/copy operations"
+	@echo "- Matrix transpose using RVV strided loads"
+	@echo ""
+	@echo "Targets:"
+	@echo "  $(TARGET_RVV_STANDALONE)      - Optimized implementation"
+	@echo "  $(TARGET_RVV_BASIC_STANDALONE) - Basic implementation"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make quick_test    - Build and run optimized version"
+	@echo "  make run_all       - Run all implementations"
+	@echo "  make perf_compare  - Compare performance"
+
+# Help target
+help: docs
+	@echo ""
+	@echo "Available targets:"
+	@echo "  all                - Build all implementations"
+	@echo "  $(TARGET_RVV_STANDALONE)    - Build optimized standalone"
+	@echo "  $(TARGET_RVV_BASIC_STANDALONE) - Build basic standalone"
+	@echo "  quick_test         - Build and run optimized version"
+	@echo "  run_all            - Run all implementations"
+	@echo "  perf_compare       - Compare performance"
+	@echo "  compile_test       - Test compilation only"
+	@echo "  check_rvv          - Verify RVV instructions"
+	@echo "  size_compare       - Compare executable sizes"
+	@echo "  clean              - Clean build artifacts"
+	@echo "  debug              - Build with debug symbols"
+	@echo "  help               - Show this help"
+
+.PHONY: all clean run_all perf_compare install_deps debug help quick_test
+.PHONY: compile_test check_rvv test_alignment size_compare pgo_build static_analysis docs

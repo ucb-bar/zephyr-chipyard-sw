@@ -1,0 +1,103 @@
+# Makefile for RISC-V RVV LQR Riccati implementations
+# Targeted for Chipyard Saturn with RVV support
+
+# Compiler settings for RISC-V with RVV
+CXX = riscv64-unknown-linux-gnu-g++
+CC = riscv64-unknown-linux-gnu-gcc
+
+# RVV and optimization flags
+CXXFLAGS = -march=rv64gcv -mabi=lp64d -O3 -std=c++17
+CFLAGS = -march=rv64gcv -mabi=lp64d -O3 -std=c99
+
+# Include paths
+INCLUDES = -I. -I../../../kris/matlib/include/float32 -I../../../kris/matlib/include
+
+# Library paths (adjust as needed for your system)
+LIBPATH = -L../../../kris/matlib/lib
+
+# Libraries
+LIBS = -lm -lgemmini
+
+# Source files
+SOURCES_RVV = lqr_riccati_rvv.cpp
+SOURCES_RVV_OPT = lqr_riccati_rvv_optimized.cpp
+SOURCES_ORIG = lqr_riccati.cpp
+
+# Object files
+OBJECTS_RVV = $(SOURCES_RVV:.cpp=.o)
+OBJECTS_RVV_OPT = $(SOURCES_RVV_OPT:.cpp=.o)
+OBJECTS_ORIG = $(SOURCES_ORIG:.cpp=.o)
+
+# Executables
+TARGET_RVV = lqr_riccati_rvv
+TARGET_RVV_OPT = lqr_riccati_rvv_optimized
+TARGET_ORIG = lqr_riccati_orig
+
+# Default target
+all: $(TARGET_RVV) $(TARGET_RVV_OPT) $(TARGET_ORIG)
+
+# RVV basic implementation
+$(TARGET_RVV): $(OBJECTS_RVV)
+	$(CXX) $(CXXFLAGS) $(OBJECTS_RVV) -o $@ $(LIBPATH) $(LIBS)
+
+# RVV optimized implementation
+$(TARGET_RVV_OPT): $(OBJECTS_RVV_OPT)
+	$(CXX) $(CXXFLAGS) $(OBJECTS_RVV_OPT) -o $@ $(LIBPATH) $(LIBS)
+
+# Original implementation (for comparison)
+$(TARGET_ORIG): $(OBJECTS_ORIG)
+	$(CXX) $(CXXFLAGS) $(OBJECTS_ORIG) -o $@ $(LIBPATH) $(LIBS) -leigen3
+
+# Pattern rule for C++ files
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# Clean build artifacts
+clean:
+	rm -f $(OBJECTS_RVV) $(OBJECTS_RVV_OPT) $(OBJECTS_ORIG)
+	rm -f $(TARGET_RVV) $(TARGET_RVV_OPT) $(TARGET_ORIG)
+
+# Run all implementations and compare
+run_all: $(TARGET_RVV) $(TARGET_RVV_OPT) $(TARGET_ORIG)
+	@echo "Running RVV basic implementation:"
+	./$(TARGET_RVV) > results_rvv.csv
+	@echo "Running RVV optimized implementation:"
+	./$(TARGET_RVV_OPT) > results_rvv_opt.csv
+	@echo "Running original implementation:"
+	./$(TARGET_ORIG) > results_orig.csv
+	@echo "Results saved to results_*.csv files"
+
+# Performance comparison
+perf_compare: run_all
+	@echo "Performance comparison (cycles):"
+	@echo "Implementation,Average_Cycles"
+	@echo "RVV_Basic,$(shell tail -n +2 results_rvv.csv | cut -d',' -f4 | awk '{sum+=$$1} END {print sum/NR}')"
+	@echo "RVV_Optimized,$(shell tail -n +2 results_rvv_opt.csv | cut -d',' -f4 | awk '{sum+=$$1} END {print sum/NR}')"
+	@echo "Original,$(shell tail -n +2 results_orig.csv | cut -d',' -f4 | awk '{sum+=$$1} END {print sum/NR}')"
+
+# Install dependencies (if needed)
+install_deps:
+	@echo "Make sure you have:"
+	@echo "1. RISC-V toolchain with RVV support"
+	@echo "2. Eigen3 library for original implementation"
+	@echo "3. Gemmini library and headers"
+	@echo "4. matlib_rvv library compiled"
+
+# Debug build
+debug: CXXFLAGS += -g -DDEBUG
+debug: $(TARGET_RVV_OPT)
+
+# Help target
+help:
+	@echo "Available targets:"
+	@echo "  all          - Build all implementations"
+	@echo "  $(TARGET_RVV) - Build basic RVV implementation"
+	@echo "  $(TARGET_RVV_OPT) - Build optimized RVV implementation"
+	@echo "  $(TARGET_ORIG) - Build original Eigen implementation"
+	@echo "  run_all      - Run all implementations and save results"
+	@echo "  perf_compare - Compare performance of all implementations"
+	@echo "  clean        - Clean build artifacts"
+	@echo "  debug        - Build optimized version with debug symbols"
+	@echo "  help         - Show this help message"
+
+.PHONY: all clean run_all perf_compare install_deps debug help
