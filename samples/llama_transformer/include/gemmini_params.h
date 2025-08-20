@@ -14,7 +14,7 @@
 #define MAX_BLOCK_LEN (MAX_BYTES/(DIM*2))
 #define MAX_BLOCK_LEN_ACC (MAX_BYTES/(DIM*4))
 
-typedef _Float16 elem_t;
+typedef uint16_t elem_t;
 #define ELEM_T_IS_LOWPREC_FLOAT
 static const float elem_t_max = 65504.0;
 static const float elem_t_min = -65504.0;
@@ -43,9 +43,13 @@ typedef uint32_t acc_scale_t_bits;
 #define row_align(blocks) __attribute__((aligned(blocks*DIM*sizeof(elem_t))))
 #define row_align_acc(blocks) __attribute__((aligned(blocks*DIM*sizeof(acc_t))))
 
-#define MVIN_SCALE_IDENTITY 1.0
+static inline uint16_t f16_bits(_Float16 x) {
+    union { _Float16 f; uint16_t u; } v; v.f = x; return v.u;
+}
 
+#define MVIN_SCALE_IDENTITY 1.0
 #define ACC_SCALE_IDENTITY 1.0
+
 
 #define ROUNDING_RIGHT_SHIFT(x, shift) \
     ((x) / (1 << (shift)))
