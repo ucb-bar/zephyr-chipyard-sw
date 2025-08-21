@@ -9,10 +9,17 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/timing/timing.h>
 #include <zephyr/sys/atomic.h>
 #include <string.h>
 #include "admm.hpp"
 #include "problem_data/quadrotor_50hz_params_constrained.hpp"
+// #include "problem_data/quadrotor_50hz_params_custom.hpp"
+// #include "problem_data/quadrotor_50hz_params_wide.hpp"
+// #include "problem_data/quadrotor_50hz_params_hawk.hpp"
+// #include "problem_data/quadrotor_50hz_params_racer.hpp"
+// #include "problem_data/quadrotor_50hz_params_custom_tweak.hpp"
+// #include "problem_data/quadrotor_50hz_params.hpp"
 #include "glob_opts.hpp"
 
 #define NUM_DRONES    4
@@ -49,7 +56,7 @@ struct DroneTask {
 static struct DroneTask drone_tasks[NUM_DRONES];
 
 /* Helper: send binary response [HEADER][id][4 floats] */
-static void send_response(uint8_t id, float *u)
+static void send_response(uint8_t id, float *u, uint32_t ns)
 {
     k_mutex_lock(&uart_mutex, K_FOREVER);
     for (int i = 0; i < 4; i++) {
@@ -62,6 +69,9 @@ static void send_response(uint8_t id, float *u)
             uart_poll_out(uart0, pb[b]);
         }
     }
+    /* 4-byte int32 ns (little-endian) */
+    uint8_t *ns_bytes = (uint8_t *)&ns;
+    for (int b = 0; b < sizeof(ns); b++) uart_poll_out(uart0, ns_bytes[b]);
     k_mutex_unlock(&uart_mutex);
 }
 
@@ -107,6 +117,17 @@ void drone_worker(void *id_ptr, void *, void *)
 
     matset(work->u_min.data, -0.583, work->u_min.outer, work->u_min.inner);
     matset(work->u_max.data, 1 - 0.583, work->u_max.outer, work->u_max.inner);
+
+    // HAWK
+    matset(work->u_min.data, -0.0625, work->u_min.outer, work->u_min.inner);
+    matset(work->u_max.data, 1 - 0.0625, work->u_max.outer, work->u_max.inner);
+
+    // // RACER
+    // matset(work->u_min.data, -0.2398f,
+    //    work->u_min.outer, work->u_min.inner);
+    // matset(work->u_max.data,  0.7602f,
+    //    work->u_max.outer, work->u_max.inner);
+
     matset(work->x_min.data, -5, work->x_min.outer, work->x_min.inner);
     matset(work->x_max.data, 5, work->x_max.outer, work->x_max.inner);
 
@@ -118,8 +139,13 @@ void drone_worker(void *id_ptr, void *, void *)
     /* Worker loop: wait for new_state event */
     float current_state[NSTATES];
     // send_response((uint8_t)id, work->u.vector[0]);
+
+    volatile timing_t start_counter, end_counter;
+    uint64_t cycles;
+    uint32_t ns;
     while (1) {
         /* spin until a new state arrives */
+        // DISABLE fow power meas
         while (atomic_cas(&drone_tasks[id].new_state, 1, 0) != 1) {
             // k_yield();
         }
@@ -130,14 +156,23 @@ void drone_worker(void *id_ptr, void *, void *)
         matsetv(work->x.vector[0], current_state, 1, NSTATES);
         matset(work->y.data, 0.0, work->y.outer, work->y.inner);
         matset(work->g.data, 0.0, work->g.outer, work->g.inner);
+
+        start_counter = timing_counter_get();
         tiny_solve(solver);
+        end_counter = timing_counter_get();
+        
+        cycles = timing_cycles_get(&start_counter, &end_counter);
+        ns = (uint32_t) timing_cycles_to_ns(cycles);
+
         float u_out[NACTIONS];
         for (int i = 0; i < NACTIONS; i++) {
             u_out[i] = work->u.vector[0][i];
         }
-        send_response((uint8_t)id, u_out);
+        send_response((uint8_t)id, u_out, ns);
     }
 }
+
+    unsigned long start_rd, end_rd, cycles_rd;
 
 /* Spawn worker threads (suspended), then pin, then start */
 static void spawn_drone_workers(void)
@@ -148,7 +183,7 @@ static void spawn_drone_workers(void)
             &drone_threads[i], drone_stacks[i], STACK_SIZE,
             drone_worker, (void *)(uintptr_t)i, NULL, NULL,
             K_PRIO_PREEMPT(1), 0, K_FOREVER);
-        k_thread_cpu_pin(drone_thread_ids[i], (i + 4) % CONFIG_MP_MAX_NUM_CPUS);
+        k_thread_cpu_pin(drone_thread_ids[i], (i + 5) % CONFIG_MP_MAX_NUM_CPUS);
     }
     for (int i = 0; i < NUM_DRONES; i++) {
         k_thread_start(drone_thread_ids[i]);
@@ -161,6 +196,11 @@ int main(void)
         return -1;
     }
     k_mutex_init(&uart_mutex);
+    enable_vector_operations();
+    //initialize atomics
+    for (int i = 0; i < NUM_DRONES; i++) {
+        atomic_set(&drone_tasks[i].new_state, 0);
+    }
     spawn_drone_workers();
 
     size_t match_idx = 0;
