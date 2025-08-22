@@ -10,3 +10,6 @@
 	path = samples/drone_control/tinympc
 	url = https://github.com/ucb-bar/Accelerated-TinyMPC
 	branch = zephyr
+[submodule "zephyr_ws/zephyr"]
+	path = zephyr_ws/zephyr
+	url = https://github.com/ucb-bar/zephyr.git
