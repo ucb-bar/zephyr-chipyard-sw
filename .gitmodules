@@ -13,3 +13,9 @@
 [submodule "zephyr_ws/zephyr"]
 	path = zephyr_ws/zephyr
 	url = https://github.com/ucb-bar/zephyr.git
+[submodule "tools/pyuartsi"]
+	path = tools/pyuartsi
+	url = https://github.com/ucb-bar/pyuartsi.git
+[submodule "tools/gym-pybullet-drones"]
+	path = tools/gym-pybullet-drones
+	url = https://github.com/utiasDSL/gym-pybullet-drones.git
