@@ -19,3 +19,9 @@
 [submodule "tools/gym-pybullet-drones"]
 	path = tools/gym-pybullet-drones
 	url = https://github.com/utiasDSL/gym-pybullet-drones.git
+[submodule "tools/riscv-gnu-toolchain"]
+	path = tools/riscv-gnu-toolchain
+	url = https://github.com/riscv/riscv-gnu-toolchain
+[submodule "tools/picolibc"]
+	path = tools/picolibc
+	url = https://github.com/picolibc/picolibc.git
