@@ -4,7 +4,8 @@ import struct
 from serial import Serial
 
 # ==== CONFIG ====
-PORT       = "/dev/ttyUSB1"
+# PORT       = "/dev/ttyUSB1"
+PORT = "/dev/serial/by-id/usb-FTDI_Dual_RS232-HS-if01-port0"
 BAUDRATE   = 115200
 HEADER     = b'\xDE\xAD\xBE\xEF'
 NSTATES    = 12  # floats per drone state
