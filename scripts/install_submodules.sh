@@ -8,7 +8,7 @@
 pip3 install west pyelftools rich
 
 # Init submodules
-git submodule update --init
+git submodule update --init ./tools/
 pip3 install ./tools/pyuartsi
 pip3 install -e ./tools/gym-pybullet-drones
 
