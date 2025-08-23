@@ -1,14 +1,19 @@
 #!/bin/bash
 
 # Create a conda environment
-# conda create -yn zephyr python=3.12
-# conda activate zephyr
+conda create -yn zephyr python=3.12
+conda activate zephyr
 
 # install the west dependencies
 pip3 install west pyelftools rich
 
 # Init submodules
-git submodule update --init ./tools/
+git submodule update --init ./tools/pyuartsi
+git submodule update --init ./tools/gym-pybullet-drones
+git submodule update --init ./tools/picolibc
+git submodule update --init ./tools/riscv-gnu-toolchain
+git submodule update --init ./zephyr_ws/zephyr
+
 pip3 install ./tools/pyuartsi
 pip3 install -e ./tools/gym-pybullet-drones
 
