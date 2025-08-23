@@ -119,8 +119,8 @@ void drone_worker(void *id_ptr, void *, void *)
     matset(work->u_max.data, 1 - 0.583, work->u_max.outer, work->u_max.inner);
 
     // HAWK
-    matset(work->u_min.data, -0.0625, work->u_min.outer, work->u_min.inner);
-    matset(work->u_max.data, 1 - 0.0625, work->u_max.outer, work->u_max.inner);
+    // matset(work->u_min.data, -0.0625, work->u_min.outer, work->u_min.inner);
+    // matset(work->u_max.data, 1 - 0.0625, work->u_max.outer, work->u_max.inner);
 
     // // RACER
     // matset(work->u_min.data, -0.2398f,
