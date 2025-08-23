@@ -13,7 +13,8 @@ from gym_pybullet_drones.utils.enums import DroneModel, Physics
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.utils.utils import str2bool
 
-UART_PORT = "/dev/ttyUSB1"
+# UART_PORT = "/dev/ttyUSB1"
+UART_PORT = "/dev/serial/by-id/usb-FTDI_Dual_RS232-HS-if01-port0"
 BAUDRATE = 115200
 HEADER = b'\xDE\xAD\xBE\xEF'
 NSTATES = 12
@@ -34,18 +35,19 @@ def extract_state_inputs(obs):
     dphi, dtheta, dpsi = obs[13], obs[14], obs[15]
     return [x, y, z, r1, r2, r3, vx, vy, vz, dphi, dtheta, dpsi]
 
-# def calculate_rpm(env, normalized_thrusts):
-#     max_thrust_N = 0.58 / 4
-#     actual = (normalized_thrusts + 0.583) * max_thrust_N
-#     return np.sqrt(np.clip(actual, 0, None) / env.KF)
-# HAWK
 def calculate_rpm(env, normalized_thrusts):
-    max_thrust_N = 3 * 0.58 / 4
-    # max_thrust_N = 6.96 * 0.58 / 4
-    # max_thrust_N = 1720 / 4
-    # actual = (normalized_thrusts + 0.0625) * max_thrust_N
-    actual = (normalized_thrusts + 0.03) * max_thrust_N
+    max_thrust_N = 0.58 / 4
+    actual = (normalized_thrusts + 0.583) * max_thrust_N
     return np.sqrt(np.clip(actual, 0, None) / env.KF)
+    
+# HAWK
+# def calculate_rpm(env, normalized_thrusts):
+#     max_thrust_N = 3 * 0.58 / 4
+#     # max_thrust_N = 6.96 * 0.58 / 4
+#     # max_thrust_N = 1720 / 4
+#     # actual = (normalized_thrusts + 0.0625) * max_thrust_N
+#     actual = (normalized_thrusts + 0.03) * max_thrust_N
+#     return np.sqrt(np.clip(actual, 0, None) / env.KF)
 
 class TinyMPCSerialInterface:
     def __init__(self, port, baudrate=BAUDRATE, timeout=0, debug=True):

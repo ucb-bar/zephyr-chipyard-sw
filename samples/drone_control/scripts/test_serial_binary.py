@@ -4,7 +4,8 @@ import struct
 import sys
 
 # ==== CONFIGURE THIS ====
-PORT      = "/dev/ttyUSB1"  # Update for your board
+# PORT      = "/dev/ttyUSB1"  # Update for your board
+PORT = "/dev/serial/by-id/usb-FTDI_Dual_RS232-HS-if01-port0"
 BAUDRATE  = 115200
 HEADER    = b'\xDE\xAD\xBE\xEF'  # 4-byte packet marker; change as needed
 HDR_LEN   = len(HEADER)
