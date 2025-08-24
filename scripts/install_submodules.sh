@@ -7,6 +7,9 @@ conda activate zephyr
 # install the west dependencies
 pip3 install west pyelftools rich
 
+# install the plotting dependencies
+pip3 install matplotlib
+
 # Init submodules
 git submodule update --init ./tools/pyuartsi
 git submodule update --init ./tools/gym-pybullet-drones
@@ -28,6 +31,7 @@ git submodule update --init --recursive samples/drone_control
 
 # create data directories
 mkdir -p data
+mkdir -p results
 
 
 # TODO set user permissions
