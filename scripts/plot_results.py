@@ -156,6 +156,7 @@ def plot_summary(directories,
     d_rvv    = rvv_dirs[0]
 
     FREQ_MHZ = 100.0
+    SIM_SCALING = 0.2
     diffs    = ["easy", "medium", "hard"]
     colors   = {"easy": "green", "medium": "blue", "hard": "red"}
 
@@ -179,6 +180,8 @@ def plot_summary(directories,
                     else:
                         ns = arr
                 ns = np.asarray(ns)
+                ns = ns * SIM_SCALING
+                
                 if ns.size:
                     valid = ns[ns >= 0]
                     if valid.size:
