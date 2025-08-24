@@ -128,6 +128,7 @@ if __name__=="__main__":
                         help="MP4 output path (optional)")
     args = parser.parse_args()
 
+    os.makedirs(os.path.dirname(args.video_out), exist_ok=True)
     replay_log(
         args.log_file,
         drone_model=args.drone,
