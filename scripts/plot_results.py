@@ -9,11 +9,9 @@ import json
 import matplotlib
 matplotlib.use("Agg")   # headless backend
 
-from matplotlib.ticker import MaxNLocator
+import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 from matplotlib.lines import Line2D
-
-
 
 power_data = {
     "scalar": {
@@ -43,25 +41,8 @@ power_data = {
 }
 
 directories = [
-    "data/full/data_ideal",
-    "data/full/data_scalar_50mhz",
-    "data/full/data_scalar_75mhz",
-    "data/full/data_scalar_100mhz",
-    "data/full/data_scalar_125mhz", 
-    "data/full/data_scalar_150mhz", 
-    "data/full/data_scalar_200mhz", 
-    "data/full/data_scalar_250mhz", 
-    "data/full/data_scalar_375mhz", 
-    "data/full/data_scalar_500mhz", 
-    "data/full/data_rvv_handopt_50mhz",
-    "data/full/data_rvv_handopt_75mhz",
-    "data/full/data_rvv_handopt_100mhz", 
-    "data/full/data_rvv_handopt_125mhz", 
-    "data/full/data_rvv_handopt_150mhz", 
-    "data/full/data_rvv_handopt_200mhz", 
-    "data/full/data_rvv_handopt_250mhz", 
-    "data/full/data_rvv_handopt_375mhz", 
-    "data/full/data_rvv_handopt_500mhz", 
+    "data/scalar", 
+    "data/rvv", 
 ]
 
 def trajectory_passed(data,
@@ -148,297 +129,174 @@ def compute_avg_power(directory,
 
     return results
 
-
 def plot_summary(directories,
                  power_data,
                  hover_rpm=14000,
                  hover_power=1.25,
                  max_rpm=21702,
-                 outdir="results/fig16",
-                 outfile="fig16.png"):
+                 outdir="results/hil-results",
+                 outfile="hil-results.png"):
     """
-    Three‐panel figure:
-      (a) median solve time ± IQR vs frequency
-      (b) successful trajectories vs frequency (scalar/vector + ideal)
-      (c) total power vs frequency with shaded gap + ideal baselines
-    
-    A shared legend is placed below all subplots. All text is scaled
-    by a common `font_scale` factor for easy resizing.
+    Two groups on x-axis: Scalar and RVV (100 MHz).
+    Within each group, three bars: Easy (green), Medium (blue), Hard (red).
+    Subplots:
+      (a) median solve time (ms) with IQR error bars
+      (b) successful trajectories
+      (c) total power (W) = actuator(diff) + CPU(100 MHz)
     """
-    # --- font scaling ---
-    font_scale    = 1.5
-    base_fs       = plt.rcParams.get('font.size', 12)
-    big_fs        = base_fs * font_scale
-
-    # --- ideal actuator‐only baseline ---
-    ideal_dirs = [d for d in directories if 'ideal' in d]
-    if not ideal_dirs:
-        raise ValueError("No 'ideal' directory found")
-    ideal_avg = compute_avg_power(ideal_dirs[0],
-                                  hover_rpm, hover_power, max_rpm)
-
-    # --- parse directories for (dir, freq(MHz), impl) ---
-    # Example matches: "_400mhz_", "_400mhz", "_400.0mhz_", "_400.0mhz"
-    mhz_re = re.compile(r'_(\d+(?:\.\d+)?)mhz(?:_|$)', re.IGNORECASE)
-
-    impls = []
-    freqs = set()
-    for d in directories:
-        if 'ideal' in d:
-            continue
-        if 'scalar' in d:
-            meas = 'scalar'
-        elif 'rvv_handopt' in d:
-            meas = 'vector'
-        else:
-            continue
-
-        m = mhz_re.search(d)
-        if not m:
-            # Skip if we can't parse MHz from the directory name
-            continue
-
-        freq = float(m.group(1))  # already MHz; no scale division now
-        impls.append((d, freq, meas))
-        freqs.add(freq)
-
-    freqs = sorted(freqs)
-    diffs  = ['easy','medium','hard']
-    colors = {'easy':'green','medium':'blue','hard':'red'}
-
-    # --- 1) ideal pass counts + actual pass counts ---
-    ideal_dir = ideal_dirs[0]
-    ideal_pass_counts = {}
-    for diff in diffs:
-        cnt = 0
-        for fn in os.listdir(ideal_dir):
-            if fn.startswith(diff + '_') and fn.endswith('.npy'):
-                if trajectory_passed_file(os.path.join(ideal_dir, fn)):
-                    cnt += 1
-        ideal_pass_counts[diff] = cnt
-
-    pass_counts = {meas:{diff:[] for diff in diffs}
-                   for meas in ('scalar','vector')}
-    for freq in freqs:
-        for meas in ('scalar','vector'):
-            ds = [d for d,f,m in impls if m==meas and f==freq]
-            for diff in diffs:
-                cnt = 0
-                for d in ds:
-                    for fn in os.listdir(d):
-                        if fn.startswith(diff + '_') and fn.endswith('.npy'):
-                            if trajectory_passed_file(os.path.join(d, fn)):
-                                cnt += 1
-                pass_counts[meas][diff].append(cnt)
-
-    # --- 2) solve‐time quantiles (ms) ---
-    solve_stats = {(meas, diff): []
-                   for meas in ('scalar','vector') for diff in diffs}
-    for d, freq, meas in impls:
-        for diff in diffs:
-            all_ns = []
-            for fn in os.listdir(d):
-                if not fn.startswith(diff + '_') or not fn.endswith('.npy'):
-                    continue
-                data = np.load(os.path.join(d, fn), allow_pickle=False)
-                valid = data['ns'][data['ns'] >= 0]
-                if valid.size:
-                    all_ns.append(valid)
-            if not all_ns:
-                continue
-            all_ns = np.concatenate(all_ns) * 1e-6  # ms
-            all_ns = all_ns * 0.2 # apply time scale
-            q1, med, q3 = np.percentile(all_ns, [25,50,75])
-            solve_stats[(meas, diff)].append((freq, med, q1, q3))
-
-    # --- 3) total power (actuator + CPU) ---
-    power_tot = {(meas, diff): []
-                 for meas in ('scalar','vector') for diff in diffs}
-    for d, freq, meas in impls:
-        cpu_map = power_data.get(meas, {})
-        cpu_p   = cpu_map.get(freq)
-        if cpu_p is None:
-            continue
-        ap = compute_avg_power(d, hover_rpm, hover_power, max_rpm)
-        for diff in diffs:
-            act_p = ap[diff]
-            if np.isnan(act_p):
-                continue
-            power_tot[(meas, diff)].append((freq, act_p + cpu_p))
-
-    # --- build figure & axes ---
-    # fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(9, 12), sharex=True)
-    fig, (ax1, ax2, ax3) = plt.subplots(
-        3, 1,
-        figsize=(9, 10),
-        sharex=True,
-        gridspec_kw={'height_ratios': [0.8, 0.8, 1]}  # e.g. 4:2:1 ratio
-    )
-
-    # scale tick labels
-    for ax in (ax1, ax2, ax3):
-        ax.tick_params(axis='both', which='major', labelsize=big_fs)
-
-    # --- subplot (a): median solve time ± IQR ---
-    for meas, ls in [('scalar','--'), ('vector','-')]:
-        for diff in diffs:
-            stats = sorted(solve_stats[(meas, diff)], key=lambda x: x[0])
-            if not stats:
-                continue
-            xs, meds, p25s, p75s = zip(*stats)
-            ax1.fill_between(xs, p25s, p75s,
-                             color=colors[diff], alpha=0.2)
-            ax1.plot(xs, meds,
-                     linestyle=ls,
-                     linewidth=2,
-                     color=colors[diff],
-                     label=f"{diff.capitalize()} {meas}")
-
-    # draw simulation latency line at 1.25 ms (black dotted)
-    lat_line = ax1.axhline(
-        1.25,
-        color='k',
-        linestyle=':',
-        linewidth=2,
-        label='Simulation Latency'
-    )
-
-    ax1.set_ylabel("Solve Time (ms)", fontsize=big_fs)
-    ax1.set_title("(a) MPC Solve Time vs Frequency (median ± IQR)",
-                  fontsize=big_fs)
-    ax1.set_yscale('log')
-    ax1.grid(True)
-
-    # legend only for the latency line, in upper right
-    ax1.legend(
-        handles=[lat_line],
-        loc='upper right',
-        fontsize=big_fs * 0.8,
-        title=None
-    )
-
-    # --- subplot (b): pass counts + ideal lines ---
-    for diff, col in colors.items():
-        ax2.axhline(ideal_pass_counts[diff],
-                    color=col,
-                    linestyle=':',
-                    linewidth=2,
-                    label=f"{diff.capitalize()} ideal")
-    for meas, ls in [('scalar','--'), ('vector','-')]:
-        for diff in diffs:
-            ax2.plot(freqs,
-                     pass_counts[meas][diff],
-                     linestyle=ls,
-                     color=colors[diff],
-                     linewidth=2,
-                     marker='o',
-                     label=f"{diff.capitalize()} {meas}")
-    ax2.set_ylabel("Successful Trajectories", fontsize=big_fs)
-    ax2.set_title("(b) Successful Trajectories vs Frequency",
-                  fontsize=big_fs)
-    ax2.yaxis.set_major_locator(MultipleLocator(2))
-    ax2.set_ylim(-1, 21)
-    ax2.grid(True)
-
-    # --- subplot (c): total power + shaded gap + ideal ---
-    for diff in diffs:
-        ax3.axhline(ideal_avg[diff],
-                    color=colors[diff],
-                    linestyle=':',
-                    linewidth=2,
-                    label=f"{diff.capitalize()} ideal")
-    for meas, ls in [('scalar','--'), ('vector','-')]:
-        for diff in diffs:
-            data = sorted(power_tot[(meas, diff)], key=lambda x: x[0])
-            if not data:
-                continue
-            xs, Pt = zip(*data)
-            # compute corresponding actuator-only for shading
-            Pa = []
-            for x in xs:
-                d_list = [d for d,f,m in impls if m==meas and f==x]
-                Pa.append(compute_avg_power(d_list[0],
-                                           hover_rpm, hover_power, max_rpm)[diff])
-            ax3.fill_between(xs, Pa, Pt,
-                             color=colors[diff], alpha=0.2, edgecolor='none')
-            ax3.plot(xs, Pt,
-                     linestyle=ls,
-                     color=colors[diff],
-                     linewidth=2,
-                     label=f"{diff.capitalize()} {meas} total")
-
-    ax3.set_xlabel("SoC Frequency (MHz)", fontsize=big_fs)
-    ax3.set_ylabel("Power (W)",               fontsize=big_fs)
-    ax3.set_title("(c) System Power Consumption vs Frequency",
-                  fontsize=big_fs)
-    ax3.grid(True)
-
-    # --- shared legend below ---
-    handles, labels = ax3.get_legend_handles_labels()
-    ordered = []
-    for diff in diffs:
-        for tag in ['ideal', 'scalar total', 'vector total']:
-            name = f"{diff.capitalize()} {tag}"
-            if name in labels:
-                idx = labels.index(name)
-                ordered.append((handles[idx], labels[idx]))
-    hs, ls = zip(*ordered)
-    # fig.legend(hs, ls,
-    #            loc='lower center',
-    #            bbox_to_anchor=(0.5, -0.02),
-    #            ncol=3,
-    #            frameon=False,
-    #            fontsize=big_fs)
-
-    # 1) Create proxy artists for difficulty (colors)
-    difficulty_handles = [
-        Line2D([0], [0], color=colors[diff], lw=4) 
-        for diff in diffs
-    ]
-    difficulty_labels = [diff.capitalize() for diff in diffs]
-
-    # 2) Create proxy artists for line‐types (patterns), all in black
-    pattern_handles = [
-        Line2D([0],[0], color='k', lw=2, linestyle=':'),
-        Line2D([0],[0], color='k', lw=2, linestyle='--'),
-        Line2D([0],[0], color='k', lw=2, linestyle='-'),
-    ]
-    pattern_labels = ['Ideal', 'Scalar', 'Vector']
-
-    # 3) Add the first legend (colors) and keep it
-    leg1 = ax3.legend(
-        difficulty_handles, difficulty_labels,
-        title="Scenario Difficulty",
-        loc='lower left',
-        bbox_to_anchor=(0, -0.5),
-        ncol=3,
-        fontsize=big_fs * 0.8,
-        title_fontsize=big_fs * 0.9
-    )
-    ax3.add_artist(leg1)
-
-    # 4) Add the second legend (patterns)
-    ax3.legend(
-        pattern_handles, pattern_labels,
-        title="Compute Target",
-        loc='lower right',
-        bbox_to_anchor=(1, -0.5),
-        ncol=3,
-        fontsize=big_fs * 0.8,
-        title_fontsize=big_fs * 0.9
-    )
-
-
-    # plt.tight_layout()
-    plt.tight_layout(rect=[0, 0.1, 1, 1])
-    plt.subplots_adjust(bottom=0.15)
-
-    # save instead of show
     os.makedirs(outdir, exist_ok=True)
+
+    # --- select dirs ---
+    scalar_dirs = [d for d in directories if "scalar" in d]
+    rvv_dirs    = [d for d in directories if "rvv" in d]
+    if not scalar_dirs or not rvv_dirs:
+        raise ValueError("Need one directory containing 'data_scalar' and one containing 'data_rvv'.")
+    d_scalar = scalar_dirs[0]
+    d_rvv    = rvv_dirs[0]
+
+    FREQ_MHZ = 100.0
+    diffs    = ["easy", "medium", "hard"]
+    colors   = {"easy": "green", "medium": "blue", "hard": "red"}
+
+    # ---------- helpers ----------
+    def load_ns_for_diff(dirpath, diff):
+        """Concatenate 'ns' (nanoseconds) from <diff>_*.npz/.npy files."""
+        out = []
+        for fn in os.listdir(dirpath):
+            if not (fn.startswith(f"{diff}_") and (fn.endswith(".npz") or fn.endswith(".npy"))):
+                continue
+            path = os.path.join(dirpath, fn)
+            data = np.load(path, allow_pickle=False)
+            try:
+                if isinstance(data, np.lib.npyio.NpzFile):
+                    if 'ns' not in data.files:
+                        continue
+                    ns = data['ns']
+                else:
+                    arr = data
+                    if getattr(arr, "dtype", None) is not None and arr.dtype.fields and ('ns' in arr.dtype.fields):
+                        ns = arr['ns']
+                    else:
+                        ns = arr
+                ns = np.asarray(ns)
+                if ns.size:
+                    valid = ns[ns >= 0]
+                    if valid.size:
+                        out.append(valid.astype(np.float64))
+            finally:
+                if isinstance(data, np.lib.npyio.NpzFile):
+                    data.close()
+        return np.concatenate(out) if out else np.array([], dtype=np.float64)
+
+    def total_passes_for_diff(dirpath, diff):
+        cnt = 0
+        for fn in os.listdir(dirpath):
+            if not (fn.startswith(f"{diff}_") and (fn.endswith(".npz") or fn.endswith(".npy"))):
+                continue
+            if trajectory_passed_file(os.path.join(dirpath, fn)):
+                cnt += 1
+        return cnt
+
+    def actuator_power_for_diff(dirpath, diff):
+        ap = compute_avg_power(dirpath, hover_rpm, hover_power, max_rpm)  # dict per diff
+        val = ap.get(diff)
+        return float(val) if val is not None else np.nan
+
+    # ---------- metrics per (series, difficulty) ----------
+    metrics = {"Scalar": {}, "RVV": {}}
+    for tag, d in [("Scalar", d_scalar), ("RVV", d_rvv)]:
+        cpu_map = power_data.get('scalar' if tag == 'Scalar' else 'vector', {})
+        cpu_w   = cpu_map.get(FREQ_MHZ, np.nan)
+
+        for diff in diffs:
+            ns = load_ns_for_diff(d, diff)
+            if ns.size:
+                ms = ns * 1e-6
+                q1, med, q3 = np.percentile(ms, [25, 50, 75])
+                iqr = q3 - q1
+            else:
+                med, iqr = np.nan, np.nan
+
+            passes = total_passes_for_diff(d, diff)
+            act_w  = actuator_power_for_diff(d, diff)
+            total_w = act_w + cpu_w if (not np.isnan(act_w) and not np.isnan(cpu_w)) else np.nan
+
+            metrics[tag][diff] = {
+                "med_ms": med,
+                "iqr_ms": iqr,
+                "passes": passes,
+                "total_w": total_w,
+            }
+
+    # ---------- plotting: grouped by compute target ----------
+    fig, axes = plt.subplots(3, 1, figsize=(7.5, 10), sharex=True)
+
+    group_labels = ["Scalar", "RVV"]
+    group_centers = np.arange(len(group_labels))  # [0,1]
+    width = 0.22
+    offsets = (-width, 0.0, width)  # easy, medium, hard
+
+    def _bar_with_optional_yerr(ax, xpos, heights, yerr):
+        """Plot bars; if any yerr is NaN, omit error bars for that bar."""
+        # Matplotlib doesn't support per-bar None in a single call cleanly,
+        # so draw each bar separately.
+        for xi, h, e in zip(xpos, heights, yerr):
+            if np.isfinite(e):
+                ax.bar(xi, h, width, yerr=e, capsize=5)
+            else:
+                ax.bar(xi, h, width)
+
+    # (a) Solve time
+    ax = axes[0]
+    for k, diff in enumerate(diffs):
+        xpos = group_centers + offsets[k]
+        heights = [metrics["Scalar"][diff]["med_ms"], metrics["RVV"][diff]["med_ms"]]
+        yerr    = [metrics["Scalar"][diff]["iqr_ms"], metrics["RVV"][diff]["iqr_ms"]]
+        # draw with color per difficulty
+        for xi, h, e in zip(xpos, heights, yerr):
+            if np.isfinite(e):
+                ax.bar(xi, h, width, yerr=e, capsize=5, color=colors[diff], edgecolor='black')
+            else:
+                ax.bar(xi, h, width, color=colors[diff], edgecolor='black')
+    ax.set_ylabel("Solve Time (ms)")
+    ax.set_title("(a) Median MPC Solve Time @ 100 MHz")
+    ax.grid(True, axis='y', linestyle=':', alpha=0.6)
+
+    # (b) Successful trajectories
+    ax = axes[1]
+    for k, diff in enumerate(diffs):
+        xpos = group_centers + offsets[k]
+        heights = [metrics["Scalar"][diff]["passes"], metrics["RVV"][diff]["passes"]]
+        ax.bar(xpos, heights, width, color=colors[diff], edgecolor='black')
+    ax.set_ylabel("Successful Trajectories")
+    ax.set_title("(b) Successful Trajectories")
+    ax.yaxis.set_major_locator(MultipleLocator(2))
+    ax.grid(True, axis='y', linestyle=':', alpha=0.6)
+
+    # (c) Total power
+    ax = axes[2]
+    for k, diff in enumerate(diffs):
+        xpos = group_centers + offsets[k]
+        heights = [metrics["Scalar"][diff]["total_w"], metrics["RVV"][diff]["total_w"]]
+        ax.bar(xpos, heights, width, color=colors[diff], edgecolor='black')
+    ax.set_ylabel("Power (W)")
+    ax.set_title("(c) System Power @ 100 MHz")
+    ax.grid(True, axis='y', linestyle=':', alpha=0.6)
+
+    # shared x labels
+    for ax in axes:
+        ax.set_xticks(group_centers, group_labels)
+
+    # Legend: difficulty colors
+    color_handles = [Line2D([0],[0], color=colors[d], lw=6, label=d.capitalize()) for d in diffs]
+    axes[2].legend(color_handles, [d.capitalize() for d in diffs],
+                   title="Difficulty", loc='lower center', bbox_to_anchor=(0.5, -0.35), ncol=3)
+
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
     outpath = os.path.join(outdir, outfile)
     fig.savefig(outpath, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved HIL results to {outpath}")
+    print(f"Saved figure to {outpath}")
 
 if __name__ == "__main__":
     plot_summary(directories, power_data)
