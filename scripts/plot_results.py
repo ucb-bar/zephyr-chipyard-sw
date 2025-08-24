@@ -142,7 +142,8 @@ def plot_summary(directories,
     Subplots:
       (a) median solve time (ms) with IQR error bars
       (b) successful trajectories
-      (c) total power (W) = actuator(diff) + CPU(100 MHz)
+      (c) total power (W) = actuator(diff) + CPU(100 MHz), shown as
+          solid actuator base + light shaded compute cap.
     """
     os.makedirs(outdir, exist_ok=True)
 
@@ -160,7 +161,6 @@ def plot_summary(directories,
 
     # ---------- helpers ----------
     def load_ns_for_diff(dirpath, diff):
-        """Concatenate 'ns' (nanoseconds) from <diff>_*.npz/.npy files."""
         out = []
         for fn in os.listdir(dirpath):
             if not (fn.startswith(f"{diff}_") and (fn.endswith(".npz") or fn.endswith(".npy"))):
@@ -209,6 +209,7 @@ def plot_summary(directories,
         cpu_w   = cpu_map.get(FREQ_MHZ, np.nan)
 
         for diff in diffs:
+            # Solve-time stats
             ns = load_ns_for_diff(d, diff)
             if ns.size:
                 ms = ns * 1e-6
@@ -217,34 +218,29 @@ def plot_summary(directories,
             else:
                 med, iqr = np.nan, np.nan
 
+            # Passes
             passes = total_passes_for_diff(d, diff)
-            act_w  = actuator_power_for_diff(d, diff)
-            total_w = act_w + cpu_w if (not np.isnan(act_w) and not np.isnan(cpu_w)) else np.nan
+
+            # Power breakdown
+            act_w = actuator_power_for_diff(d, diff)
+            tot_w = act_w + cpu_w if (np.isfinite(act_w) and np.isfinite(cpu_w)) else np.nan
 
             metrics[tag][diff] = {
                 "med_ms": med,
                 "iqr_ms": iqr,
                 "passes": passes,
-                "total_w": total_w,
+                "act_w":  act_w,
+                "cpu_w":  cpu_w,
+                "total_w": tot_w,
             }
 
     # ---------- plotting: grouped by compute target ----------
     fig, axes = plt.subplots(3, 1, figsize=(7.5, 10), sharex=True)
 
-    group_labels = ["Scalar", "RVV"]
-    group_centers = np.arange(len(group_labels))  # [0,1]
+    group_labels  = ["Scalar", "RVV"]
+    group_centers = np.arange(len(group_labels))  # [0, 1]
     width = 0.22
     offsets = (-width, 0.0, width)  # easy, medium, hard
-
-    def _bar_with_optional_yerr(ax, xpos, heights, yerr):
-        """Plot bars; if any yerr is NaN, omit error bars for that bar."""
-        # Matplotlib doesn't support per-bar None in a single call cleanly,
-        # so draw each bar separately.
-        for xi, h, e in zip(xpos, heights, yerr):
-            if np.isfinite(e):
-                ax.bar(xi, h, width, yerr=e, capsize=5)
-            else:
-                ax.bar(xi, h, width)
 
     # (a) Solve time
     ax = axes[0]
@@ -252,7 +248,6 @@ def plot_summary(directories,
         xpos = group_centers + offsets[k]
         heights = [metrics["Scalar"][diff]["med_ms"], metrics["RVV"][diff]["med_ms"]]
         yerr    = [metrics["Scalar"][diff]["iqr_ms"], metrics["RVV"][diff]["iqr_ms"]]
-        # draw with color per difficulty
         for xi, h, e in zip(xpos, heights, yerr):
             if np.isfinite(e):
                 ax.bar(xi, h, width, yerr=e, capsize=5, color=colors[diff], edgecolor='black')
@@ -273,24 +268,48 @@ def plot_summary(directories,
     ax.yaxis.set_major_locator(MultipleLocator(2))
     ax.grid(True, axis='y', linestyle=':', alpha=0.6)
 
-    # (c) Total power
+    # (c) Total power with shaded compute cap
     ax = axes[2]
     for k, diff in enumerate(diffs):
         xpos = group_centers + offsets[k]
-        heights = [metrics["Scalar"][diff]["total_w"], metrics["RVV"][diff]["total_w"]]
-        ax.bar(xpos, heights, width, color=colors[diff], edgecolor='black')
+        # Base actuator bars (solid)
+        act_heights = [metrics["Scalar"][diff]["act_w"], metrics["RVV"][diff]["act_w"]]
+        ax.bar(xpos, act_heights, width, color=colors[diff], edgecolor='black', label=None)
+
+        # Compute cap stacked above actuator (lighter shade)
+        cpu_heights = [metrics["Scalar"][diff]["cpu_w"], metrics["RVV"][diff]["cpu_w"]]
+        # Use same hue with alpha for a lighter cap
+        for xi, base, cpu in zip(xpos, act_heights, cpu_heights):
+            if np.isfinite(base) and np.isfinite(cpu):
+                ax.bar(xi, cpu, width,
+                       bottom=base,
+                       color=colors[diff],
+                       alpha=0.35,
+                       edgecolor='black',
+                       linewidth=0.5)
+
     ax.set_ylabel("Power (W)")
-    ax.set_title("(c) System Power @ 100 MHz")
+    ax.set_title("(c) System Power @ 100 MHz (actuator + compute)")
     ax.grid(True, axis='y', linestyle=':', alpha=0.6)
 
     # shared x labels
     for ax in axes:
         ax.set_xticks(group_centers, group_labels)
 
-    # Legend: difficulty colors
-    color_handles = [Line2D([0],[0], color=colors[d], lw=6, label=d.capitalize()) for d in diffs]
-    axes[2].legend(color_handles, [d.capitalize() for d in diffs],
-                   title="Difficulty", loc='lower center', bbox_to_anchor=(0.5, -0.35), ncol=3)
+    # Build handles & labels explicitly
+    color_handles = [Line2D([0],[0], color=colors[d], lw=6, label=d.capitalize())
+                    for d in ["easy", "medium", "hard"]]
+    compute_note  = Line2D([0],[0], color='k', alpha=0.35, lw=8, label='Compute cap (CPU)')
+
+    handles = color_handles + [compute_note]
+    labels  = [h.get_label() for h in handles]
+
+    leg = axes[2].legend(handles=handles,
+                        labels=labels,
+                        title="Difficulty / Breakdown",
+                        loc='lower center',
+                        bbox_to_anchor=(0.5, -0.35),
+                        ncol=4)
 
     plt.tight_layout(rect=[0, 0.05, 1, 1])
     outpath = os.path.join(outdir, outfile)
