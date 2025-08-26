@@ -10,60 +10,36 @@ TODO
 ## Standalone Installation
 
 ### Main Installation
-To use this repo, first install the Chipyard Zephyr fork, and then install this samples repo:
 
+First, clone this repo:
 ```
-# Create your zephyr workspace
-mkdir zephyr_ws
-cd zephyr_ws
-
-
-# Clone Chipyard's Zephyr fork
-git clone git@github.com:ucb-bar/zephyr.git
-cd zephyr
-git checkout dev
-
-# Create a conda environment
-conda create -yn zephyr python=3.12
-conda activate zephyr
-
-# install the west dependencies
-pip3 install west pyelftools
-
-# Initialize west workspace
-west init -l .
-west config manifest.file west-riscv.yml
-west update
-
-# Return to zephyr_ws
-cd -
-
-# Install this repository
 git clone git@github.com:ucb-bar/zephyr-chipyard-sw.git
 cd zephyr-chipyard-sw
-git checkout dev
+git checkout iiswc-ae
 git submodule update --init
-cd -
-
 ```
 
-Next, set up your environment variables. The example below is for providing your own cross-compiler:
-
+Next, install conda and dependencies:
 ```
-cd zephyr
-export ZEPHYR_BASE=$(pwd)
-export ZEPHYR_TOOLCHAIN_VARIANT=cross-compile
-# set based on your RISCV toolchain path
-export CROSS_COMPILE=/path/to/toolchain/bin/riscv64-unknown-elf-
-cd -
+source scripts/install_conda.sh
+source scripts/install_submodules.sh
 ```
 
-To test an example with spike:
+
+Install GCC15.1, patched for Zephyr support:
 ```
-cd zephyr-chipyard-sw
+bash scripts/install_toolchain.sh
+```
+
+Finally, set your environment variables:
+```
+source scripts/set_envvars.sh
+```
+
+To test an example with spike (spike requires a chipyard install):
+```
 west build -p -b spike_riscv64 samples/hello_world/
 spike build/zephyr/zephyr.elf
-cd -
 ```
 
 
