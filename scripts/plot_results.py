@@ -42,7 +42,7 @@ power_data = {
 
 directories = [
     "data/scalar", 
-    "data/rvv", 
+    "data/vector", 
 ]
 
 def trajectory_passed(data,
@@ -151,7 +151,7 @@ def plot_summary(directories,
     scalar_dirs = [d for d in directories if "scalar" in d]
     rvv_dirs    = [d for d in directories if "vector" in d]
     if not scalar_dirs or not rvv_dirs:
-        raise ValueError("Need one directory containing 'data_scalar' and one containing 'data_rvv'.")
+        raise ValueError("Need one directory containing 'scalar' and one containing 'vector'.")
     d_scalar = scalar_dirs[0]
     d_rvv    = rvv_dirs[0]
 
