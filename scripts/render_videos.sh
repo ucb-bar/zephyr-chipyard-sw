@@ -57,6 +57,6 @@ process_dir() {
   done < <(find "$in_dir" -type f -name '*.npy' -print0 | sort -z)
 }
 
-process_dir "rvv"
+process_dir "vector"
 process_dir "scalar"
 echo "[DONE] All videos written under ${OUTPUT_ROOT}/"

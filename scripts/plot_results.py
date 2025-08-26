@@ -149,7 +149,7 @@ def plot_summary(directories,
 
     # --- select dirs ---
     scalar_dirs = [d for d in directories if "scalar" in d]
-    rvv_dirs    = [d for d in directories if "rvv" in d]
+    rvv_dirs    = [d for d in directories if "vector" in d]
     if not scalar_dirs or not rvv_dirs:
         raise ValueError("Need one directory containing 'data_scalar' and one containing 'data_rvv'.")
     d_scalar = scalar_dirs[0]
