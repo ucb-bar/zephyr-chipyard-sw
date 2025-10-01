@@ -10,3 +10,18 @@
 	path = samples/drone_control/tinympc
 	url = https://github.com/ucb-bar/Accelerated-TinyMPC
 	branch = zephyr
+[submodule "zephyr_ws/zephyr"]
+	path = zephyr_ws/zephyr
+	url = https://github.com/ucb-bar/zephyr.git
+[submodule "tools/pyuartsi"]
+	path = tools/pyuartsi
+	url = https://github.com/ucb-bar/pyuartsi.git
+[submodule "tools/gym-pybullet-drones"]
+	path = tools/gym-pybullet-drones
+	url = https://github.com/utiasDSL/gym-pybullet-drones.git
+[submodule "tools/riscv-gnu-toolchain"]
+	path = tools/riscv-gnu-toolchain
+	url = https://github.com/riscv/riscv-gnu-toolchain
+[submodule "tools/picolibc"]
+	path = tools/picolibc
+	url = https://github.com/picolibc/picolibc.git
