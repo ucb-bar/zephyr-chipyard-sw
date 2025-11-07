@@ -15,7 +15,6 @@ First, clone this repo:
 ```
 git clone git@github.com:ucb-bar/zephyr-chipyard-sw.git
 cd zephyr-chipyard-sw
-git checkout iiswc-ae
 git submodule update --init
 ```
 
