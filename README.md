@@ -21,9 +21,8 @@ git submodule update --init
 Next, install conda and dependencies:
 ```
 source scripts/install_conda.sh
-source scripts/install_submodules.sh
+bash scripts/install_submodules.sh
 ```
-
 
 Install GCC15.1, patched for Zephyr support:
 ```
@@ -33,6 +32,12 @@ bash scripts/install_toolchain.sh
 Finally, set your environment variables:
 ```
 source scripts/set_envvars.sh
+```
+
+After installation, activate the conda environment:
+```
+source tools/miniforge3/etc/profile.d/conda.sh
+conda activate zephyr
 ```
 
 To test an example with spike (spike requires a chipyard install):
@@ -66,8 +71,11 @@ cd -
 cd ./third-party/executorch/
 ./install_requirements.sh
 cd -
-```
-./install_requirements.sh --pybind xnnpack # TODO just needs to install python deps, okay if there are CUDA errors
+
+# Install additional executorch dependencies
+cd ./third-party/executorch/
+./install_requirements.sh --pybind xnnpack  # TODO just needs to install python deps, okay if there are CUDA errors
+cd -
 
 To test an example using Executorch, inside `zephyr-chipyard-sw`:
 
@@ -81,6 +89,8 @@ west build -p -b spike_riscv64 ./samples/executorch/executor_runner/ -DXNNPACK_E
 
 # Run using spike
 spike -p4 --isa=rv64gcv_zicntr build/zephyr/zephyr.elf
-
 ```
 
+## Troubleshooting
+
+If you encounter issues during installation or when activating the conda environment, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for detailed troubleshooting information.
