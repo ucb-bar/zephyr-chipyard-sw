@@ -76,6 +76,7 @@ cd -
 cd ./third-party/executorch/
 ./install_requirements.sh --pybind xnnpack  # TODO just needs to install python deps, okay if there are CUDA errors
 cd -
+```
 
 To test an example using Executorch, inside `zephyr-chipyard-sw`:
 
