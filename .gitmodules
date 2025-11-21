@@ -25,3 +25,7 @@
 [submodule "tools/picolibc"]
 	path = tools/picolibc
 	url = https://github.com/picolibc/picolibc.git
+[submodule "tools/Baremetal-IDE"]
+	path = tools/Baremetal-IDE
+	url = git@github.com:ucb-bar/sp24-Baremetal-IDE.git
+	branch = george

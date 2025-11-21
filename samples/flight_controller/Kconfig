@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "Flight Controller Configuration"
+
+config ATTITUDE_ESTIMATOR_FREQUENCY
+	int "Attitude estimator frequency (Hz)"
+	default 200
+	range 10 1000
+	help
+	  Frequency at which the attitude estimator runs.
+	  Higher frequencies provide better responsiveness but use more CPU.
+
+config ATTITUDE_ESTIMATOR_STACK_SIZE
+	int "Attitude estimator thread stack size"
+	default 2048
+	help
+	  Stack size for the attitude estimator thread.
+
+source "Kconfig.zephyr"
+

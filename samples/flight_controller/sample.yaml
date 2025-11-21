@@ -1,0 +1,16 @@
+sample:
+  description: Flight controller application with attitude estimation
+  name: flight controller
+common:
+  tags: sensor control
+  integration_platforms:
+    - native_sim
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "Flight Controller.*"
+tests:
+  sample.basic.flight_controller:
+    tags: sensor control
+
