@@ -104,12 +104,11 @@ int main(void)
 						   output_channels, // Output size per batch
 						   input_channels,  // Input stride
 						   output_channels, // Output stride
-						   weights,         // Weights matrix
+						   weights,         // Weights matrix (kernel)
 						   bias,            // Bias vector
 						   -INFINITY,       // Min activation
 						   INFINITY,        // Max activation
 						   0,               // Flags
-						   NULL,            // Code cache
 						   NULL,            // Weights cache
 						   &fc_op);
 
@@ -134,7 +133,7 @@ int main(void)
 		return -1;
 	}
 
-	printf("Shape of input and output data: %d, %d\n", input_channels, output_channels);
+	printf("Shape of input and output data: %zu, %zu\n", input_channels, output_channels);
 
 	unsigned long clock_start = cycle();
 
@@ -161,7 +160,7 @@ int main(void)
 	for (size_t i = 0; i < output_channels; i++) {
 		float diff = fabsf(output_data[i] - output_data_ref[i]);
 		diff /= fabsf(output_data_ref[i]);
-		if (diff > 1e-5) {
+		if (diff > 1e-5f) {
 			printf("Output verification failed at index %zu: expected %f, got %f\n", i,
 			       (double)output_data_ref[i], (double)output_data[i]);
 		}
