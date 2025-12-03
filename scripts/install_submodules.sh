@@ -105,7 +105,7 @@ main() {
 
   # Install the west dependencies
   log "Installing west dependencies..."
-  run_cmd "${CONDA_RUN} pip install west pyelftools rich"
+  run_cmd "${CONDA_RUN} pip install west pyelftools rich jsonschema"
 
   # Install toolchain build dependencies (meson and ninja)
   log "Installing toolchain build dependencies (meson, ninja)..."

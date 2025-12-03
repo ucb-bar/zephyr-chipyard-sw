@@ -86,25 +86,21 @@ After the main installation, run the following:
 
 ```
 # Install executorch dependencies
-python -m pip install executorch==0.5.0 zstd
+python -m pip install executorch==1.0.1 zstd torchvision
 
 # Setup Executorch repos
 cd zephyr-chipyard-sw
 
 cd ./third-party/executorch
-git checkout zephyr
+git checkout zephyr-1.0.1
 git submodule sync
-git submodule update --init
+git submodule update --init --recursive
 cd -
 
-cd ./third-party/executorch/backends/xnnpack/third-party/XNNPACK
-# git checkout zephyr
-git checkout e1515295a8fbd3a90a7264facc3703ae5c4463be # TODO have branch name
-cd -
-
-# Install additional executorch dependencies
+# Install additional executorch Python dependencies (optional - only needed if building Python bindings or using Python tools)
+# Note: This requires all submodules to be initialized (done above)
 cd ./third-party/executorch/
-./install_requirements.sh --pybind xnnpack  # TODO just needs to install python deps, okay if there are CUDA errors
+./install_requirements.sh
 cd -
 ```
 

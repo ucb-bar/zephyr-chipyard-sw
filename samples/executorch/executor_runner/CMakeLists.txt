@@ -64,7 +64,7 @@ target_link_libraries(pthreadpool PUBLIC compile_commands)
 target_link_libraries(app PRIVATE
   # "-Wl,--whole-archive" 
   extension_runner_util executorch executorch_core quantized_ops_lib portable_ops_lib quantized_kernels portable_kernels 
-  xnnpack_backend XNNPACK microkernels-prod
+  xnnpack_backend XNNPACK xnnpack-microkernels-prod extension_threadpool
   # "-Wl,--no-whole-archive"`
 )
 
