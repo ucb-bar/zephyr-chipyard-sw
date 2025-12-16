@@ -11,7 +11,7 @@ add_compile_definitions(__POSIX_VISIBLE=200809L)
 
 find_program(FLATC_EXECUTABLE flatc)
 set(ET_DIR_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../third-party/executorch" CACHE PATH "Path to ExecuTorch dir")
-set(ET_BUILD_DIR_PATH "${ET_DIR_PATH}/cmake-out" CACHE PATH "Path to ExecuTorch build dir")
+set(ET_BUILD_DIR_PATH "${CMAKE_CURRENT_BINARY_DIR}/executorch" CACHE PATH "Path to ExecuTorch build dir")
 set(ET_INCLUDE_PATH "${ET_DIR_PATH}/.." CACHE PATH "Path to ExecuTorch headers")
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
@@ -21,7 +21,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(EXECUTORCH_BUILD_EXECUTOR_RUNNER OFF CACHE BOOL "")
 set(EXECUTORCH_BUILD_EXTENSION_RUNNER_UTIL ON CACHE BOOL "")
-set(EXECUTORCH_BUILD_KERNELS_QUANTIZED ON CACHE BOOL "")
+set(EXECUTORCH_BUILD_KERNELS_QUANTIZED OFF CACHE BOOL "")
 set(EXECUTORCH_ENABLE_LOGGING ON CACHE BOOL "")
 set(EXECUTORCH_BUILD_CPUINFO OFF CACHE BOOL "")
 set(EXECUTORCH_BUILD_PTHREADPOOL OFF CACHE BOOL "")
@@ -63,7 +63,7 @@ target_link_libraries(pthreadpool PUBLIC compile_commands)
 
 target_link_libraries(app PRIVATE
   # "-Wl,--whole-archive" 
-  extension_runner_util executorch executorch_core quantized_ops_lib portable_ops_lib quantized_kernels portable_kernels 
+  extension_runner_util executorch executorch_core portable_ops_lib portable_kernels 
   xnnpack_backend XNNPACK xnnpack-microkernels-prod extension_threadpool
   # "-Wl,--no-whole-archive"`
 )

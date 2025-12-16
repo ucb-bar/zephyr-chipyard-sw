@@ -116,7 +116,7 @@ west build -p -b spike_riscv64 ./samples/executorch/executor_runner/ -DXNNPACK_E
 
 # Run using spike
 spike -p4 --isa=rv64gcv_zicntr build/zephyr/zephyr.elf
-```
+``
 
 ## Chipyard Installation
 
