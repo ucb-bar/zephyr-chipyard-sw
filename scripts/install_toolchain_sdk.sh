@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 TOOLS_MANUAL_DIR="${REPO_ROOT}/tools-manual"
 PATCHES_DIR="${REPO_ROOT}/tools/patches"
+LOG_FILE="${REPO_ROOT}/.install_toolchain_sdk.log"
 
 SDK_VERSION="1.0.0-beta1"
 SDK_NAME="zephyr-sdk-${SDK_VERSION}"
@@ -14,13 +15,54 @@ SDK_MINIMAL_TARBALL="${SDK_NAME}_linux-x86_64_minimal.tar.xz"
 SDK_URL="https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${SDK_VERSION}/${SDK_MINIMAL_TARBALL}"
 SDK_INSTALL_DIR="${TOOLS_MANUAL_DIR}/${SDK_NAME}"
 
-log() { printf "\n\033[1;32m[%s]\033[0m %s\n" "$(date +%H:%M:%S)" "$*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
+log() {
+  local msg="[$(date +%H:%M:%S)] $*"
+  printf "\n\033[1;32m%s\033[0m\n" "$msg"
+  echo "$msg" >> "${LOG_FILE}" 2>/dev/null || true
+}
+die() {
+  local msg="[$(date +%H:%M:%S)] ERROR: $*"
+  printf "\n\033[1;31m%s\033[0m\n" "$msg" >&2
+  echo "$msg" >> "${LOG_FILE}" 2>/dev/null || true
+  exit 1
+}
 
-# Check dependencies
+# Check basic host dependencies (no root required for the rest)
 command -v wget >/dev/null 2>&1 || die "wget not found. Please install wget."
 command -v cmake >/dev/null 2>&1 || die "cmake not found. Please install cmake."
 command -v tar >/dev/null 2>&1 || die "tar not found. Please install tar."
+
+# Ensure we have conda and the 'zephyr' env so we can use its libidn without root
+CONDA_RUN=""
+
+# Try to find conda.sh in common locations (same logic as install_submodules.sh)
+if ! command -v conda >/dev/null 2>&1; then
+  CONDA_SH=""
+  if [[ -f "${REPO_ROOT}/tools/miniforge3/etc/profile.d/conda.sh" ]]; then
+    CONDA_SH="${REPO_ROOT}/tools/miniforge3/etc/profile.d/conda.sh"
+  elif [[ -f "${HOME}/miniforge3/etc/profile.d/conda.sh" ]]; then
+    CONDA_SH="${HOME}/miniforge3/etc/profile.d/conda.sh"
+  elif [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
+    CONDA_SH="${HOME}/anaconda3/etc/profile.d/conda.sh"
+  fi
+
+  if [[ -n "${CONDA_SH}" ]]; then
+    log "Sourcing conda.sh from ${CONDA_SH}"
+    # shellcheck disable=SC1090
+    source "${CONDA_SH}" 2>>"${LOG_FILE}" || true
+  fi
+fi
+
+if ! command -v conda >/dev/null 2>&1; then
+  die "conda not found in PATH. Please run 'bash scripts/install_submodules.sh' first."
+fi
+
+# Check that the 'zephyr' env exists (created by install_submodules.sh)
+if ! conda env list 2>/dev/null | grep -q "^zephyr[[:space:]]"; then
+  die "Conda environment 'zephyr' not found. Please run 'bash scripts/install_submodules.sh' first."
+fi
+
+CONDA_RUN="conda run -n zephyr --no-capture-output"
 
 # Create tools-manual directory if it doesn't exist
 mkdir -p "${TOOLS_MANUAL_DIR}"
@@ -50,8 +92,10 @@ cd "${SDK_INSTALL_DIR}"
 # - LLVM toolchain (-l)
 # - Host tools (-h)
 # - CMake package registration (-c)
-log "Installing SDK components (GNU riscv64, LLVM, host tools)..."
-./setup.sh -t riscv64-zephyr-elf -l -h -c
+# We run this inside the 'zephyr' conda environment so that the SDK's CMake
+# can see libidn from conda instead of requiring a system-wide libidn.so.11.
+log "Installing SDK components (GNU riscv64, LLVM, host tools) inside 'zephyr' conda env..."
+${CONDA_RUN} bash -lc 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; ./setup.sh -t riscv64-zephyr-elf -l -h -c'
 
 # Copy cmake files from tools/patches to cmake/zephyr/ in SDK
 if [ -d "${PATCHES_DIR}" ]; then

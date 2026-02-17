@@ -210,6 +210,31 @@ main() {
   log "Initializing drone_control submodule..."
   run_cmd "git submodule update --init --recursive samples/drone_control"
 
+    # Check for libidn runtime library (required by cmake/curl on some toolchains)
+  log "Checking for libidn (libidn.so.11 runtime)..."
+
+  if ldconfig -p 2>/dev/null | grep -q "libidn.so.11"; then
+    log "System libidn found"
+  elif [ -n "${CONDA_PREFIX:-}" ] && find "$CONDA_PREFIX" -name "libidn.so.11" 2>/dev/null | grep -q .; then
+    log "libidn found in current conda environment"
+  else
+    log "libidn not found, attempting to install via conda (libidn11 from conda-forge)..."
+    if eval "${CONDA_RUN} conda install -y -c conda-forge libidn11" >> "${LOG_FILE}" 2>&1; then
+      log "libidn11 installed successfully via conda"
+    else
+      # Fallback: older name 'libidn' on some channels
+      log "libidn11 package not available, trying legacy 'libidn' package via conda..."
+      if eval "${CONDA_RUN} conda install -y -c conda-forge libidn" >> "${LOG_FILE}" 2>&1; then
+        log "libidn installed successfully via conda"
+      else
+        WARNINGS+=("libidn (libidn.so.11) missing and could not be installed automatically. CMake may fail to run. On Ubuntu: sudo apt-get install libidn11")
+        log_error "libidn installation failed"
+        log "You can install libidn system-wide with: sudo apt-get install libidn11"
+        log "Or try manually inside the env: conda install -n zephyr -c conda-forge libidn11"
+      fi
+    fi
+  fi
+
   # Check for dtc (device tree compiler) - needed for spike
   log "Checking for dtc (device tree compiler)..."
   if command -v dtc >/dev/null 2>&1; then
