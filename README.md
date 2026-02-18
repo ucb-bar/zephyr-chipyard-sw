@@ -81,27 +81,20 @@ spike build/zephyr/zephyr.elf
 ```
 
 
-### Executorch Installation
-After the main installation, run the following:
+### Executorch/Torch Installation
+**Note:** The torch setup uses the `torch-bump-testing` branch of the main repository, which references specific commits for `zephyr_ws/zephyr`, `third-party/executorch`, and `third-party/XNNPACK` submodules.
+
+After the main installation, checkout the torch-bump-testing branch:
 
 ```
-# Install executorch dependencies
-python -m pip install executorch==1.0.1 zstd torchvision
+git fetch origin
+git checkout torch-bump-testing
+```
 
-# Setup Executorch repos
-cd zephyr-chipyard-sw
+Then run the torch installation script:
 
-cd ./third-party/executorch
-git checkout zephyr-1.0.1
-git submodule sync
-git submodule update --init --recursive
-cd -
-
-# Install additional executorch Python dependencies (optional - only needed if building Python bindings or using Python tools)
-# Note: This requires all submodules to be initialized (done above)
-cd ./third-party/executorch/
-./install_requirements.sh
-cd -
+```
+bash scripts/install_torch.sh
 ```
 
 To test an example using Executorch, inside `zephyr-chipyard-sw`:
