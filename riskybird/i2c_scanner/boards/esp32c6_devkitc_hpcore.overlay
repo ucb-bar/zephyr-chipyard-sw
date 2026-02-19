@@ -1,0 +1,50 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * 
+ * Overlay for custom ESP32C6 PCB
+ * Override I2C pin assignments to match your PCB
+ */
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO15>,  
+				 <I2C0_SCL_GPIO14>;  
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+	
+	/* BMI088 Accelerometer at I2C address 0x18 */
+	bmi088_accel: bmi08x@18 {
+		compatible = "bosch,bmi08x-accel";
+		reg = <0x18>;
+		accel-hz = "800";
+		accel-fs = <6>;
+		status = "okay";
+	};
+	
+	/* BMI088 Gyroscope at I2C address 0x69 */
+	bmi088_gyro: bmi08x@69 {
+		compatible = "bosch,bmi08x-gyro";
+		reg = <0x69>;
+		gyro-hz = "1000_116";
+		gyro-fs = <1000>;
+		status = "okay";
+	};
+};
+
+/ {
+	/* Define aliases for easier access in code */
+	aliases {
+		bmi088-accel = &bmi088_accel;
+		bmi088-gyro = &bmi088_gyro;
+	};
+};
