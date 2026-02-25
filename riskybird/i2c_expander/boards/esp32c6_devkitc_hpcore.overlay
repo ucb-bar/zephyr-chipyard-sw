@@ -1,0 +1,38 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * 
+ * Overlay for custom ESP32C6 PCB
+ * Override I2C pin assignments to match your PCB
+ */
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO15>,  
+				 <I2C0_SCL_GPIO14>;  
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+
+	/* VL53L0X Time-of-Flight sensor at I2C address 0x29 */
+	vl53l0x: vl53l0x@29 {
+		compatible = "st,vl53l0x";
+		reg = <0x29>;
+		status = "okay";
+	};
+};
+
+/ {
+	/* Define aliases for easier access in code */
+	aliases {
+		vl53l0x = &vl53l0x;
+	};
+};
