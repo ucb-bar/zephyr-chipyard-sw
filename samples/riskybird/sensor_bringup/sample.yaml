@@ -1,0 +1,16 @@
+sample:
+  description: Test ADS7128 I2C ADC expander connection
+  name: ads7128 test
+common:
+  tags: i2c adc sensor
+  integration_platforms:
+    - esp32c6_devkitc_hpcore
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "ADS7128.*connected successfully"
+tests:
+  sample.riskybird.ads7128_test:
+    tags: i2c adc sensor
+    platform_allow: esp32c6_devkitc_hpcore

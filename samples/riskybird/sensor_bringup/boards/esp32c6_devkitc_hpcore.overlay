@@ -1,0 +1,56 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * 
+ * Overlay for ADS7128 I2C ADC Expander Test
+ * 
+ * ADS7128 is configured at I2C address 0x17
+ * Reference: ADS7128 datasheet (SBAS868A)
+ */
+
+/ {
+	aliases {
+		tof0 = &vl53l1x;
+	};
+};
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			/* I2C pins for custom ESP32C6 PCB (riskybird) */
+			pinmux = <I2C0_SDA_GPIO15>,
+				 <I2C0_SCL_GPIO14>;
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	
+	/* ADS7128 I2C ADC Expander at address 0x17
+	 * Note: ADS7128 doesn't have a standard Zephyr driver yet,
+	 * so we're just validating I2C communication.
+	 * The device tree node is optional but helps document the hardware.
+	 * GPIO6 on ADS7128 is used to enable/disable the VL53L1X sensor.
+	 */
+	ads7128@17 {
+		compatible = "ti,ads7128";
+		reg = <0x17>;
+		status = "okay";
+	};
+	
+	/* VL53L1X Time-of-Flight sensor
+	 * Default I2C address is 0x29 (can be changed via XSHUT sequence)
+	 * XSHUT control is handled via ADS7128 GPIO6 in application code
+	 */
+	vl53l1x: vl53l1x@29 {
+		compatible = "st,vl53l1x";
+		reg = <0x29>;
+		status = "okay";
+	};
+};
