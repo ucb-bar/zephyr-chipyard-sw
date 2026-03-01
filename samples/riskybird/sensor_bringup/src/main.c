@@ -12,6 +12,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/sensor/vl53l1x.h>
 #include <zephyr/devicetree.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -21,6 +22,9 @@
 
 #define I2C_NODE DT_NODELABEL(i2c0)
 #define ADS7128_I2C_ADDR 0x17
+#define VL53L1X_OLD_ADDR 0x29
+#define VL53L1X_NEW_ADDR 0x30
+#define VL53L1X_I2C_SLAVE_ADDR_REG 0x01  /* Register to change I2C address */
 
 /* ADS7128 I2C command opcodes (Table 9 in datasheet, section 8.5.1/8.5.2) */
 #define ADS7128_CMD_REG_WRITE 0x08  /* 0000 1000b: Single register write */
@@ -96,6 +100,98 @@ static int ads7128_write_gpio(const struct device *i2c_dev, uint8_t channel, uin
     }
     
     return ads7128_write_reg(i2c_dev, GPO_VALUE_ADDRESS, gpo_value);
+}
+
+/* Reprogram VL53L1X I2C address from old_addr to new_addr
+ * The sensor must be powered (XSHUT high) to accept I2C commands.
+ * We mirror the ST API (VL53L1_SetDeviceAddress): write the new 7-bit
+ * address to register VL53L1_I2C_SLAVE__DEVICE_ADDRESS (0x0001).
+ * No XSHUT cycling is required for the change to take effect.
+ */
+static int vl53l1x_change_address(const struct device *i2c_dev, 
+                                   uint8_t old_addr, uint8_t new_addr)
+{
+    uint8_t write_buf[3];
+    uint8_t reg_addr[2];
+    uint8_t read_back;
+    int ret;
+    uint8_t gpo_value;
+    int i;
+
+    printf("Reprogramming VL53L1X from 0x%02X to 0x%02X...\n", old_addr, new_addr);
+
+    /* Ensure XSHUT is HIGH (sensor must be powered to accept I2C commands) */
+    ret = ads7128_read_reg(i2c_dev, GPO_VALUE_ADDRESS, &gpo_value);
+    if (ret != 0) {
+        printf("ERROR: Failed to read GPO_VALUE (ret: %d)\n", ret);
+        return ret;
+    }
+    if (!(gpo_value & (1 << 6))) {
+        printf("ERROR: XSHUT (GPIO6) must be HIGH to reprogram address\n");
+        return -EINVAL;
+    }
+
+    /* Wait for sensor to be ready after power-on (boot time + I2C ready) */
+    k_msleep(50);
+
+    /* Verify sensor responds at old address before attempting to reprogram */
+    printf("Verifying sensor at old address 0x%02X...\n", old_addr);
+    for (i = 0; i < 5; i++) {
+        ret = i2c_write(i2c_dev, NULL, 0, old_addr);
+        if (ret == 0) {
+            printf("Sensor confirmed at 0x%02X\n", old_addr);
+            break;
+        }
+        k_msleep(10);
+    }
+    if (ret != 0) {
+        printf("WARNING: Sensor not responding at 0x%02X (ret: %d), continuing anyway...\n", old_addr, ret);
+    }
+
+    /* VL53L1X uses 16-bit register addresses, MSB first, then LSB, then data
+     * Format matches VL53L1_WriteMulti: buffer[0]=MSB, buffer[1]=LSB, buffer[2]=data
+     */
+    write_buf[0] = (VL53L1X_I2C_SLAVE_ADDR_REG >> 8) & 0xFF;  /* Register MSB (0x00) */
+    write_buf[1] = VL53L1X_I2C_SLAVE_ADDR_REG & 0xFF;          /* Register LSB (0x8A) */
+    write_buf[2] = new_addr;                                   /* New address value */
+
+    /* Write to the sensor at its current address (old_addr) */
+    printf("Writing new address 0x%02X to register 0x%04X...\n", new_addr, VL53L1X_I2C_SLAVE_ADDR_REG);
+    ret = i2c_write(i2c_dev, write_buf, sizeof(write_buf), old_addr);
+    if (ret != 0) {
+        printf("ERROR: Failed to write new address (ret: %d)\n", ret);
+        printf("  Transaction: [0x%02X 0x%02X 0x%02X] to addr 0x%02X\n", 
+               write_buf[0], write_buf[1], write_buf[2], old_addr);
+        return ret;
+    }
+
+    k_msleep(10); /* Small delay for address change to take effect */
+
+    /* Read back 0x0001 at old address to confirm write */
+    reg_addr[0] = write_buf[0];
+    reg_addr[1] = write_buf[1];
+    ret = i2c_write_read(i2c_dev, old_addr, reg_addr, sizeof(reg_addr),
+                         &read_back, 1);
+    if (ret != 0) {
+        printf("WARNING: Failed to read back 0x%04X at 0x%02X (ret: %d)\n",
+               VL53L1X_I2C_SLAVE_ADDR_REG, old_addr, ret);
+    } else {
+        printf("Read-back at old addr: 0x%02X (expected 0x%02X)\n",
+               read_back, new_addr);
+    }
+
+    /* Try reading 0x0001 at new address without cycling XSHUT */
+    ret = i2c_write_read(i2c_dev, new_addr, reg_addr, sizeof(reg_addr),
+                         &read_back, 1);
+    if (ret != 0) {
+        printf("WARNING: Failed to read back 0x%04X at new addr 0x%02X (ret: %d)\n",
+               VL53L1X_I2C_SLAVE_ADDR_REG, new_addr, ret);
+    } else {
+        printf("Read-back after XSHUT at new addr: 0x%02X\n", read_back);
+    }
+
+    printf("VL53L1X address reprogrammed sequence complete.\n");
+    return 0;
 }
 
 /* Perform I2C bus scan */
@@ -185,27 +281,94 @@ int main(void)
     /* Give the ToF sensor a moment after enabling via GPIO6 */
     k_msleep(100);
 
-    /* Now that GPIO6 is HIGH, the ToF sensor should be available */
+    /* Reprogram VL53L1X address from 0x29 to 0x30 */
+    ret = vl53l1x_change_address(i2c_dev, VL53L1X_OLD_ADDR, VL53L1X_NEW_ADDR);
+    if (ret != 0) {
+        printf("ERROR: Failed to reprogram VL53L1X address (ret: %d)\n", ret);
+        printf("Continuing anyway - sensor may already be at new address.\n");
+    }
+    k_msleep(100); /* Allow time for sensor to stabilize after address change */
+
+    /* Verify sensor is at new address */
+    printf("Verifying VL53L1X at address 0x%02X...\n", VL53L1X_NEW_ADDR);
+    ret = i2c_write(i2c_dev, NULL, 0, VL53L1X_NEW_ADDR);
+    if (ret != 0) {
+        printf("WARNING: VL53L1X not found at address 0x%02X (ret: %d)\n",
+               VL53L1X_NEW_ADDR, ret);
+        printf("Checking old address 0x%02X...\n", VL53L1X_OLD_ADDR);
+        ret = i2c_write(i2c_dev, NULL, 0, VL53L1X_OLD_ADDR);
+        if (ret == 0) {
+            printf("Sensor still at old address. Address reprogramming may have failed.\n");
+        }
+    } else {
+        printf("VL53L1X confirmed at address 0x%02X\n\n", VL53L1X_NEW_ADDR);
+    }
+
+    /* Wait a bit for the sensor to be ready after address change.
+     * Note: We do NOT power cycle here as that would reset the address back to default.
+     */
+    printf("Waiting for sensor to stabilize after address change...\n");
+    k_msleep(50);
+
+    /* Verify sensor is still responding at new address before initializing */
+    printf("Verifying sensor is responding at address 0x%02X...\n", VL53L1X_NEW_ADDR);
+    ret = i2c_write(i2c_dev, NULL, 0, VL53L1X_NEW_ADDR);
+    if (ret != 0) {
+        printf("WARNING: Sensor not responding at 0x%02X (ret: %d), continuing anyway...\n", 
+               VL53L1X_NEW_ADDR, ret);
+    } else {
+        printf("Sensor confirmed responding at 0x%02X\n", VL53L1X_NEW_ADDR);
+    }
+
+    /* Initialize the sensor now that it's powered and address is reprogrammed */
     const struct device *tof_dev = DEVICE_DT_GET(DT_ALIAS(tof0));
     
-    /* Check if ToF sensor device is ready */
-    if (!device_is_ready(tof_dev)) {
-        printf("ERROR: ToF sensor device (VL53L1X) is not ready.\n");
+    printf("\nInitializing VL53L1X sensor after address reprogramming...\n");
+    ret = vl53l1x_reinit(tof_dev);
+    if (ret != 0) {
+        printf("ERROR: Failed to initialize VL53L1X sensor (ret: %d)\n", ret);
+        /* Error code -134 (0xFFFFFF7A) is from ST HAL library.
+         * This could indicate sensor not ready, I2C issue, or invalid parameters.
+         * Common VL53L1 error codes: 0=SUCCESS, -1=INVALID_PARAMS, -4=TIME_OUT, -13=REF_SPAD_INIT
+         */
+        printf("Error code %d (0x%08X) from ST HAL library.\n", ret, (unsigned int)ret);
+        printf("Make sure:\n");
+        printf("  - Sensor is powered (GPIO6 HIGH)\n");
+        printf("  - Sensor is at address 0x%02X\n", VL53L1X_NEW_ADDR);
+        printf("  - Sensor has had enough time after address change (50ms+)\n");
+        printf("  - I2C bus is functioning correctly\n");
         return 1;
     }
-    printf("ToF sensor device ready: %s\n\n", tof_dev->name);
+    printf("VL53L1X sensor initialized successfully.\n\n");
 
     /* Continuously read distance measurements from the VL53L1X */
     printf("\nEntering VL53L1X continuous distance read loop...\n");
+    printf("Note: If the driver failed initialization during boot, it may not recover\n");
+    printf("automatically. The power cycle should help, but if errors persist, the\n");
+    printf("driver may need to be modified to support deferred initialization.\n\n");
 
     struct sensor_value distance;
     double dist_mm;
+    int consecutive_errors = 0;
+    const int MAX_CONSECUTIVE_ERRORS = 10;
 
     while (1) {
         ret = sensor_sample_fetch(tof_dev);
         if (ret < 0) {
-            printf("ERROR: sensor_sample_fetch failed (%d)\n", ret);
+            consecutive_errors++;
+            if (consecutive_errors <= MAX_CONSECUTIVE_ERRORS) {
+                printf("ERROR: sensor_sample_fetch failed (%d) [attempt %d/%d]\n", 
+                       ret, consecutive_errors, MAX_CONSECUTIVE_ERRORS);
+            }
+            if (consecutive_errors == MAX_CONSECUTIVE_ERRORS) {
+                printf("\nERROR: Too many consecutive failures. The driver may need to be reinitialized.\n");
+                printf("The sensor is at address 0x%02X and GPIO6 is HIGH, but the driver\n", VL53L1X_NEW_ADDR);
+                printf("initialized during boot when the sensor wasn't ready.\n");
+                printf("Try power-cycling the board or modifying the driver to support runtime initialization.\n");
+                return 1;
+            }
         } else {
+            consecutive_errors = 0; /* Reset error counter on success */
             ret = sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &distance);
             if (ret < 0) {
                 printf("ERROR: sensor_channel_get failed (%d)\n", ret);
