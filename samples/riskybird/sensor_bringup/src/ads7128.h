@@ -81,7 +81,9 @@
     /* I2C_SPEED field */
     #define I2C_SPEED_MASK													((uint8_t) 0x20)
     #define I2C_SPEED_NORMAL												((uint8_t) 0x00)    // DEFAULT
+    #ifndef I2C_SPEED_HIGH  /* Avoid redefinition if Zephyr already defines it */
     #define I2C_SPEED_HIGH													((uint8_t) 0x20)
+    #endif
 
     /* OSR_DONE field */
     #define OSR_DONE_MASK													((uint8_t) 0x08)

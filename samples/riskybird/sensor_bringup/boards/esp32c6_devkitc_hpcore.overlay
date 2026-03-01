@@ -45,12 +45,12 @@
 	};
 	
 	/* VL53L1X Time-of-Flight sensor
-	 * Default I2C address is 0x29 (can be changed via XSHUT sequence)
+	 * Reprogrammed to I2C address 0x30 (default is 0x29)
 	 * XSHUT control is handled via ADS7128 GPIO6 in application code
 	 */
-	vl53l1x: vl53l1x@29 {
+	vl53l1x: vl53l1x@30 {
 		compatible = "st,vl53l1x";
-		reg = <0x29>;
+		reg = <0x30>;
 		status = "okay";
 	};
 };
