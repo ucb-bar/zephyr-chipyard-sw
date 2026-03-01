@@ -1,0 +1,41 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * PMW3901 bring-up overlay (SPI2 pinmux)
+ *
+ * Pin mapping (riskybird PCB):
+ * - SCK:  GPIO6
+ * - MOSI: GPIO7
+ * - MISO: GPIO18
+ * - CS:   GPIO19  (handled as a normal GPIO in software; not hardware CSEL)
+ * - RST:  GPIO2   (optional, active-low)
+ * - LED:  GPIO3   (optional, active-low)
+ *
+ * This overlay reconfigures SPI2 pinmux to match the PMW3901 wiring.
+ */
+
+/* Disable I2C0 to avoid pin conflict with GPIO6/GPIO7 (board default I2C0). */
+&i2c0 {
+	status = "disabled";
+};
+
+&pinctrl {
+	spim2_pmw3901: spim2_pmw3901 {
+		group1 {
+			pinmux = <SPIM2_MISO_GPIO18>,
+				 <SPIM2_SCLK_GPIO6>,
+				 <SPIM2_CSEL_GPIO10>;
+		};
+
+		group2 {
+			pinmux = <SPIM2_MOSI_GPIO7>;
+			output-low;
+		};
+	};
+};
+
+&spi2 {
+	status = "okay";
+	pinctrl-0 = <&spim2_pmw3901>;
+	pinctrl-names = "default";
+};
