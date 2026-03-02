@@ -1,0 +1,61 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * 
+ * Overlay for custom ESP32C6 PCB
+ * Override I2C pin assignments to match your PCB
+ */
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO15>,  
+				 <I2C0_SCL_GPIO14>;  
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+
+	clock-frequency = <400000>;
+
+	/* Final unique addresses after reprogramming (see sample logic). */
+	vl53l5cx0: vl53l5cx@31 {
+		compatible = "st,vl53l5cx";
+		reg = <0x31>;
+		status = "okay";
+	};
+
+	vl53l5cx1: vl53l5cx@32 {
+		compatible = "st,vl53l5cx";
+		reg = <0x32>;
+		status = "okay";
+	};
+
+	vl53l5cx2: vl53l5cx@33 {
+		compatible = "st,vl53l5cx";
+		reg = <0x33>;
+		status = "okay";
+	};
+
+	vl53l5cx3: vl53l5cx@34 {
+		compatible = "st,vl53l5cx";
+		reg = <0x34>;
+		status = "okay";
+	};
+};
+
+/ {
+	/* Define aliases for easier access in code */
+	aliases {
+		tof0 = &vl53l5cx0;
+		tof1 = &vl53l5cx1;
+		tof2 = &vl53l5cx2;
+		tof3 = &vl53l5cx3;
+	};
+};
