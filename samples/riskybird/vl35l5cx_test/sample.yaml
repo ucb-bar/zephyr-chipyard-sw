@@ -1,0 +1,9 @@
+sample:
+  description: Minimal VL53L5CX bring-up using ADS7128 GPIO expander enable
+  name: vl53l5cx minimal
+common:
+  tags: sensor i2c
+  integration_platforms:
+    - esp32c6_devkitc
+  harness: console
+tests: {}
