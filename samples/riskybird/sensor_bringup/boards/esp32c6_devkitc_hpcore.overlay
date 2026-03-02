@@ -24,6 +24,20 @@
 			output-high;
 		};
 	};
+
+	spim2_pmw3901: spim2_pmw3901 {
+		group1 {
+			/* SPI2 pins for PMW3901 (riskybird PCB) */
+			pinmux = <SPIM2_MISO_GPIO18>,
+				 <SPIM2_SCLK_GPIO6>,
+				 <SPIM2_CSEL_GPIO10>;
+		};
+
+		group2 {
+			pinmux = <SPIM2_MOSI_GPIO7>;
+			output-low;
+		};
+	};
 };
 
 &i2c0 {
@@ -53,4 +67,10 @@
 		reg = <0x30>;
 		status = "okay";
 	};
+};
+
+&spi2 {
+	status = "okay";
+	pinctrl-0 = <&spim2_pmw3901>;
+	pinctrl-names = "default";
 };

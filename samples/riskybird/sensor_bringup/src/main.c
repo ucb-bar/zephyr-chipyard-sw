@@ -19,12 +19,19 @@
 #include <errno.h>
 
 #include "ads7128.h"
+#include "pmw3901.h"
 
 #define I2C_NODE DT_NODELABEL(i2c0)
+#define SPI_NODE DT_NODELABEL(spi2)
+#define GPIO_NODE DT_NODELABEL(gpio0)
 #define ADS7128_I2C_ADDR 0x17
 #define VL53L1X_OLD_ADDR 0x29
 #define VL53L1X_NEW_ADDR 0x30
 #define VL53L1X_I2C_SLAVE_ADDR_REG 0x01  /* Register to change I2C address */
+
+/* PMW3901 pins (riskybird PCB) */
+#define PMW3901_CS_GPIO_PIN    19
+#define PMW3901_RESET_GPIO_PIN 2
 
 /* ADS7128 I2C command opcodes (Table 9 in datasheet, section 8.5.1/8.5.2) */
 #define ADS7128_CMD_REG_WRITE 0x08  /* 0000 1000b: Single register write */
@@ -216,6 +223,49 @@ static void i2c_scan(const struct device *i2c_dev)
     }
 }
 
+/* PMW3901 device/config instantiated at runtime (bring-up oriented) */
+static struct pmw3901_config pmw3901_cfg;
+static struct pmw3901_data pmw3901_data;
+static const struct device pmw3901_device = {
+	.name = "PMW3901",
+	.config = &pmw3901_cfg,
+	.data = &pmw3901_data,
+};
+
+#define PMW3901_DEV (&pmw3901_device)
+
+static int pmw3901_init_config(void)
+{
+	if (!DT_NODE_EXISTS(SPI_NODE) || !DT_NODE_EXISTS(GPIO_NODE)) {
+		printf("PMW3901: missing SPI/GPIO devicetree nodes\n");
+		return -ENODEV;
+	}
+
+	const struct device *spi_dev = DEVICE_DT_GET(SPI_NODE);
+	const struct device *gpio_dev = DEVICE_DT_GET(GPIO_NODE);
+	if (spi_dev == NULL || gpio_dev == NULL) {
+		return -ENODEV;
+	}
+
+	pmw3901_cfg.spi.bus = spi_dev;
+	/* PMW3901 uses SPI mode 3 (CPOL=1, CPHA=1) */
+	pmw3901_cfg.spi.config.operation =
+		SPI_WORD_SET(8) | SPI_OP_MODE_MASTER | SPI_MODE_CPOL | SPI_MODE_CPHA |
+		SPI_TRANSFER_MSB;
+	pmw3901_cfg.spi.config.frequency = 2000000; /* 2 MHz bring-up */
+	pmw3901_cfg.spi.config.slave = 0;
+
+	pmw3901_cfg.cs_gpio.port = gpio_dev;
+	pmw3901_cfg.cs_gpio.pin = PMW3901_CS_GPIO_PIN;
+	pmw3901_cfg.cs_gpio.dt_flags = GPIO_ACTIVE_LOW;
+
+	pmw3901_cfg.reset_gpio.port = gpio_dev;
+	pmw3901_cfg.reset_gpio.pin = PMW3901_RESET_GPIO_PIN;
+	pmw3901_cfg.reset_gpio.dt_flags = GPIO_ACTIVE_LOW;
+
+	return 0;
+}
+
 int main(void)
 {
     const struct device *i2c_dev = DEVICE_DT_GET(I2C_NODE);
@@ -223,6 +273,22 @@ int main(void)
 
     printf("Sensor Bringup: I2C Scan with GPIO Control\n");
     printf("==========================================\n\n");
+
+    /* Initialize PMW3901 optical flow sensor before doing I2C scans */
+    printf("Initializing PMW3901 (optical flow)...\n");
+    ret = pmw3901_init_config();
+    if (ret != 0) {
+        printf("WARNING: PMW3901 config init failed (ret: %d), continuing\n\n", ret);
+    } else if (!device_is_ready(pmw3901_cfg.spi.bus) || !device_is_ready(pmw3901_cfg.cs_gpio.port)) {
+        printf("WARNING: PMW3901 SPI/GPIO not ready, continuing\n\n");
+    } else {
+        ret = pmw3901_init(PMW3901_DEV);
+        if (ret != 0) {
+            printf("WARNING: PMW3901 init failed (ret: %d), continuing\n\n", ret);
+        } else {
+            printf("PMW3901 initialized.\n\n");
+        }
+    }
 
     /* Check if I2C device is ready */
     if (!device_is_ready(i2c_dev)) {
@@ -341,6 +407,18 @@ int main(void)
     }
     printf("VL53L1X sensor initialized successfully.\n\n");
 
+    /* Enable VL53L5 power/enable via GPIO1 and perform a third I2C scan */
+    printf("Enabling VL53L5 via ADS7128 GPIO1 (set HIGH)...\n");
+    ret = ads7128_write_gpio(i2c_dev, 1, 1);
+    if (ret != 0) {
+        printf("ERROR: Failed to set GPIO1 HIGH (ret: %d)\n", ret);
+        return 1;
+    }
+    k_msleep(100); /* Allow time for VL53L5 to power up / enable */
+
+    printf("\n--- I2C Scan #3 (GPIO1 = HIGH, GPIO2-4 = LOW, GPIO6 = HIGH) ---\n");
+    i2c_scan(i2c_dev);
+
     /* Continuously read distance measurements from the VL53L1X */
     printf("\nEntering VL53L1X continuous distance read loop...\n");
     printf("Note: If the driver failed initialization during boot, it may not recover\n");
@@ -351,6 +429,8 @@ int main(void)
     double dist_mm;
     int consecutive_errors = 0;
     const int MAX_CONSECUTIVE_ERRORS = 10;
+    motionBurst_t flow_motion;
+    bool pmw_ok = (ret == 0);
 
     while (1) {
         ret = sensor_sample_fetch(tof_dev);
@@ -375,7 +455,13 @@ int main(void)
             } else {
                 /* Distance is reported in meters; print directly using float printf support */
                 dist_mm = sensor_value_to_double(&distance);
-                printf("VL53L1X distance: %.1f mm\n", dist_mm);
+                if (pmw_ok && (pmw3901_read_motion_burst(PMW3901_DEV, &flow_motion) == 0)) {
+                    printf("VL53L1X: %.1f mm | PMW3901: dX=%d dY=%d SQUAL=%u Shutter=%u\n",
+                           dist_mm, flow_motion.deltaX, flow_motion.deltaY,
+                           flow_motion.squal, flow_motion.shutter);
+                } else {
+                    printf("VL53L1X: %.1f mm | PMW3901: (no data)\n", dist_mm);
+                }
             }
         }
 
