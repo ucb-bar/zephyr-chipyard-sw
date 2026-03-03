@@ -115,6 +115,10 @@ main() {
   log "Installing plotting dependencies..."
   run_cmd "${CONDA_RUN} pip install matplotlib"
 
+  # Install the zephyr/scripts/list_boards.py dependency (jsonschema) 
+  log "Installing zephyr/scripts/list_boards.py dependency (jsonschema) ..."
+  run_cmd "${CONDA_RUN} pip install jsonschema"
+
   # Init submodules
   log "Initializing git submodules..."
   run_cmd "git submodule update --init ./tools/pyuartsi"
