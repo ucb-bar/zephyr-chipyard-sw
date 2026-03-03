@@ -4,7 +4,7 @@
 	branch = zephyr
 [submodule "third-party/executorch"]
 	path = third-party/executorch
-	url = git@github.com:ucb-bar/executorch.git
+	url = https://github.com/ucb-bar/executorch.git
 	branch = zephyr
 [submodule "samples/drone_control/tinympc"]
 	path = samples/drone_control/tinympc
@@ -27,5 +27,5 @@
 	url = https://github.com/picolibc/picolibc.git
 [submodule "tools/Baremetal-IDE"]
 	path = tools/Baremetal-IDE
-	url = git@github.com:ucb-bar/sp24-Baremetal-IDE.git
+	url = https://github.com/ucb-bar/sp24-Baremetal-IDE.git
 	branch = george
