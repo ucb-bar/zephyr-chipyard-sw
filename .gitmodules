@@ -29,3 +29,7 @@
 	path = tools/Baremetal-IDE
 	url = https://github.com/ucb-bar/sp24-Baremetal-IDE.git
 	branch = george
+[submodule "third-party/micro_ros_zephyr_module"]
+	path = third-party/micro_ros_zephyr_module
+	url = https://github.com/micro-ROS/micro_ros_zephyr_module.git
+	branch = jazzy
