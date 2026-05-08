@@ -82,18 +82,18 @@ static const uint8_t XRCE_VENDOR_EPROSIMA[2] = {0x01, 0x0F};
 K_THREAD_STACK_DEFINE(broker_stack, BROKER_THREAD_STACK);
 static struct k_thread broker_thread_data;
 
-/* Per-session state — we have at most one client. */
+/* Per-session state — one slot per loopback queue pair. */
 struct session_state {
 	bool     active;
-	uint8_t  session_id;
+	uint8_t  session_id;        /* the XRCE-DDS protocol session_id, e.g. 0x81 */
 	uint8_t  key[4];
-	/* One seq counter per output-stream class. We don't model multiple
-	 * indices because rmw_microxrcedds_c only uses one of each. */
+	/* One reply seq counter per output-stream class. rmw_microxrcedds_c
+	 * uses at most one stream of each kind per session. */
 	uint16_t seq_none;
 	uint16_t seq_be;
 	uint16_t seq_rel;
 };
-static struct session_state sess;
+static struct session_state sessions[LOOPBACK_MAX_SESSIONS];
 
 /* ----- Entity registry (for WRITE_DATA -> DATA fanout) ---------------------
  *
@@ -113,30 +113,46 @@ static struct session_state sess;
 #define MAX_DATAREADERS  8
 #define MAX_TOPIC_NAME   64
 
-struct topic_ent { bool used; uint8_t id[2]; char name[MAX_TOPIC_NAME]; };
-struct ep_ent    { bool used; uint8_t id[2]; uint8_t topic_id[2]; };
+/* Each entity carries the session_idx of its creator so reply routing knows
+ * which queue (and thus which session_id / key) to use when delivering DATA
+ * to a subscribed datareader.  Object_ids are 2 bytes — they are unique
+ * within a session but two different sessions can both have, say, id=0x0001. */
+struct topic_ent {
+	bool    used;
+	int     session_idx;
+	uint8_t id[2];
+	char    name[MAX_TOPIC_NAME];
+};
+struct ep_ent {
+	bool    used;
+	int     session_idx;
+	uint8_t id[2];
+	uint8_t topic_id[2];
+};
 
 static struct topic_ent topics[MAX_TOPICS];
 static struct ep_ent    datawriters[MAX_DATAWRITERS];
 static struct ep_ent    datareaders[MAX_DATAREADERS];
 
-static struct topic_ent *find_topic(const uint8_t id[2])
+static struct topic_ent *find_topic(int session_idx, const uint8_t id[2])
 {
 	for (size_t i = 0; i < MAX_TOPICS; i++) {
-		if (topics[i].used && topics[i].id[0] == id[0] && topics[i].id[1] == id[1]) {
+		if (topics[i].used && topics[i].session_idx == session_idx &&
+		    topics[i].id[0] == id[0] && topics[i].id[1] == id[1]) {
 			return &topics[i];
 		}
 	}
 	return NULL;
 }
 
-static struct topic_ent *alloc_topic(const uint8_t id[2])
+static struct topic_ent *alloc_topic(int session_idx, const uint8_t id[2])
 {
-	struct topic_ent *t = find_topic(id);
+	struct topic_ent *t = find_topic(session_idx, id);
 	if (t) return t;
 	for (size_t i = 0; i < MAX_TOPICS; i++) {
 		if (!topics[i].used) {
 			topics[i].used = true;
+			topics[i].session_idx = session_idx;
 			topics[i].id[0] = id[0];
 			topics[i].id[1] = id[1];
 			topics[i].name[0] = '\0';
@@ -146,23 +162,27 @@ static struct topic_ent *alloc_topic(const uint8_t id[2])
 	return NULL;
 }
 
-static struct ep_ent *find_ep(struct ep_ent *table, size_t n, const uint8_t id[2])
+static struct ep_ent *find_ep(struct ep_ent *table, size_t n,
+			      int session_idx, const uint8_t id[2])
 {
 	for (size_t i = 0; i < n; i++) {
-		if (table[i].used && table[i].id[0] == id[0] && table[i].id[1] == id[1]) {
+		if (table[i].used && table[i].session_idx == session_idx &&
+		    table[i].id[0] == id[0] && table[i].id[1] == id[1]) {
 			return &table[i];
 		}
 	}
 	return NULL;
 }
 
-static struct ep_ent *alloc_ep(struct ep_ent *table, size_t n, const uint8_t id[2])
+static struct ep_ent *alloc_ep(struct ep_ent *table, size_t n,
+			       int session_idx, const uint8_t id[2])
 {
-	struct ep_ent *e = find_ep(table, n, id);
+	struct ep_ent *e = find_ep(table, n, session_idx, id);
 	if (e) return e;
 	for (size_t i = 0; i < n; i++) {
 		if (!table[i].used) {
 			table[i].used = true;
+			table[i].session_idx = session_idx;
 			table[i].id[0] = id[0];
 			table[i].id[1] = id[1];
 			return &table[i];
@@ -173,7 +193,11 @@ static struct ep_ent *alloc_ep(struct ep_ent *table, size_t n, const uint8_t id[
 
 /* Header values from the message currently being processed. Replies echo
  * these so pre-session pings (session_id=0x80, no key) get pre-session
- * replies and post-session traffic gets the established session header. */
+ * replies and post-session traffic gets the established session header.
+ * cur_session_idx is the loopback transport queue index (which client this
+ * inbound message came from), distinct from cur_session_id which is the
+ * XRCE-DDS protocol session_id chosen by the client. */
+static int      cur_session_idx;
 static uint8_t  cur_session_id;
 static uint8_t  cur_key[4];
 static uint8_t  cur_in_stream_id;
@@ -288,16 +312,19 @@ static void put_msg_header(ucdrBuffer *ub, uint8_t session_id, uint8_t stream_id
 	}
 }
 
-/* Bump and return the appropriate per-stream seq counter. */
-static uint16_t next_seq_for(uint8_t stream_id)
+/* Bump and return the appropriate per-stream seq counter for the named
+ * session. Pulled into its own function so DATA-fanout to a subscriber on a
+ * different session uses that session's counter, not the publisher's. */
+static uint16_t next_seq_for(int session_idx, uint8_t stream_id)
 {
+	struct session_state *s = &sessions[session_idx];
 	if (stream_id == 0) {
-		return sess.seq_none++;
+		return s->seq_none++;
 	}
 	if (stream_id < STREAM_THRESH_REL) {
-		return sess.seq_be++;
+		return s->seq_be++;
 	}
-	return sess.seq_rel++;
+	return s->seq_rel++;
 }
 
 static void put_subheader(ucdrBuffer *ub, uint8_t id, uint8_t flags, uint16_t length)
@@ -324,7 +351,8 @@ static void send_status_agent(uint16_t request_id, uint8_t status_value)
 	/* STATUS_AGENT must arrive on the NONE stream (the client's read path
 	 * for STATUS_AGENT requires stream_id.type == UXR_NONE_STREAM). */
 	const uint8_t reply_stream = 0;
-	put_msg_header(&ub, cur_session_id, reply_stream, next_seq_for(reply_stream), cur_key);
+	put_msg_header(&ub, cur_session_id, reply_stream,
+		       next_seq_for(cur_session_idx, reply_stream), cur_key);
 
 	/* STATUS_AGENT payload:
 	 *   ResultStatus (2): status, implementation_status
@@ -347,7 +375,7 @@ static void send_status_agent(uint16_t request_id, uint8_t status_value)
 	(void)request_id;  /* not echoed in STATUS_AGENT */
 
 	s.len = (uint16_t)ucdr_buffer_length(&ub);
-	(void)loopback_broker_send(&s);
+	(void)loopback_broker_send(cur_session_idx, &s);
 }
 
 static void send_status(uint16_t related_request_id, const uint8_t object_id[2],
@@ -360,7 +388,8 @@ static void send_status(uint16_t related_request_id, const uint8_t object_id[2],
 	/* For non-DELETE_SESSION STATUS, anything except NONE stream is fine.
 	 * Mirror the inbound stream so reliable requests get reliable replies. */
 	const uint8_t reply_stream = cur_in_stream_id ? cur_in_stream_id : 0x80;
-	put_msg_header(&ub, cur_session_id, reply_stream, next_seq_for(reply_stream), cur_key);
+	put_msg_header(&ub, cur_session_id, reply_stream,
+		       next_seq_for(cur_session_idx, reply_stream), cur_key);
 
 	/* STATUS payload: BaseObjectReply
 	 *   related_request: RequestId(2) + ObjectId(2) = 4
@@ -379,7 +408,7 @@ static void send_status(uint16_t related_request_id, const uint8_t object_id[2],
 	ucdr_serialize_uint8_t(&ub, 0);   /* implementation_status */
 
 	s.len = (uint16_t)ucdr_buffer_length(&ub);
-	(void)loopback_broker_send(&s);
+	(void)loopback_broker_send(cur_session_idx, &s);
 }
 
 static void send_info(uint16_t related_request_id, const uint8_t object_id[2])
@@ -389,7 +418,8 @@ static void send_info(uint16_t related_request_id, const uint8_t object_id[2])
 	ucdr_init_buffer(&ub, s.data, sizeof(s.data));
 
 	const uint8_t reply_stream = 0;   /* INFO matches GET_INFO stream (NONE) */
-	put_msg_header(&ub, cur_session_id, reply_stream, next_seq_for(reply_stream), cur_key);
+	put_msg_header(&ub, cur_session_id, reply_stream,
+		       next_seq_for(cur_session_idx, reply_stream), cur_key);
 
 	/* INFO payload — must satisfy uxr_acknack_pong / read_submessage_info:
 	 *   BaseObjectReply: request_id(2) + object_id(2) + result(2)        = 6
@@ -421,7 +451,7 @@ static void send_info(uint16_t related_request_id, const uint8_t object_id[2])
 		1);                                             /* availability > 0 */
 
 	s.len = (uint16_t)ucdr_buffer_length(&ub);
-	(void)loopback_broker_send(&s);
+	(void)loopback_broker_send(cur_session_idx, &s);
 }
 
 /* ----- Inbound submessage handling ----- */
@@ -462,12 +492,13 @@ static void handle_create_client(ucdrBuffer *ub, uint8_t session_id_masked,
 	ucdr_deserialize_array_uint8_t(ub, client_key, 4);
 	ucdr_deserialize_uint8_t(ub, &real_session_id);
 
-	sess.active = true;
-	sess.session_id = real_session_id;
-	memcpy(sess.key, client_key, 4);
-	sess.seq_none = 0;
-	sess.seq_be = 0;
-	sess.seq_rel = 0;
+	struct session_state *s = &sessions[cur_session_idx];
+	s->active = true;
+	s->session_id = real_session_id;
+	memcpy(s->key, client_key, 4);
+	s->seq_none = 0;
+	s->seq_be = 0;
+	s->seq_rel = 0;
 
 	/* uxr_read_session_header rejects any reply whose header session_id !=
 	 * info->id, including the STATUS_AGENT we send back here. So we already
@@ -475,7 +506,7 @@ static void handle_create_client(ucdrBuffer *ub, uint8_t session_id_masked,
 	cur_session_id = real_session_id;
 	memcpy(cur_key, client_key, 4);
 
-	printk("broker: session up id=0x%02x\n", real_session_id);
+	printk("broker: session up s=%d id=0x%02x\n", cur_session_idx, real_session_id);
 	send_status_agent(0, STATUS_OK);
 }
 
@@ -581,11 +612,13 @@ static void handle_create(ucdrBuffer *ub, uint16_t length)
 			if (open_binary_repr(ub, &blob)) {
 				char name[MAX_TOPIC_NAME];
 				if (read_cdr_string(&blob, name, sizeof(name))) {
-					struct topic_ent *t = alloc_topic(b.object_id);
+					struct topic_ent *t = alloc_topic(cur_session_idx,
+									  b.object_id);
 					if (t) {
 						strncpy(t->name, name, MAX_TOPIC_NAME - 1);
 						t->name[MAX_TOPIC_NAME - 1] = '\0';
-						printk("broker: TOPIC id=%02x%02x name=%s\n",
+						printk("broker: TOPIC s=%d id=%02x%02x name=%s\n",
+						       cur_session_idx,
 						       b.object_id[0], b.object_id[1], t->name);
 					}
 				}
@@ -606,14 +639,17 @@ static void handle_create(ucdrBuffer *ub, uint16_t length)
 				uint8_t topic_id[2];
 				if (ucdr_deserialize_array_uint8_t(&blob, topic_id, 2)) {
 					struct ep_ent *e = (obj_kind(b.object_id) == OBJK_DATAWRITER)
-						? alloc_ep(datawriters, MAX_DATAWRITERS, b.object_id)
-						: alloc_ep(datareaders, MAX_DATAREADERS, b.object_id);
+						? alloc_ep(datawriters, MAX_DATAWRITERS,
+							   cur_session_idx, b.object_id)
+						: alloc_ep(datareaders, MAX_DATAREADERS,
+							   cur_session_idx, b.object_id);
 					if (e) {
 						e->topic_id[0] = topic_id[0];
 						e->topic_id[1] = topic_id[1];
-						printk("broker: %s id=%02x%02x topic=%02x%02x\n",
+						printk("broker: %s s=%d id=%02x%02x topic=%02x%02x\n",
 						       (obj_kind(b.object_id) == OBJK_DATAWRITER) ?
 							       "DW   " : "DR   ",
+						       cur_session_idx,
 						       b.object_id[0], b.object_id[1],
 						       topic_id[0], topic_id[1]);
 					}
@@ -645,22 +681,29 @@ static void handle_delete(ucdrBuffer *ub, uint16_t length)
 }
 
 /* Build and queue one DATA submessage delivering `payload[0..payload_len)` to
- * the subscriber identified by `dr_id`. Each datareader gets a FRESH XRCE-DDS
- * message — this matches the upstream agent's behavior of one-DATA-per-message
- * on the reliable input stream and keeps the seq numbering simple. */
-static void send_data(const uint8_t dr_id[2], const uint8_t *payload,
-		      size_t payload_len)
+ * the subscriber identified by `dr_id` on session `target_session_idx`.
+ * The header session_id, key, and seq counter all come from that target's
+ * session_state — that's how cross-session pub/sub works: WRITE_DATA in on
+ * session A, DATA out on session B with B's session metadata. */
+static void send_data(int target_session_idx, const uint8_t dr_id[2],
+		      const uint8_t *payload, size_t payload_len)
 {
+	if (target_session_idx < 0 ||
+	    target_session_idx >= LOOPBACK_MAX_SESSIONS ||
+	    !sessions[target_session_idx].active) {
+		return;
+	}
+	struct session_state *target = &sessions[target_session_idx];
+
 	struct loopback_slot s;
 	ucdrBuffer ub;
 	ucdr_init_buffer(&ub, s.data, sizeof(s.data));
 
-	/* Reliable input stream from the client's perspective (= our output
-	 * reliable stream). Use seq_rel which the read_format_data path
-	 * accepts in any in-window order. */
+	/* Reliable input stream from the client's perspective. */
 	const uint8_t reply_stream = 0x80;
-	put_msg_header(&ub, cur_session_id, reply_stream,
-		       next_seq_for(reply_stream), cur_key);
+	put_msg_header(&ub, target->session_id, reply_stream,
+		       next_seq_for(target_session_idx, reply_stream),
+		       target->key);
 
 	/* DATA submessage:
 	 *   Subheader (4): id=9, flags=FORMAT_DATA|endian, length
@@ -671,14 +714,12 @@ static void send_data(const uint8_t dr_id[2], const uint8_t *payload,
 	uint8_t flags = pick_endian_flag() | FLAG_FORMAT_DATA;
 	put_subheader(&ub, SUB_DATA, flags, sub_payload_len);
 
-	/* request_id: anything non-zero; rmw_microxrcedds doesn't pair DATA
-	 * with READ_DATA requests for our usage pattern. Use 0x0000. */
 	ucdr_serialize_endian_uint16_t(&ub, UCDR_BIG_ENDIANNESS, 0x0000);
 	ucdr_serialize_array_uint8_t(&ub, dr_id, 2);
 	ucdr_serialize_array_uint8_t(&ub, payload, payload_len);
 
 	s.len = (uint16_t)ucdr_buffer_length(&ub);
-	(void)loopback_broker_send(&s);
+	(void)loopback_broker_send(target_session_idx, &s);
 }
 
 static void handle_write_data(ucdrBuffer *ub, uint16_t length)
@@ -697,12 +738,13 @@ static void handle_write_data(ucdrBuffer *ub, uint16_t length)
 	}
 	const uint8_t *payload = ub->iterator;
 
-	/* Find the datawriter, resolve to topic name. */
-	struct ep_ent *dw = find_ep(datawriters, MAX_DATAWRITERS, b.object_id);
+	/* Find the datawriter (on the publisher's session), resolve to topic name. */
+	struct ep_ent *dw = find_ep(datawriters, MAX_DATAWRITERS,
+				    cur_session_idx, b.object_id);
 	if (!dw) {
 		return;
 	}
-	struct topic_ent *src_topic = find_topic(dw->topic_id);
+	struct topic_ent *src_topic = find_topic(cur_session_idx, dw->topic_id);
 	if (!src_topic) {
 		return;
 	}
@@ -712,17 +754,25 @@ static void handle_write_data(ucdrBuffer *ub, uint16_t length)
 	 * Done once per WRITE_DATA, regardless of how many subscribers exist locally. */
 	log_topic_emit(src_topic->name, payload, payload_len);
 
-	/* Fan out to every datareader whose topic resolves to the same name. */
+	/* Fan out to every datareader (across all sessions) whose topic name
+	 * matches the publisher's. Topic_ids are distinct per session, so we
+	 * resolve each datareader's topic_id within its own session_idx and
+	 * compare names. */
 	for (size_t i = 0; i < MAX_DATAREADERS; i++) {
 		if (!datareaders[i].used) {
 			continue;
 		}
-		struct topic_ent *t = find_topic(datareaders[i].topic_id);
+		struct topic_ent *t = find_topic(datareaders[i].session_idx,
+						 datareaders[i].topic_id);
 		if (!t) {
 			continue;
 		}
 		if (strcmp(t->name, src_topic->name) == 0) {
-			send_data(datareaders[i].id, payload, payload_len);
+			printk("broker: fanout %s s=%d->s=%d (%u B)\n",
+			       src_topic->name, cur_session_idx,
+			       datareaders[i].session_idx, (unsigned)payload_len);
+			send_data(datareaders[i].session_idx,
+				  datareaders[i].id, payload, payload_len);
 		}
 	}
 
@@ -758,7 +808,7 @@ static void send_acknack(uint16_t first_unacked, uint8_t reliable_stream_id)
 	ucdr_serialize_uint8_t(&ub, reliable_stream_id);
 
 	s.len = (uint16_t)ucdr_buffer_length(&ub);
-	(void)loopback_broker_send(&s);
+	(void)loopback_broker_send(cur_session_idx, &s);
 }
 
 static void handle_heartbeat(ucdrBuffer *ub, uint16_t length)
@@ -777,10 +827,12 @@ static void handle_heartbeat(ucdrBuffer *ub, uint16_t length)
 static void broker_thread_fn(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	printk("broker: thread alive on hart %d\n", arch_proc_id());
 
 	struct loopback_slot in;
+	int session_idx;
 	for (;;) {
-		if (loopback_broker_recv(&in, K_FOREVER) != 0) {
+		if (loopback_broker_recv_any(&in, &session_idx, K_FOREVER) != 0) {
 			continue;
 		}
 		if (in.len < HEADER_NO_KEY) {
@@ -801,6 +853,7 @@ static void broker_thread_fn(void *a, void *b, void *c)
 			ucdr_deserialize_array_uint8_t(&ub, key, 4);
 		}
 		/* Stash so reply builders can echo the right header values. */
+		cur_session_idx = session_idx;
 		cur_session_id = session_id;
 		cur_in_stream_id = stream_id;
 		memcpy(cur_key, key, 4);
@@ -885,7 +938,12 @@ static void broker_thread_fn(void *a, void *b, void *c)
 
 void broker_start(void)
 {
-	memset(&sess, 0, sizeof(sess));
+	broker_start_pinned(-1);
+}
+
+void broker_start_pinned(int cpu)
+{
+	memset(sessions, 0, sizeof(sessions));
 	memset(topics, 0, sizeof(topics));
 	memset(datawriters, 0, sizeof(datawriters));
 	memset(datareaders, 0, sizeof(datareaders));
@@ -895,9 +953,21 @@ void broker_start(void)
 		htif_dev_for_log = NULL;
 	}
 
-	k_thread_create(&broker_thread_data, broker_stack,
-			K_THREAD_STACK_SIZEOF(broker_stack),
-			broker_thread_fn, NULL, NULL, NULL,
-			BROKER_THREAD_PRIO, 0, K_NO_WAIT);
-	k_thread_name_set(&broker_thread_data, "uros_broker");
+	/* Spawn suspended (K_FOREVER) so we can pin BEFORE the thread runs.
+	 * The cpu_pin call is illegal on a runnable thread under
+	 * CONFIG_SCHED_CPU_MASK_PIN_ONLY=y, which is what the existing
+	 * SMP samples in this repo use. */
+	k_tid_t tid = k_thread_create(&broker_thread_data, broker_stack,
+				      K_THREAD_STACK_SIZEOF(broker_stack),
+				      broker_thread_fn, NULL, NULL, NULL,
+				      BROKER_THREAD_PRIO, 0, K_FOREVER);
+	k_thread_name_set(tid, "uros_broker");
+#ifdef CONFIG_SCHED_CPU_MASK
+	if (cpu >= 0) {
+		k_thread_cpu_pin(tid, cpu);
+	}
+#else
+	(void)cpu;
+#endif
+	k_thread_start(tid);
 }
