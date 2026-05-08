@@ -87,6 +87,82 @@ struct session_state {
 };
 static struct session_state sess;
 
+/* ----- Entity registry (for WRITE_DATA -> DATA fanout) ---------------------
+ *
+ * To match a published topic to its subscribed datareaders we need three
+ * tables, all keyed by the 2-byte raw object_id:
+ *
+ *   topics[]:        topic raw_id  -> topic name string
+ *   datawriters[]:   dw    raw_id  -> the topic raw_id it writes to
+ *   datareaders[]:   dr    raw_id  -> the topic raw_id it reads from
+ *
+ * On WRITE_DATA arriving for some dw_id, we resolve dw -> topic_id -> name,
+ * then fan out a DATA submessage to every datareader whose topic_id resolves
+ * to the same name.
+ */
+#define MAX_TOPICS       8
+#define MAX_DATAWRITERS  8
+#define MAX_DATAREADERS  8
+#define MAX_TOPIC_NAME   64
+
+struct topic_ent { bool used; uint8_t id[2]; char name[MAX_TOPIC_NAME]; };
+struct ep_ent    { bool used; uint8_t id[2]; uint8_t topic_id[2]; };
+
+static struct topic_ent topics[MAX_TOPICS];
+static struct ep_ent    datawriters[MAX_DATAWRITERS];
+static struct ep_ent    datareaders[MAX_DATAREADERS];
+
+static struct topic_ent *find_topic(const uint8_t id[2])
+{
+	for (size_t i = 0; i < MAX_TOPICS; i++) {
+		if (topics[i].used && topics[i].id[0] == id[0] && topics[i].id[1] == id[1]) {
+			return &topics[i];
+		}
+	}
+	return NULL;
+}
+
+static struct topic_ent *alloc_topic(const uint8_t id[2])
+{
+	struct topic_ent *t = find_topic(id);
+	if (t) return t;
+	for (size_t i = 0; i < MAX_TOPICS; i++) {
+		if (!topics[i].used) {
+			topics[i].used = true;
+			topics[i].id[0] = id[0];
+			topics[i].id[1] = id[1];
+			topics[i].name[0] = '\0';
+			return &topics[i];
+		}
+	}
+	return NULL;
+}
+
+static struct ep_ent *find_ep(struct ep_ent *table, size_t n, const uint8_t id[2])
+{
+	for (size_t i = 0; i < n; i++) {
+		if (table[i].used && table[i].id[0] == id[0] && table[i].id[1] == id[1]) {
+			return &table[i];
+		}
+	}
+	return NULL;
+}
+
+static struct ep_ent *alloc_ep(struct ep_ent *table, size_t n, const uint8_t id[2])
+{
+	struct ep_ent *e = find_ep(table, n, id);
+	if (e) return e;
+	for (size_t i = 0; i < n; i++) {
+		if (!table[i].used) {
+			table[i].used = true;
+			table[i].id[0] = id[0];
+			table[i].id[1] = id[1];
+			return &table[i];
+		}
+	}
+	return NULL;
+}
+
 /* Header values from the message currently being processed. Replies echo
  * these so pre-session pings (session_id=0x80, no key) get pre-session
  * replies and post-session traffic gets the established session header. */
@@ -304,10 +380,154 @@ static void handle_create_client(ucdrBuffer *ub, uint8_t session_id_masked,
 	send_status_agent(0, STATUS_OK);
 }
 
+/* Object-kind nibble (low 4 bits of object_id[1]). */
+#define OBJK_PARTICIPANT  0x01
+#define OBJK_TOPIC        0x02
+#define OBJK_PUBLISHER    0x03
+#define OBJK_SUBSCRIBER   0x04
+#define OBJK_DATAWRITER   0x05
+#define OBJK_DATAREADER   0x06
+
+static inline uint8_t obj_kind(const uint8_t id[2])
+{
+	return id[1] & 0x0F;
+}
+
+/* Walk past a CDR string field starting at the buffer iterator: 4-byte aligned
+ * uint32 length, then `length` bytes (string includes its own NUL terminator),
+ * then padding to next 4-byte alignment.  Out parameter receives a copy (up
+ * to dst_size-1 chars + NUL).  Returns false on a malformed buffer. */
+static bool read_cdr_string(ucdrBuffer *ub, char *dst, size_t dst_size)
+{
+	uint32_t len = 0;
+	if (!ucdr_deserialize_uint32_t(ub, &len)) {
+		return false;
+	}
+	if (len == 0 || ucdr_buffer_remaining(ub) < len) {
+		return false;
+	}
+	size_t copy = (len - 1 < dst_size - 1) ? (len - 1) : (dst_size - 1);
+	for (size_t i = 0; i < len; i++) {
+		uint8_t c;
+		if (!ucdr_deserialize_uint8_t(ub, &c)) {
+			return false;
+		}
+		if (i < copy) {
+			dst[i] = (char)c;
+		}
+	}
+	dst[copy] = '\0';
+	return true;
+}
+
+/* Skip past the OBJK_Representation3_Base prefix shared by TOPIC / PUBLISHER /
+ * SUBSCRIBER / DATAWRITER / DATAREADER representations. Returns the inner
+ * binary blob's start (writes its length to *blob_len), or NULL if the format
+ * isn't IN_BINARY (the only one rmw_microxrcedds emits). */
+static bool open_binary_repr(ucdrBuffer *ub, ucdrBuffer *out_blob)
+{
+	uint8_t format;
+	if (!ucdr_deserialize_uint8_t(ub, &format)) {
+		return false;
+	}
+	if (format != 0x03 /* IN_BINARY */) {
+		return false;
+	}
+	uint32_t blob_size = 0;
+	if (!ucdr_deserialize_uint32_t(ub, &blob_size)) {
+		return false;
+	}
+	if (ucdr_buffer_remaining(ub) < blob_size) {
+		return false;
+	}
+	/* Initialize a fresh buffer over the blob — alignment within the blob
+	 * starts from offset 0, independent of where it sits in the outer msg. */
+	ucdr_init_buffer(out_blob, ub->iterator, blob_size);
+	/* Advance the outer buffer past the blob. */
+	for (uint32_t i = 0; i < blob_size; i++) {
+		uint8_t junk;
+		if (!ucdr_deserialize_uint8_t(ub, &junk)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static void handle_create(ucdrBuffer *ub, uint16_t length)
 {
 	(void)length;
 	struct base_request b = read_base_request(ub);
+
+	/* CREATE_Payload after BaseObjectRequest:
+	 *   ObjectVariant: kind(1) + variant-specific layout
+	 *
+	 * For our purposes we only need to extract:
+	 *   TOPIC      -> topic name (via OBJK_Topic_Binary)
+	 *   DATAWRITER -> topic_id   (via OBJK_DataWriter_Binary, first ObjectId field)
+	 *   DATAREADER -> topic_id   (via OBJK_DataReader_Binary, first ObjectId field)
+	 * Other CREATE kinds we just STATUS_OK and move on.
+	 */
+	uint8_t kind;
+	if (ucdr_deserialize_uint8_t(ub, &kind)) {
+		switch (obj_kind(b.object_id)) {
+		case OBJK_TOPIC: {
+			/* OBJK_TOPIC_Representation:
+			 *   OBJK_Representation3_Base { format(1) + binary blob }
+			 *   participant_id(2)
+			 * (parent_id comes AFTER the base — same order as PUB/SUB/DW/DR.)
+			 *
+			 * Inside the blob: OBJK_Topic_Binary { topic_name string + ... }
+			 */
+			ucdrBuffer blob;
+			if (open_binary_repr(ub, &blob)) {
+				char name[MAX_TOPIC_NAME];
+				if (read_cdr_string(&blob, name, sizeof(name))) {
+					struct topic_ent *t = alloc_topic(b.object_id);
+					if (t) {
+						strncpy(t->name, name, MAX_TOPIC_NAME - 1);
+						t->name[MAX_TOPIC_NAME - 1] = '\0';
+						printk("broker: TOPIC id=%02x%02x name=%s\n",
+						       b.object_id[0], b.object_id[1], t->name);
+					}
+				}
+			}
+			break;
+		}
+		case OBJK_DATAWRITER:
+		case OBJK_DATAREADER: {
+			/* DATAWRITER_Representation / DATAREADER_Representation:
+			 *   OBJK_Representation3_Base { format(1) + binary blob }
+			 *   parent_id(2)   <-- publisher_id or subscriber_id, ignored here
+			 *
+			 * Inside the blob: OBJK_Data{Writer,Reader}_Binary which begins
+			 * with topic_id (ObjectId, 2 bytes).
+			 */
+			ucdrBuffer blob;
+			if (open_binary_repr(ub, &blob)) {
+				uint8_t topic_id[2];
+				if (ucdr_deserialize_array_uint8_t(&blob, topic_id, 2)) {
+					struct ep_ent *e = (obj_kind(b.object_id) == OBJK_DATAWRITER)
+						? alloc_ep(datawriters, MAX_DATAWRITERS, b.object_id)
+						: alloc_ep(datareaders, MAX_DATAREADERS, b.object_id);
+					if (e) {
+						e->topic_id[0] = topic_id[0];
+						e->topic_id[1] = topic_id[1];
+						printk("broker: %s id=%02x%02x topic=%02x%02x\n",
+						       (obj_kind(b.object_id) == OBJK_DATAWRITER) ?
+							       "DW   " : "DR   ",
+						       b.object_id[0], b.object_id[1],
+						       topic_id[0], topic_id[1]);
+					}
+				}
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	(void)kind;
 	send_status(b.request_id, b.object_id, STATUS_OK);
 }
 
@@ -325,10 +545,91 @@ static void handle_delete(ucdrBuffer *ub, uint16_t length)
 	send_status(b.request_id, b.object_id, STATUS_OK);
 }
 
+/* Build and queue one DATA submessage delivering `payload[0..payload_len)` to
+ * the subscriber identified by `dr_id`. Each datareader gets a FRESH XRCE-DDS
+ * message — this matches the upstream agent's behavior of one-DATA-per-message
+ * on the reliable input stream and keeps the seq numbering simple. */
+static void send_data(const uint8_t dr_id[2], const uint8_t *payload,
+		      size_t payload_len)
+{
+	struct loopback_slot s;
+	ucdrBuffer ub;
+	ucdr_init_buffer(&ub, s.data, sizeof(s.data));
+
+	/* Reliable input stream from the client's perspective (= our output
+	 * reliable stream). Use seq_rel which the read_format_data path
+	 * accepts in any in-window order. */
+	const uint8_t reply_stream = 0x80;
+	put_msg_header(&ub, cur_session_id, reply_stream,
+		       next_seq_for(reply_stream), cur_key);
+
+	/* DATA submessage:
+	 *   Subheader (4): id=9, flags=FORMAT_DATA|endian, length
+	 *   BaseObjectRequest (4): request_id(2) + datareader_id(2)
+	 *   Payload: raw user bytes
+	 */
+	const uint16_t sub_payload_len = (uint16_t)(4 + payload_len);
+	uint8_t flags = pick_endian_flag() | FLAG_FORMAT_DATA;
+	put_subheader(&ub, SUB_DATA, flags, sub_payload_len);
+
+	/* request_id: anything non-zero; rmw_microxrcedds doesn't pair DATA
+	 * with READ_DATA requests for our usage pattern. Use 0x0000. */
+	ucdr_serialize_endian_uint16_t(&ub, UCDR_BIG_ENDIANNESS, 0x0000);
+	ucdr_serialize_array_uint8_t(&ub, dr_id, 2);
+	ucdr_serialize_array_uint8_t(&ub, payload, payload_len);
+
+	s.len = (uint16_t)ucdr_buffer_length(&ub);
+	(void)loopback_broker_send(&s);
+}
+
 static void handle_write_data(ucdrBuffer *ub, uint16_t length)
 {
-	(void)ub; (void)length;
-	/* Step 4 will route this. For now, drop. */
+	/* WRITE_DATA layout (FORMAT_DATA):
+	 *   BaseObjectRequest (4): request_id + datawriter_id
+	 *   payload bytes (length - 4): the user data
+	 */
+	struct base_request b = read_base_request(ub);
+	if (length < 4) {
+		return;
+	}
+	const uint16_t payload_len = (uint16_t)(length - 4);
+	if (ucdr_buffer_remaining(ub) < payload_len) {
+		return;
+	}
+	const uint8_t *payload = ub->iterator;
+
+	/* Find the datawriter, resolve to topic name. */
+	struct ep_ent *dw = find_ep(datawriters, MAX_DATAWRITERS, b.object_id);
+	if (!dw) {
+		return;
+	}
+	struct topic_ent *src_topic = find_topic(dw->topic_id);
+	if (!src_topic) {
+		return;
+	}
+
+	/* Fan out to every datareader whose topic resolves to the same name. */
+	for (size_t i = 0; i < MAX_DATAREADERS; i++) {
+		if (!datareaders[i].used) {
+			continue;
+		}
+		struct topic_ent *t = find_topic(datareaders[i].topic_id);
+		if (!t) {
+			continue;
+		}
+		if (strcmp(t->name, src_topic->name) == 0) {
+			send_data(datareaders[i].id, payload, payload_len);
+		}
+	}
+
+	/* Advance the outer parser past the payload bytes (the broker loop
+	 * will skip any unconsumed remainder, but be explicit). */
+	for (size_t i = 0; i < payload_len; i++) {
+		uint8_t junk;
+		if (!ucdr_deserialize_uint8_t(ub, &junk)) {
+			break;
+		}
+	}
 }
 
 static void send_acknack(uint16_t first_unacked, uint8_t reliable_stream_id)

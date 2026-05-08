@@ -1,13 +1,16 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Self-contained two-node micro-ROS sample: target-resident broker, no
- * host-side agent required. Spike runs the full sample and exits cleanly.
+ * Self-contained on-target ping-pong:
  *
- * For step 3 (stub broker): the executor / nodes / publishers are created
- * successfully and the executor loop runs. rcl_publish() calls succeed but
- * the broker drops WRITE_DATA — no inter-node delivery yet. Step 4 adds the
- * routing so node_a's pub reaches node_b's sub callback.
+ *   node_a:  timer @ 1 Hz  -> publishes /ping (Int32 incrementing counter)
+ *            sub on /pong  -> prints "pong N" via printk on receive
+ *
+ *   node_b:  sub on /ping  -> prints "ping N" via printk on receive,
+ *                             then publishes /pong (= ping+1) immediately
+ *
+ * No host agent. The target-resident broker (broker.c) routes WRITE_DATA
+ * from each publisher to the matching subscribed datareader.
  */
 
 #include <zephyr/kernel.h>
@@ -31,43 +34,45 @@
 	} \
 } while (0)
 
-static rcl_publisher_t pub_a;
-static rcl_publisher_t pub_b;
-static std_msgs__msg__Int32 msg_a;
-static std_msgs__msg__Int32 msg_b;
+static rcl_publisher_t   pub_ping;     /* on node_a, topic /ping */
+static rcl_publisher_t   pub_pong;     /* on node_b, topic /pong */
+static std_msgs__msg__Int32 ping_out;
+static std_msgs__msg__Int32 pong_out;
+static std_msgs__msg__Int32 ping_in;   /* node_b's incoming ping */
+static std_msgs__msg__Int32 pong_in;   /* node_a's incoming pong */
 
-static void timer_a_cb(rcl_timer_t *t, int64_t last_call_time)
+static void ping_timer_cb(rcl_timer_t *t, int64_t last_call_time)
 {
 	ARG_UNUSED(t); ARG_UNUSED(last_call_time);
-	(void)rcl_publish(&pub_a, &msg_a, NULL);
-	msg_a.data++;
+	printk("[node_a] tick: send ping=%d\n", (int)ping_out.data);
+	(void)rcl_publish(&pub_ping, &ping_out, NULL);
+	ping_out.data++;
 }
 
-static void timer_b_cb(rcl_timer_t *t, int64_t last_call_time)
+/* Runs on node_b when /ping arrives. Echoes back to /pong. */
+static void on_ping_received(const void *msg)
 {
-	ARG_UNUSED(t); ARG_UNUSED(last_call_time);
-	(void)rcl_publish(&pub_b, &msg_b, NULL);
-	msg_b.data += 10;
+	const std_msgs__msg__Int32 *m = (const std_msgs__msg__Int32 *)msg;
+	printk("[node_b] recv ping=%d -> send pong=%d\n",
+	       (int)m->data, (int)(m->data + 1));
+	pong_out.data = m->data + 1;
+	(void)rcl_publish(&pub_pong, &pong_out, NULL);
+}
+
+/* Runs on node_a when /pong arrives. */
+static void on_pong_received(const void *msg)
+{
+	const std_msgs__msg__Int32 *m = (const std_msgs__msg__Int32 *)msg;
+	printk("[node_a] recv pong=%d\n", (int)m->data);
 }
 
 static void uros_main(void)
 {
-	/* Wire the loopback custom transport. framing=false because k_msgq
-	 * preserves message boundaries — no need for the stream-framing
-	 * wrapper that targets serial-like transports. */
-	rmw_uros_set_custom_transport(
-		false,
-		NULL,
-		loopback_open,
-		loopback_close,
-		loopback_write,
-		loopback_read);
-
-	/* Launch the in-target broker thread. */
+	rmw_uros_set_custom_transport(false, NULL,
+				      loopback_open, loopback_close,
+				      loopback_write, loopback_read);
 	broker_start();
 
-	/* Same micro-ROS bring-up as before — but the agent it talks to is
-	 * the broker thread we just launched, on a queue. */
 	printk("micro_ros_local: pinging local broker...\n");
 	while (rmw_uros_ping_agent(1000, 1) != RMW_RET_OK) {
 		k_msleep(50);
@@ -85,36 +90,47 @@ static void uros_main(void)
 	const rosidl_message_type_support_t *int32_ts =
 		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32);
 
-	RCCHECK(rclc_publisher_init_default(&pub_a, &node_a, int32_ts, "/node_a/counter"));
-	RCCHECK(rclc_publisher_init_default(&pub_b, &node_b, int32_ts, "/node_b/counter"));
+	/* Publishers */
+	RCCHECK(rclc_publisher_init_default(&pub_ping, &node_a, int32_ts, "/ping"));
+	RCCHECK(rclc_publisher_init_default(&pub_pong, &node_b, int32_ts, "/pong"));
 
-	std_msgs__msg__Int32__init(&msg_a);
-	std_msgs__msg__Int32__init(&msg_b);
-	msg_a.data = 0;
-	msg_b.data = 0;
+	/* Subscribers — node_b listens to /ping, node_a listens to /pong */
+	rcl_subscription_t sub_ping_on_b, sub_pong_on_a;
+	RCCHECK(rclc_subscription_init_default(&sub_ping_on_b, &node_b, int32_ts, "/ping"));
+	RCCHECK(rclc_subscription_init_default(&sub_pong_on_a, &node_a, int32_ts, "/pong"));
 
-	rcl_timer_t timer_a, timer_b;
-	RCCHECK(rclc_timer_init_default2(&timer_a, &support,
-				RCL_MS_TO_NS(1000), timer_a_cb, true));
-	RCCHECK(rclc_timer_init_default2(&timer_b, &support,
-				RCL_MS_TO_NS(500),  timer_b_cb, true));
+	std_msgs__msg__Int32__init(&ping_out);
+	std_msgs__msg__Int32__init(&pong_out);
+	std_msgs__msg__Int32__init(&ping_in);
+	std_msgs__msg__Int32__init(&pong_in);
+	ping_out.data = 0;
 
+	rcl_timer_t ping_timer;
+	RCCHECK(rclc_timer_init_default2(&ping_timer, &support,
+					 RCL_MS_TO_NS(1000), ping_timer_cb, true));
+
+	/* Executor: 1 timer + 2 subscriptions = 3 handles. */
 	rclc_executor_t executor;
-	RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
-	RCCHECK(rclc_executor_add_timer(&executor, &timer_a));
-	RCCHECK(rclc_executor_add_timer(&executor, &timer_b));
+	RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
+	RCCHECK(rclc_executor_add_timer(&executor, &ping_timer));
+	RCCHECK(rclc_executor_add_subscription(&executor, &sub_ping_on_b, &ping_in,
+					       on_ping_received, ON_NEW_DATA));
+	RCCHECK(rclc_executor_add_subscription(&executor, &sub_pong_on_a, &pong_in,
+					       on_pong_received, ON_NEW_DATA));
 
-	const int64_t deadline_ms = k_uptime_get() + 10000;
-	printk("micro_ros_local: executor running (10s)\n");
+	const int64_t deadline_ms = k_uptime_get() + 8000;
+	printk("micro_ros_local: ping-pong loop (8s)\n");
 	while (k_uptime_get() < deadline_ms) {
 		rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
 		k_msleep(10);
 	}
-	printk("micro_ros_local: shutting down (a=%d b=%d)\n",
-	       (int)msg_a.data, (int)msg_b.data);
 
-	(void)rcl_publisher_fini(&pub_a, &node_a);
-	(void)rcl_publisher_fini(&pub_b, &node_b);
+	printk("micro_ros_local: shutting down (ping_out=%d)\n", (int)ping_out.data);
+
+	(void)rcl_subscription_fini(&sub_ping_on_b, &node_b);
+	(void)rcl_subscription_fini(&sub_pong_on_a, &node_a);
+	(void)rcl_publisher_fini(&pub_ping, &node_a);
+	(void)rcl_publisher_fini(&pub_pong, &node_b);
 	(void)rcl_node_fini(&node_a);
 	(void)rcl_node_fini(&node_b);
 	(void)rclc_support_fini(&support);
