@@ -26,6 +26,8 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/uart.h>
 #include <string.h>
 
 #include <ucdr/microcdr.h>
@@ -169,6 +171,97 @@ static struct ep_ent *alloc_ep(struct ep_ent *table, size_t n, const uint8_t id[
 static uint8_t  cur_session_id;
 static uint8_t  cur_key[4];
 static uint8_t  cur_in_stream_id;
+
+/* ----- Topic-data log over HTIF (HDLC-framed) ------------------------------
+ *
+ * Every successful WRITE_DATA fans out a side-channel record on the HTIF
+ * console:  <FLAG> <name_len:1> <name bytes> <payload bytes> <CRC16:2> <FLAG>
+ *
+ * with byte stuffing: 0x7E -> 0x7D 0x5E,  0x7D -> 0x7D 0x5D.  Console printk
+ * traffic shares the same byte stream, but the host-side decoder validates
+ * CRC and drops anything that isn't a valid frame, so printk and structured
+ * topic data coexist transparently.  See tools/microros/topic_log_decoder.py
+ * for the parser. */
+
+#define HDLC_FLAG  0x7E
+#define HDLC_ESC   0x7D
+#define HDLC_XOR   0x20
+
+static const struct device *htif_dev_for_log;
+
+static inline void htif_emit_byte_atomic(uint8_t b)
+{
+	uart_poll_out(htif_dev_for_log, b);
+}
+
+static void htif_emit_escaped(uint8_t b, uint16_t *crc)
+{
+	/* CRC-CCITT update on the unescaped byte. */
+	*crc ^= ((uint16_t)b) << 8;
+	for (int i = 0; i < 8; i++) {
+		*crc = (*crc & 0x8000u) ? (uint16_t)((*crc << 1) ^ 0x1021u)
+				       : (uint16_t)(*crc << 1);
+	}
+	if (b == HDLC_FLAG || b == HDLC_ESC) {
+		htif_emit_byte_atomic(HDLC_ESC);
+		htif_emit_byte_atomic(b ^ HDLC_XOR);
+	} else {
+		htif_emit_byte_atomic(b);
+	}
+}
+
+static void htif_emit_crc_byte(uint8_t b)
+{
+	if (b == HDLC_FLAG || b == HDLC_ESC) {
+		htif_emit_byte_atomic(HDLC_ESC);
+		htif_emit_byte_atomic(b ^ HDLC_XOR);
+	} else {
+		htif_emit_byte_atomic(b);
+	}
+}
+
+/* htif_lock is the per-byte mutex inside the standard HTIF uart driver. We
+ * declare it extern so we can hold it across our entire frame and keep
+ * concurrent printk traffic from interleaving inside one HDLC frame. The
+ * Zephyr HTIF driver acquires/releases the same mutex per byte, and Zephyr
+ * k_mutex is recursive — so uart_poll_out() called below works fine while
+ * we already hold it. */
+#ifdef CONFIG_MULTITHREADING
+extern struct k_mutex htif_lock;
+#endif
+
+static void log_topic_emit(const char *topic_name,
+			   const uint8_t *payload, size_t payload_len)
+{
+	if (!htif_dev_for_log) {
+		return;
+	}
+	size_t name_len = strlen(topic_name);
+	if (name_len > 255) {
+		return;
+	}
+
+#ifdef CONFIG_MULTITHREADING
+	k_mutex_lock(&htif_lock, K_FOREVER);
+#endif
+
+	uint16_t crc = 0xFFFFu;
+	htif_emit_byte_atomic(HDLC_FLAG);
+	htif_emit_escaped((uint8_t)name_len, &crc);
+	for (size_t i = 0; i < name_len; i++) {
+		htif_emit_escaped((uint8_t)topic_name[i], &crc);
+	}
+	for (size_t i = 0; i < payload_len; i++) {
+		htif_emit_escaped(payload[i], &crc);
+	}
+	htif_emit_crc_byte((uint8_t)(crc >> 8));
+	htif_emit_crc_byte((uint8_t)(crc & 0xFFu));
+	htif_emit_byte_atomic(HDLC_FLAG);
+
+#ifdef CONFIG_MULTITHREADING
+	k_mutex_unlock(&htif_lock);
+#endif
+}
 
 /* ----- Helpers ----- */
 
@@ -608,6 +701,11 @@ static void handle_write_data(ucdrBuffer *ub, uint16_t length)
 		return;
 	}
 
+	/* Side-channel: dump the topic write to the HTIF log frame for off-target
+	 * capture (host-side script decodes via tools/microros/topic_log_decoder.py).
+	 * Done once per WRITE_DATA, regardless of how many subscribers exist locally. */
+	log_topic_emit(src_topic->name, payload, payload_len);
+
 	/* Fan out to every datareader whose topic resolves to the same name. */
 	for (size_t i = 0; i < MAX_DATAREADERS; i++) {
 		if (!datareaders[i].used) {
@@ -782,6 +880,15 @@ static void broker_thread_fn(void *a, void *b, void *c)
 void broker_start(void)
 {
 	memset(&sess, 0, sizeof(sess));
+	memset(topics, 0, sizeof(topics));
+	memset(datawriters, 0, sizeof(datawriters));
+	memset(datareaders, 0, sizeof(datareaders));
+
+	htif_dev_for_log = DEVICE_DT_GET(DT_NODELABEL(htif));
+	if (!device_is_ready(htif_dev_for_log)) {
+		htif_dev_for_log = NULL;
+	}
+
 	k_thread_create(&broker_thread_data, broker_stack,
 			K_THREAD_STACK_SIZEOF(broker_stack),
 			broker_thread_fn, NULL, NULL, NULL,
