@@ -9,17 +9,16 @@ HDLC-on-HTIF proxy for the micro_ros_multinode sample.
 What it does:
 
   1. Forks spike as a child, captures spike.stdout / drives spike.stdin.
-  2. Opens a pty pair, exposes the slave path (e.g. /dev/pts/12) so the agent
-     can be launched against it like a real serial port.
+  2. Forks the agent in `pseudoterminal` mode; the agent allocates its own pty
+     and prints the slave path on its stderr, which we parse out and open.
   3. Bidirectionally routes bytes:
        spike.stdout  ->  HDLC parser:
-            in-frame, CRC-good   -> writes payload (re-framed in the same
-                                    HDLC the agent expects) to pty master
+            in-frame, CRC-good   -> writes payload to the agent's pty (raw)
             out-of-frame         -> proxies to this process's stdout, so
                                     Zephyr's printk output is still visible
                                     to the user
-       pty master    ->  spike.stdin (HDLC-framed; the target's transport
-                                      reader will unwrap)
+       agent pty     ->  spike.stdin (raw — the target's HDLC parser handles
+                                      framing of bytes the agent emits)
 
 Frame format (matches samples/micro_ros_multinode/src/transport_htif.c):
 
@@ -33,12 +32,13 @@ from __future__ import annotations
 import argparse
 import os
 import pty
+import re
 import select
 import signal
-import struct
 import subprocess
 import sys
 import threading
+import time
 
 
 FLAG = 0x7E
@@ -72,11 +72,8 @@ def hdlc_encode(payload: bytes) -> bytes:
 
 
 class HdlcParser:
-    """Byte-by-byte parser that yields (kind, byte_or_payload).
-
-    kind == 'console' -> single byte, out-of-frame, should be tee'd to stdout
-    kind == 'frame'   -> bytes, CRC-validated payload to deliver to the agent
-    """
+    """Byte-by-byte parser; yields ('console', byte) for out-of-frame data
+    and ('frame', bytes) for CRC-validated frame payloads."""
     def __init__(self):
         self._state = 'OUT'
         self._buf = bytearray()
@@ -95,9 +92,8 @@ class HdlcParser:
                     crc_got = (crc_bytes[0] << 8) | crc_bytes[1]
                     if crc_got == crc16_ccitt(payload):
                         yield ('frame', payload)
-                    # else: bad CRC - silently drop, likely stray printk byte
                 self._buf = bytearray()
-                self._state = 'IN'  # trailing FLAG = leading FLAG of next frame
+                self._state = 'IN'
             elif b == ESC:
                 self._state = 'IN_ESC'
             else:
@@ -107,25 +103,135 @@ class HdlcParser:
             self._state = 'IN'
 
 
+_ANSI_RE = re.compile(rb'\x1b\[[0-9;]*[A-Za-z]')
+# The agent emits a line like "...Pseudoterminal opened at | dev: /dev/pts/N",
+# but with ANSI color codes interleaved. Match loosely after stripping ANSI.
+_PTY_RE = re.compile(rb'dev:\s*(/dev/pts/\d+)')
+
+
+def wait_for_agent_pty(agent_proc: subprocess.Popen, timeout: float = 10.0) -> str:
+    """Block until the agent prints its allocated pty path. Returns the path."""
+    deadline = time.time() + timeout
+    buf = bytearray()
+    while time.time() < deadline:
+        # The agent prints to stderr; we read both fds.
+        for fd in (agent_proc.stderr, agent_proc.stdout):
+            if fd is None:
+                continue
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if fd in r:
+                chunk = os.read(fd.fileno(), 4096)
+                if chunk:
+                    buf += chunk
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.flush()
+                    clean = _ANSI_RE.sub(b'', bytes(buf))
+                    m = _PTY_RE.search(clean)
+                    if m:
+                        return m.group(1).decode()
+        if agent_proc.poll() is not None:
+            raise RuntimeError(f'agent exited with rc={agent_proc.returncode}')
+    raise TimeoutError("Couldn't find pty path in agent output within timeout")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--elf', required=True, help='Path to the Zephyr ELF to run in spike')
     ap.add_argument('--spike', default='spike', help='Path to spike binary')
     ap.add_argument('--isa', default='rv64gc', help='ISA string for spike')
     ap.add_argument('--agent', default='micro-ros-agent',
-                    help='Path to micro-ros-agent binary (or omit to print pty path only)')
+                    help='Path to micro-ros-agent binary (snap mode, broken on this host)')
+    ap.add_argument('--agent-mode', choices=['snap', 'docker'], default='docker',
+                    help='How to launch the agent: '
+                         '"snap" (broken — pty in snap confinement is inaccessible), '
+                         '"docker" (microros/micro-ros-agent:jazzy with host pty bind)')
+    ap.add_argument('--agent-image', default='microros/micro-ros-agent:jazzy',
+                    help='Docker image for --agent-mode docker')
     ap.add_argument('--no-agent', action='store_true',
-                    help='Do not launch the agent; print pty path and wait')
-    ap.add_argument('--agent-verbosity', default='4',
+                    help='Do not launch the agent; use --agent-pty instead')
+    ap.add_argument('--agent-pty', default=None,
+                    help='Path to an already-allocated agent pty (skips agent launch)')
+    ap.add_argument('--agent-verbosity', default='6',
                     help='-v argument to micro-ros-agent (0..6)')
     args = ap.parse_args()
 
-    # 1. pty pair for the agent
-    agent_master, agent_slave = pty.openpty()
-    agent_slave_path = os.ttyname(agent_slave)
-    print(f'[proxy] agent pty: {agent_slave_path}', file=sys.stderr)
+    # 1. Get an agent — and a pty between the agent and us.
+    agent_proc = None
+    agent_fd = None
+    if args.agent_pty:
+        agent_pty_path = args.agent_pty
+        print(f'[proxy] using existing agent pty: {agent_pty_path}', file=sys.stderr)
+        agent_fd = os.open(agent_pty_path, os.O_RDWR | os.O_NOCTTY)
+    elif args.no_agent:
+        print('ERROR: --no-agent requires --agent-pty <path>', file=sys.stderr)
+        return 1
+    elif args.agent_mode == 'docker':
+        # Create a pty pair on the host. The agent inside the Docker
+        # container opens the slave path in `serial` mode; we hold the
+        # master fd here. We KEEP the slave fd open in this process too —
+        # closing it can hang up the pty as the container starts.
+        agent_fd, slave_fd = pty.openpty()
+        slave_path = os.ttyname(slave_fd)
+        print(f'[proxy] host pty pair: master_fd={agent_fd}, slave={slave_path}',
+              file=sys.stderr)
+        # `-v /dev/pts:/dev/pts` shares the host's pts namespace with the
+        # container, so /dev/pts/<N> on host and inside container reference
+        # the same kernel-allocated pty (cleaner than --device which needs
+        # capabilities to create a device node).
+        # Pipe agent stdout/stderr; the agent_to_stderr thread below drains
+        # them and tees to our stderr (file-redirection via subprocess
+        # caused symptoms where agent appeared to receive no traffic — likely
+        # libc block-buffering on the file fd masking real-time activity).
+        agent_proc = subprocess.Popen(
+            ['docker', 'run', '--rm',
+             '-v', '/dev/pts:/dev/pts',
+             '-i',
+             args.agent_image,
+             'serial', '--dev', slave_path,
+             '-b', '115200', '-v', args.agent_verbosity],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        print(f'[proxy] launched docker agent pid={agent_proc.pid}', file=sys.stderr)
+        # Start draining agent's stdout/stderr immediately so its log writes
+        # don't back up on the subprocess pipes during container startup.
+        def _drain_to_stderr(fd):
+            try:
+                while True:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        return
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.flush()
+            except (OSError, ValueError):
+                return
+        threading.Thread(target=_drain_to_stderr,
+                         args=(agent_proc.stdout.fileno(),),
+                         daemon=True).start()
+        threading.Thread(target=_drain_to_stderr,
+                         args=(agent_proc.stderr.fileno(),),
+                         daemon=True).start()
+        # Give the container time to start and the agent to open /dev/pts/N.
+        time.sleep(3.0)
+    else:
+        # snap mode (kept for reference, broken under snap confinement)
+        agent_proc = subprocess.Popen(
+            [args.agent, 'pseudoterminal',
+             '-b', '115200',
+             '-v', args.agent_verbosity],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        print(f'[proxy] launched {args.agent} pid={agent_proc.pid}', file=sys.stderr)
+        agent_pty_path = wait_for_agent_pty(agent_proc)
+        print(f'[proxy] agent pty: {agent_pty_path}', file=sys.stderr)
+        agent_fd = os.open(agent_pty_path, os.O_RDWR | os.O_NOCTTY)
 
-    # 2. spike subprocess — full bidirectional pipes
+    # 3. Spike subprocess — full bidirectional pipes.
     spike = subprocess.Popen(
         [args.spike, f'--isa={args.isa}', args.elf],
         stdin=subprocess.PIPE,
@@ -133,18 +239,7 @@ def main():
         stderr=sys.stderr,
         bufsize=0,
     )
-
-    # 3. agent subprocess (optional)
-    agent_proc = None
-    if not args.no_agent:
-        agent_proc = subprocess.Popen(
-            [args.agent, 'serial', '--dev', agent_slave_path,
-             '-b', '115200', '-v', args.agent_verbosity],
-            stdin=subprocess.DEVNULL,
-            stdout=sys.stderr,
-            stderr=sys.stderr,
-        )
-        print(f'[proxy] launched {args.agent} on {agent_slave_path}', file=sys.stderr)
+    print(f'[proxy] launched spike pid={spike.pid}', file=sys.stderr)
 
     parser = HdlcParser()
     stop = threading.Event()
@@ -153,6 +248,10 @@ def main():
         stop.set()
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
+
+    frames_to_agent = [0]
+    bytes_from_agent = [0]
+    debug = bool(int(os.environ.get('HTIF_PROXY_DEBUG', '0')))
 
     def spike_to_proxy():
         """Read spike stdout, demux frames to agent pty, console bytes to stdout."""
@@ -165,35 +264,109 @@ def main():
                     if kind == 'console':
                         sys.stdout.buffer.write(data)
                         sys.stdout.flush()
-                    else:  # 'frame' — re-encode and forward to agent
-                        os.write(agent_master, hdlc_encode(data))
+                    else:
+                        os.write(agent_fd, data)
+                        frames_to_agent[0] += 1
+                        if debug and (frames_to_agent[0] <= 3 or
+                                      frames_to_agent[0] % 10 == 0):
+                            hex_preview = data[:16].hex(' ')
+                            print(f'[proxy] spike->agent frame#{frames_to_agent[0]} '
+                                  f'len={len(data)} hex_head={hex_preview}',
+                                  file=sys.stderr)
         except Exception as e:
             print(f'[proxy] spike->agent thread: {e}', file=sys.stderr)
 
     def agent_to_spike():
-        """Read agent pty output, HDLC-encode (it's already framed by the agent
-        in serial mode, but we re-frame to match the on-target parser), feed to
-        spike stdin."""
+        """Read agent pty output, HDLC-encode each chunk, feed to spike stdin."""
         try:
-            agent_parser = HdlcParser()
             while not stop.is_set():
                 try:
-                    chunk = os.read(agent_master, 4096)
+                    chunk = os.read(agent_fd, 4096)
                 except OSError:
                     return
                 if not chunk:
                     return
-                # The agent already emits HDLC-framed bytes when configured
-                # in serial mode. We just pass them through to the target —
-                # the target's HdlcParser will validate and unwrap.
-                spike.stdin.write(chunk)
+                bytes_from_agent[0] += len(chunk)
+                spike.stdin.write(hdlc_encode(chunk))
                 spike.stdin.flush()
         except Exception as e:
             print(f'[proxy] agent->spike thread: {e}', file=sys.stderr)
 
-    t1 = threading.Thread(target=spike_to_proxy, name='spike->agent', daemon=True)
-    t2 = threading.Thread(target=agent_to_spike, name='agent->spike', daemon=True)
-    t1.start(); t2.start()
+    def agent_to_stderr():
+        """Tee remaining agent stderr/stdout to our stderr so we can see its log."""
+        if agent_proc is None:
+            return
+        try:
+            while not stop.is_set():
+                for fd in (agent_proc.stderr, agent_proc.stdout):
+                    if fd is None:
+                        continue
+                    r, _, _ = select.select([fd], [], [], 0.1)
+                    if fd in r:
+                        chunk = os.read(fd.fileno(), 4096)
+                        if not chunk:
+                            return
+                        sys.stderr.buffer.write(chunk)
+                        sys.stderr.flush()
+                if agent_proc.poll() is not None:
+                    return
+        except Exception:
+            pass
+
+    spike_stdin_lock = threading.Lock()
+
+    def heartbeat_to_spike():
+        """Continuously feed a 0x00 byte into spike's stdin so the target's
+        uart_poll_in -> spike HTIF GETC -> read(stdin) chain doesn't block
+        when the agent has nothing to send. The target's HDLC parser sees
+        0x00 in OUT_OF_FRAME state and discards it. When the agent does have
+        something to send, agent_to_spike grabs the lock and sends a real
+        HDLC-framed payload; the heartbeat resumes after that frame finishes."""
+        try:
+            while not stop.is_set():
+                with spike_stdin_lock:
+                    try:
+                        spike.stdin.write(b'\x00')
+                        spike.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        return
+                time.sleep(0.001)   # ~1000 Hz; cheap relative to spike speed
+        except Exception as e:
+            print(f'[proxy] heartbeat: {e}', file=sys.stderr)
+
+    agent_frames_sent = [0]
+    # Wrap agent_to_spike's write under the same lock so heartbeats and
+    # frame writes don't interleave bytes.
+    def agent_to_spike():  # noqa: F811
+        try:
+            while not stop.is_set():
+                try:
+                    chunk = os.read(agent_fd, 4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                bytes_from_agent[0] += len(chunk)
+                agent_frames_sent[0] += 1
+                with spike_stdin_lock:
+                    spike.stdin.write(hdlc_encode(chunk))
+                    spike.stdin.flush()
+                if debug and (agent_frames_sent[0] <= 3 or
+                              agent_frames_sent[0] % 10 == 0):
+                    hex_preview = chunk[:16].hex(' ')
+                    print(f'[proxy] agent->spike frame#{agent_frames_sent[0]} '
+                          f'len={len(chunk)} hex_head={hex_preview}',
+                          file=sys.stderr)
+        except Exception as e:
+            print(f'[proxy] agent->spike thread: {e}', file=sys.stderr)
+
+    threads = [
+        threading.Thread(target=spike_to_proxy, name='spike->agent', daemon=True),
+        threading.Thread(target=agent_to_spike, name='agent->spike', daemon=True),
+        threading.Thread(target=heartbeat_to_spike, name='heartbeat', daemon=True),
+    ]
+    for t in threads:
+        t.start()
 
     try:
         rc = spike.wait()
@@ -209,11 +382,10 @@ def main():
             if p:
                 try: p.wait(timeout=2)
                 except subprocess.TimeoutExpired: p.kill()
-        try: os.close(agent_master)
+        try: os.close(agent_fd)
         except OSError: pass
-        try: os.close(agent_slave)
-        except OSError: pass
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
