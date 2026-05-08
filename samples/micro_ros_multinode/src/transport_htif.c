@@ -200,9 +200,12 @@ size_t htif_transport_read(struct uxrCustomTransport *t,
 		return out;
 	}
 
-	int waited = 0;
+	const int64_t deadline = k_uptime_get() + (int64_t)timeout_ms;
 	const int slice_ms = 2;
 	for (;;) {
+		if (k_uptime_get() >= deadline) {
+			return out;
+		}
 		unsigned char raw;
 		int rc = uart_poll_in(htif_dev, &raw);
 		if (rc == 0) {
@@ -214,10 +217,6 @@ size_t htif_transport_read(struct uxrCustomTransport *t,
 			}
 			continue;
 		}
-		if (waited >= timeout_ms) {
-			return out;
-		}
 		k_msleep(slice_ms);
-		waited += slice_ms;
 	}
 }
