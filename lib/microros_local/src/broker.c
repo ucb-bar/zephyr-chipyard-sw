@@ -1,28 +1,34 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Target-resident XRCE-DDS broker (stub).
+ * Target-resident XRCE-DDS broker.
  *
  * Drains messages from the loopback transport's rmw->broker queue, parses
- * each XRCE-DDS message header + submessage(s), and emits the minimum
- * responses needed to keep rmw_microxrcedds happy:
+ * each XRCE-DDS message header + submessage(s), and synthesizes the agent
+ * responses rmw_microxrcedds expects:
  *
  *   CREATE_CLIENT (0)  -> STATUS_AGENT (4)  with OK
- *   CREATE        (1)  -> STATUS        (5)  with OK
- *   GET_INFO      (2)  -> INFO          (6)  with OK
+ *   CREATE        (1)  -> STATUS        (5)  with OK; for TOPIC/DATAWRITER/
+ *                          DATAREADER also extracts identity from the binary
+ *                          representation and registers in entity tables.
+ *   GET_INFO      (2)  -> INFO          (6)  with OK + AGENT activity stub
  *   DELETE        (3)  -> STATUS        (5)  with OK
- *   WRITE_DATA    (7)  -> dropped (routing comes in step 4)
+ *   WRITE_DATA    (7)  -> resolved via entity tables; for each datareader
+ *                          subscribed to the same topic name, emits a DATA
+ *                          submessage on the reliable input stream. Also
+ *                          emits an HDLC-framed copy of {topic, payload} on
+ *                          HTIF for off-target capture (see topic_log_decoder.py).
  *   READ_DATA     (8)  -> ignored
- *   ACKNACK       (10) -> ignored (we always send best-effort)
- *   HEARTBEAT     (11) -> ignored
+ *   ACKNACK       (10) -> ignored
+ *   HEARTBEAT     (11) -> ACKNACK reply (claims first_unacked = last+1).
  *
- * This is enough to get rclc_publisher_init_default() / executor entry to
- * succeed without an actual host-side agent. Real WRITE_DATA -> DATA fanout
- * is the next step.
+ * The proactive ACKNACK after every received reliable-stream message is
+ * load-bearing: rmw_microxrcedds defaults RMW_UXRCE_STREAM_HISTORY to 4, and
+ * without it the client stalls before the 5th CREATE.
  */
 
-#include "broker.h"
-#include "transport_loopback.h"
+#include <microros_local/broker.h>
+#include <microros_local/transport_loopback.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>

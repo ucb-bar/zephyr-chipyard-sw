@@ -1,0 +1,4 @@
+# Tells Zephyr this is a module — its CMakeLists.txt sits at the module
+# root (lib/microros_local/CMakeLists.txt) so cmake: . resolves correctly.
+build:
+    cmake: .
