@@ -21,4 +21,10 @@ void broker_start(void);
  * it floating (equivalent to broker_start()).  Requires CONFIG_SCHED_CPU_MASK=y. */
 void broker_start_pinned(int cpu);
 
+/* Quiesce the broker: subsequent broker_thread_fn iterations skip the
+ * HDLC topic-emit + console printk path so a fault handler on another
+ * hart can drain its register dump without the HTIF lock contention.
+ * Atomic + idempotent. */
+void broker_quiesce(void);
+
 #endif

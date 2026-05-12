@@ -32,13 +32,37 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <string.h>
 
+/* Set by broker_quiesce() to skip all HTIF emit + printk in the broker
+ * thread.  Used by a fault handler on another hart so the HTIF lock
+ * isn't held by broker while the fault dump tries to drain. */
+static atomic_t broker_quiet = ATOMIC_INIT(0);
+
+void broker_quiesce(void)
+{
+	atomic_set(&broker_quiet, 1);
+}
+
+#define BROKER_QUIET_RETURN_IF_SET()                                          \
+	do {                                                                  \
+		if (atomic_get(&broker_quiet)) {                              \
+			return;                                               \
+		}                                                             \
+	} while (0)
+
 #include <ucdr/microcdr.h>
 
-#define BROKER_THREAD_STACK 4096
+/* 64 KB. The XRCE-DDS broker does in-thread message parsing + topic
+ * fanout + HDLC framing, all of which can use deep stack via picolibc's
+ * RVV-vectorized memcpy/memset paths. The previous 4 KB allocation
+ * silently overflowed under sustained DW publish traffic, corrupting
+ * adjacent BSS (model state, trace ring, executor stacks) — manifested
+ * as multi-thread RVV memcpy faults in the agents' kernel calls. */
+#define BROKER_THREAD_STACK 65536
 #define BROKER_THREAD_PRIO  6
 
 /* Constants from the upstream protocol headers — duplicated locally so the
@@ -263,6 +287,7 @@ extern struct k_mutex htif_lock;
 static void log_topic_emit(const char *topic_name,
 			   const uint8_t *payload, size_t payload_len)
 {
+	BROKER_QUIET_RETURN_IF_SET();
 	if (!htif_dev_for_log) {
 		return;
 	}
@@ -506,7 +531,9 @@ static void handle_create_client(ucdrBuffer *ub, uint8_t session_id_masked,
 	cur_session_id = real_session_id;
 	memcpy(cur_key, client_key, 4);
 
-	printk("broker: session up s=%d id=0x%02x\n", cur_session_idx, real_session_id);
+	if (!atomic_get(&broker_quiet)) {
+		printk("broker: session up s=%d id=0x%02x\n", cur_session_idx, real_session_id);
+	}
 	send_status_agent(0, STATUS_OK);
 }
 
@@ -617,9 +644,11 @@ static void handle_create(ucdrBuffer *ub, uint16_t length)
 					if (t) {
 						strncpy(t->name, name, MAX_TOPIC_NAME - 1);
 						t->name[MAX_TOPIC_NAME - 1] = '\0';
-						printk("broker: TOPIC s=%d id=%02x%02x name=%s\n",
-						       cur_session_idx,
-						       b.object_id[0], b.object_id[1], t->name);
+						if (!atomic_get(&broker_quiet)) {
+							printk("broker: TOPIC s=%d id=%02x%02x name=%s\n",
+							       cur_session_idx,
+							       b.object_id[0], b.object_id[1], t->name);
+						}
 					}
 				}
 			}
@@ -646,12 +675,14 @@ static void handle_create(ucdrBuffer *ub, uint16_t length)
 					if (e) {
 						e->topic_id[0] = topic_id[0];
 						e->topic_id[1] = topic_id[1];
-						printk("broker: %s s=%d id=%02x%02x topic=%02x%02x\n",
-						       (obj_kind(b.object_id) == OBJK_DATAWRITER) ?
-							       "DW   " : "DR   ",
-						       cur_session_idx,
-						       b.object_id[0], b.object_id[1],
-						       topic_id[0], topic_id[1]);
+						if (!atomic_get(&broker_quiet)) {
+							printk("broker: %s s=%d id=%02x%02x topic=%02x%02x\n",
+							       (obj_kind(b.object_id) == OBJK_DATAWRITER) ?
+								       "DW   " : "DR   ",
+							       cur_session_idx,
+							       b.object_id[0], b.object_id[1],
+							       topic_id[0], topic_id[1]);
+						}
 					}
 				}
 			}
@@ -768,9 +799,11 @@ static void handle_write_data(ucdrBuffer *ub, uint16_t length)
 			continue;
 		}
 		if (strcmp(t->name, src_topic->name) == 0) {
-			printk("broker: fanout %s s=%d->s=%d (%u B)\n",
-			       src_topic->name, cur_session_idx,
-			       datareaders[i].session_idx, (unsigned)payload_len);
+			if (!atomic_get(&broker_quiet)) {
+				printk("broker: fanout %s s=%d->s=%d (%u B)\n",
+				       src_topic->name, cur_session_idx,
+				       datareaders[i].session_idx, (unsigned)payload_len);
+			}
 			send_data(datareaders[i].session_idx,
 				  datareaders[i].id, payload, payload_len);
 		}
@@ -833,6 +866,12 @@ static void broker_thread_fn(void *a, void *b, void *c)
 	int session_idx;
 	for (;;) {
 		if (loopback_broker_recv_any(&in, &session_idx, K_FOREVER) != 0) {
+			continue;
+		}
+		/* If a fault handler on another hart has quiesced us, drop the
+		 * message on the floor instead of running fanout / send_data /
+		 * acknack — any of those can grab the HTIF lock indirectly. */
+		if (atomic_get(&broker_quiet)) {
 			continue;
 		}
 		if (in.len < HEADER_NO_KEY) {
