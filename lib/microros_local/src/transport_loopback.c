@@ -13,7 +13,7 @@
 #include <string.h>
 
 /* Per-session in-flight depth. Tune up if rmw bursts more than this. */
-#define LOOPBACK_DEPTH 8
+#define LOOPBACK_DEPTH 32  /* was 8 — bumped after broker drain race during 2-net init */
 
 static inline int session_index_from(struct uxrCustomTransport *t)
 {
