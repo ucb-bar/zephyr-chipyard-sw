@@ -61,7 +61,7 @@ void broker_quiesce(void)
  * RVV-vectorized memcpy/memset paths. The previous 4 KB allocation
  * silently overflowed under sustained DW publish traffic, corrupting
  * adjacent BSS (model state, trace ring, executor stacks) — manifested
- * as multi-thread RVV memcpy faults in the agents' kernel calls. */
+ * as multi-thread RVV memcpy faults in the modelblaster' kernel calls. */
 #define BROKER_THREAD_STACK 65536
 #define BROKER_THREAD_PRIO  6
 
