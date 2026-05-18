@@ -1,1 +1,0 @@
-per_config/Q31Ws32x32AccGemminiRocketAlinxAxku040DraftConfig/gemmini_params.h

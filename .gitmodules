@@ -33,3 +33,6 @@
 	path = third-party/micro_ros_zephyr_module
 	url = https://github.com/ucb-bar/micro_ros_zephyr_module.git
 	branch = jazzy
+[submodule "modelblaster"]
+	path = modelblaster
+	url = git@github.com:ucb-bar/ModelBlaster.git
