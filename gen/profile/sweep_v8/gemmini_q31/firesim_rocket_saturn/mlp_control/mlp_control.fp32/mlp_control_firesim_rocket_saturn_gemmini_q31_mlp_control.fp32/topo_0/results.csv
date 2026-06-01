@@ -1,0 +1,8 @@
+dispatch_id,module_name,vmfb_path,mlir_path,mean_time,mean_unit,mean_time_ns,returncode,log_path,source,op,shape,cycles
+0,mlp_control$dispatch_0_gemmini_linear_M1xK16xN256,,,0.050087,ms,50087.000000,0,,firesim,linear,M=1;K=16;N=256,50087
+1,mlp_control$dispatch_1_gemmini_elu_n256,,,0.024935,ms,24935.000000,0,,firesim,elu,n=256,24935
+2,mlp_control$dispatch_2_gemmini_linear_M1xK256xN128,,,0.341016,ms,341016.000000,0,,firesim,linear,M=1;K=256;N=128,341016
+3,mlp_control$dispatch_3_gemmini_elu_n128,,,0.015115,ms,15115.000000,0,,firesim,elu,n=128,15115
+4,mlp_control$dispatch_4_gemmini_linear_M1xK128xN64,,,0.086406,ms,86406.000000,0,,firesim,linear,M=1;K=128;N=64,86406
+5,mlp_control$dispatch_5_gemmini_elu_n64,,,0.006331,ms,6331.000000,0,,firesim,elu,n=64,6331
+6,mlp_control$dispatch_6_gemmini_linear_M1xK64xN4,,,0.002755,ms,2755.000000,0,,firesim,linear,M=1;K=64;N=4,2755
