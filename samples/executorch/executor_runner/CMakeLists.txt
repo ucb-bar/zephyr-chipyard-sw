@@ -43,6 +43,37 @@ get_filename_component(ET_BUILD_DIR_PATH ${ET_BUILD_DIR_PATH} REALPATH)
 get_filename_component(ET_DIR_PATH ${ET_DIR_PATH} REALPATH)
 get_filename_component(ET_INCLUDE_PATH ${ET_INCLUDE_PATH} REALPATH)
 
+# Operator-level profiling: makes the XNNPACK delegate create its runtime with
+# XNN_FLAG_BASIC_PROFILING and print per-operator timings (`>>, <op>, <ticks>`)
+# on delegate destroy — the ExecuTorch counterpart to modelblaster's per-kernel
+# cycle CSV. Applies to the executorch/xnnpack_backend libs in the subbuild.
+# Per-op profiling emits ET_LOG(">>, <op>, <cycles>") every invoke over the HTIF
+# console, which is very slow on FireSim (each tohost write costs ~millions of
+# cycles) and inflates the execute() measurement. Keep it ON for op-level
+# characterization; build -DMB_XNN_PROFILE=OFF for a clean end-to-end timing.
+option(MB_XNN_PROFILE "Enable XNNPACK per-op profiling (adds HTIF log overhead)" ON)
+if(MB_XNN_PROFILE)
+  add_compile_definitions(ENABLE_XNNPACK_PROFILING)
+endif()
+
+# Opt-in: TACIT / L-Trace of the (warm) method->execute() iteration. Pass
+# -DMB_TACIT_TRACE_MODEL=1 and run on the TACIT spike with `--trace=l`.
+# See samples/tacit/TACIT_TRACING.md.
+if(MB_TACIT_TRACE_MODEL)
+  add_compile_definitions(MB_TACIT_TRACE_MODEL=1)
+  message(STATUS "executor_runner: TACIT model tracing enabled")
+endif()
+
+# The ExecuTorch/XNNPACK targets below are added as a plain subdirectory and do
+# NOT link Zephyr's `zephyr_interface`, so they would otherwise compile with the
+# SDK toolchain's default multilib (rv32 + soft-float) and fail the final link
+# against Zephyr's rv64/lp64d objects with "file in wrong format". Force the
+# spike_riscv64 target ABI into the subbuild. `-mcmodel=medany` matches Zephyr's
+# rv64 code model and keeps R_RISCV_CALL_PLT relocations in range for the large
+# executorch+XNNPACK image.
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -march=rv64imafdc -mabi=lp64d -mcmodel=medany")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64imafdc -mabi=lp64d -mcmodel=medany")
+
 add_subdirectory(${ET_DIR_PATH} ${ET_BUILD_DIR_PATH})
 
 
@@ -57,14 +88,38 @@ add_dependencies(compile_commands zephyr_property_target)
 
 target_link_libraries(pthreadpool PUBLIC compile_commands)
 
+# --- Threadpool variant toggle (vanilla vs modelblaster-style spin) ---------
+# XNNPACK parallelizes every operator through pthreadpool, whose wait loop
+# spins PTHREADPOOL_SPIN_WAIT_ITERATIONS (=1000 here) times then falls to a
+# futex/condvar wait. On bare-metal Zephyr that futex wait blocks until the
+# next 100 Hz system tick (~10 ms), so each op eats ~one tick — the dominant
+# cost for small models (see modelblaster/microbench/threadpool: pthreadpool
+# ~13M cyc/dispatch vs a raw spin rendezvous ~20k). modelblaster's lightweight
+# pool avoids this by never sleeping. We can't drop modelblaster_pool into
+# XNNPACK (it only implements parallelize_1d; XNNPACK needs 30+ variants), so
+# we bring modelblaster's *property* — spin instead of tick-sleep — by bumping
+# the spin-iteration ceiling via the same -include override the microbench
+# uses. Default OFF = vanilla pthreadpool (the baseline to compare against).
+option(MB_XNNPACK_SPIN_THREADPOOL
+       "Use spin-wait pthreadpool (modelblaster-style, no condvar/tick sleep)" OFF)
+if(MB_XNNPACK_SPIN_THREADPOOL)
+  target_compile_options(pthreadpool PRIVATE
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/../../../modelblaster/microbench/threadpool/spin_overrides/spin_inject.h")
+  message(STATUS "executor_runner: pthreadpool variant = SPIN (modelblaster-style)")
+else()
+  message(STATUS "executor_runner: pthreadpool variant = vanilla (condvar/tick fallback)")
+endif()
+
 
 
 
 
 target_link_libraries(app PRIVATE
-  # "-Wl,--whole-archive" 
-  extension_runner_util executorch executorch_core quantized_ops_lib portable_ops_lib quantized_kernels portable_kernels 
-  xnnpack_backend XNNPACK microkernels-prod
+  # "-Wl,--whole-archive"
+  extension_runner_util executorch executorch_core quantized_ops_lib portable_ops_lib quantized_kernels portable_kernels
+  # microkernels-prod was renamed xnnpack-microkernels-prod in the XNNPACK
+  # used by ExecuTorch 1.0.1 (ucb-bar torch-1.0.0-bump fork).
+  xnnpack_backend XNNPACK xnnpack-microkernels-prod
   # "-Wl,--no-whole-archive"`
 )
 
