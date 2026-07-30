@@ -22,6 +22,21 @@ void *__dso_handle = nullptr;
 
 #include "model_pte.h"
 
+/* Opt-in TACIT / L-Trace of just the model execute() (the final, warm
+ * iteration). Build with -DMB_TACIT_TRACE_MODEL=1 and run on the TACIT-enabled
+ * spike with `--trace=l`. See samples/tacit/TACIT_TRACING.md. */
+#if defined(MB_TACIT_TRACE_MODEL)
+extern "C" {
+#include <tacit/tacit.h>
+}
+#endif
+
+/* How many times to run method->execute() for cold-vs-warm cycle profiling.
+ * Override with -DMB_EXEC_ITERS=N. */
+#ifndef MB_EXEC_ITERS
+#define MB_EXEC_ITERS 5
+#endif
+
 using executorch::aten::ScalarType;
 using executorch::aten::Tensor;
 using executorch::aten::TensorImpl;
@@ -45,7 +60,7 @@ using executorch::runtime::TensorInfo;
  * used and other data used like the planned memory pool (e.g. memory-planned
  * buffers to use for mutable tensor data).
  */
-const size_t method_allocation_pool_size = 20 * 1024 * 1024;
+const size_t method_allocation_pool_size = 96 * 1024 * 1024;  // bumped from 20MB for MobileNetV2-224 planned activations
 unsigned char
 	__attribute__((section("input_data_sec"), aligned(16))) method_allocation_pool[method_allocation_pool_size];
 
@@ -298,9 +313,39 @@ int main()
 
 	ET_LOG(Info, "Starting the model execution...");
 	size_t executor_membase = method_allocator.used_size();
-	// StartMeasurements();
-	Error status = method->execute();
-	// StopMeasurements();
+	/* rdcycle bracket around execute() so the flow-comparison harness
+	 * (compare_flows.sh) can parse a per-run cycle count that lines up with
+	 * modelblaster's rdcycle totals. We run execute() MB_EXEC_ITERS times so
+	 * the harness can separate cold (iter 0: XNNPACK runtime create + weight
+	 * pack + memory plan) from warm (steady-state compute) cost — a single
+	 * cold run wildly overstates the compute. Printed with printf (not ET_LOG)
+	 * so it survives log-level filtering. */
+	Error status = Error::Ok;
+	const int _mb_iters = MB_EXEC_ITERS;
+#if defined(MB_TACIT_TRACE_MODEL)
+	LTraceEncoderType *_tacit_enc = l_trace_encoder_get(0);
+	l_trace_encoder_configure_target(_tacit_enc, TARGET_PRINT);
+#endif
+	for (int _it = 0; _it < _mb_iters; _it++) {
+		unsigned long _mb_cyc_begin, _mb_cyc_end;
+#if defined(MB_TACIT_TRACE_MODEL)
+		/* Trace only the final, warm iteration (cold iter 0 includes XNNPACK
+		 * runtime create + weight pack, which we don't want in the trace). */
+		bool _tacit_on = (_it == _mb_iters - 1);
+		if (_tacit_on) l_trace_encoder_start(_tacit_enc);
+#endif
+		__asm__ volatile("rdcycle %0" : "=r"(_mb_cyc_begin));
+		status = method->execute();
+		__asm__ volatile("rdcycle %0" : "=r"(_mb_cyc_end));
+#if defined(MB_TACIT_TRACE_MODEL)
+		if (_tacit_on) {
+			l_trace_encoder_stop(_tacit_enc);
+			for (int _i = 0; _i < 16; _i++) __asm__ volatile("nop"); /* flush */
+		}
+#endif
+		printf("EXECUTORCH_EXECUTE_CYCLES[%d]=%lu\n", _it, _mb_cyc_end - _mb_cyc_begin);
+		fflush(stdout);
+	}
 	size_t executor_memsize = method_allocator.used_size() - executor_membase;
 
 	ET_LOG(Info, "model_pte_loaded_size:     %lu bytes.", pte_size);
