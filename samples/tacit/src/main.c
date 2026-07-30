@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <math.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/arch/cpu.h>  // Required for arch_curr_cpu()->id
 
