@@ -35,4 +35,5 @@
 	branch = jazzy
 [submodule "modelblaster"]
 	path = modelblaster
-	url = git@github.com:ucb-bar/ModelBlaster.git
+	url = git@github.com:lorenshung/ModelBlaster.git
+	branch = main
