@@ -16,11 +16,20 @@
 #include <executorch/runtime/platform/platform.h>
 #include <executorch/runtime/platform/runtime.h>
 
+#if defined(__ZEPHYR__)
+#include <zephyr/kernel.h>
+#include <zephyr/sys/reboot.h>
+#endif
+
 struct _reent * _impure_ptr = nullptr;
 
 void *__dso_handle = nullptr;
 
+#ifdef MB_MULTI_MODEL
+#include "models_pte.h"   /* registry of N baked .pte models (batched run) */
+#else
 #include "model_pte.h"
+#endif
 
 /* Opt-in TACIT / L-Trace of just the model execute() (the final, warm
  * iteration). Build with -DMB_TACIT_TRACE_MODEL=1 and run on the TACIT-enabled
@@ -228,16 +237,27 @@ Result<BufferCleanup> prepare_input_tensors(Method &method, MemoryAllocator &all
 
 } // namespace
 
-int main()
+// Run one baked .pte end-to-end: load the program, prepare inputs, execute
+// MB_EXEC_ITERS times (rdcycle-bracketed), and print `_mb_tag`-tagged cycles +
+// an output checksum. All allocators are constructed fresh on entry, so they
+// reset the shared static pools — a multi-model loop reuses one pool
+// sequentially (only one model's activations are live at a time).
+static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_size, const char *_mb_tag)
 {
-	executorch::runtime::runtime_init();
 	std::vector<std::pair<char *, size_t>> input_buffers;
 	size_t pte_size = model_pte_size;
 
 	ET_LOG(Info, "Model in %p %c", model_pte, model_pte[0]);
 	auto loader = BufferDataLoader(model_pte, pte_size);
 	ET_LOG(Info, "Model PTE file loaded. Size: %lu bytes.", pte_size);
-	Result<Program> program = Program::load(&loader);
+	// Leak the ExecuTorch objects (program/method/inputs): their destructors
+	// tear down the XNNPACK delegate + shared workspace, which triggers a
+	// Load access fault on this bare-metal build — the SAME fault that's benign
+	// at end-of-program in single-model mode, but here it fires after every
+	// model and kills the loop. Each model uses a fresh allocator on the reset
+	// pool and we never revisit a prior model, so never destructing them is safe
+	// (and lets model N+1 reuse the shared workspace instead of re-initing it).
+	Result<Program> &program = *(new Result<Program>(Program::load(&loader)));
 	if (!program.ok())
 	{
 		ET_LOG(Info, "Program loading failed @ 0x%p: 0x%" PRIx32, model_pte, program.error());
@@ -290,7 +310,8 @@ int main()
 
 	size_t method_loaded_membase = method_allocator.used_size();
 
-	Result<Method> method = program->load_method(method_name, &memory_manager);
+	Result<Method> &method = *(new Result<Method>(
+		program->load_method(method_name, &memory_manager)));   // leaked (see above)
 	if (!method.ok())
 	{
 		ET_LOG(Info, "Loading of method %s failed with status 0x%" PRIx32, method_name, method.error());
@@ -301,7 +322,7 @@ int main()
 	ET_LOG(Info, "Preparing inputs...");
 	size_t input_membase = method_allocator.used_size();
 
-	auto inputs = ::prepare_input_tensors(*method, method_allocator, input_buffers);
+	auto &inputs = *(new auto(::prepare_input_tensors(*method, method_allocator, input_buffers)));  // leaked (see above)
 
 	if (!inputs.ok())
 	{
@@ -343,7 +364,7 @@ int main()
 			for (int _i = 0; _i < 16; _i++) __asm__ volatile("nop"); /* flush */
 		}
 #endif
-		printf("EXECUTORCH_EXECUTE_CYCLES[%d]=%lu\n", _it, _mb_cyc_end - _mb_cyc_begin);
+		printf("EXECUTORCH_EXECUTE_CYCLES[%s][%d]=%lu\n", _mb_tag, _it, _mb_cyc_end - _mb_cyc_begin);
 		fflush(stdout);
 	}
 	size_t executor_memsize = method_allocator.used_size() - executor_membase;
@@ -384,22 +405,70 @@ int main()
 	for (int i = 0; i < outputs.size(); ++i)
 	{
 		Tensor t = outputs[i].toTensor();
+		const int n = (int)t.numel();
 		// The output might be collected and parsed so printf() is used instead
-		// of ET_LOG() here
-		for (int j = 0; j < outputs[i].toTensor().numel(); ++j)
+		// of ET_LOG() here.
+		// FireSim's HTIF console costs ~millions of cycles per char, so dumping
+		// every element (KernelBench outputs reach ~50k) dominates wall time and
+		// hits the run timeout. By default emit a checksum + the first few
+		// elements (enough to sanity-check / diff against the golden); define
+		// MB_ET_FULL_OUTPUT to restore the full per-element dump.
+#ifdef MB_ET_FULL_OUTPUT
+		for (int j = 0; j < n; ++j)
 		{
 			if (t.scalar_type() == ScalarType::Int)
-			{
-				printf("Output[%d][%d]: %d\n", i, j, outputs[i].toTensor().const_data_ptr<int>()[j]);
-			}
+				printf("Output[%d][%d]: %d\n", i, j, t.const_data_ptr<int>()[j]);
 			else
-			{
-				printf("Output[%d][%d]: %f\n", i, j, outputs[i].toTensor().const_data_ptr<float>()[j]);
-			}
+				printf("Output[%d][%d]: %f\n", i, j, t.const_data_ptr<float>()[j]);
 		}
+#else
+		if (t.scalar_type() == ScalarType::Int)
+		{
+			const int *p = t.const_data_ptr<int>();
+			long long sum = 0;
+			for (int j = 0; j < n; ++j) sum += p[j];
+			printf("Output[%d] numel=%d checksum=%lld\n", i, n, sum);
+			for (int j = 0; j < n && j < 8; ++j)
+				printf("Output[%d][%d]: %d\n", i, j, p[j]);
+		}
+		else
+		{
+			const float *p = t.const_data_ptr<float>();
+			double sum = 0.0;
+			for (int j = 0; j < n; ++j) sum += (double)p[j];
+			printf("Output[%d] numel=%d checksum=%f\n", i, n, sum);
+			for (int j = 0; j < n && j < 8; ++j)
+				printf("Output[%d][%d]: %f\n", i, j, p[j]);
+		}
+#endif
 	}
-out:
+	printf("MB_MODEL_DONE_OUTPUT=%s\n", _mb_tag); fflush(stdout);
+	return 0; /* end run_one_pte — locals (method/program/allocators) destruct here */
+}
+
+int main()
+{
+	executorch::runtime::runtime_init();
+#ifdef MB_MULTI_MODEL
+	// Batched: run every baked model sequentially under ONE boot (and, on
+	// FireSim, ONE infrasetup). Every model's io lives in rodata; only the
+	// active model's activations occupy the pool at a time (fresh allocators
+	// per call reset it), so N models cost N*io of RAM + one activation set.
+	for (unsigned _mi = 0; _mi < mb_num_models; ++_mi) {
+		printf("MB_MODEL_BEGIN=%s\n", mb_models[_mi].name); fflush(stdout);
+		run_one_pte(mb_models[_mi].data, mb_models[_mi].size, mb_models[_mi].name);
+		printf("MB_MODEL_END=%s\n", mb_models[_mi].name); fflush(stdout);
+	}
+#else
+	run_one_pte(model_pte, model_pte_size, "model");
+#endif
 	ET_LOG(Info, "Program complete, exiting.");
 	ET_LOG(Info, "\04");
+	// On FireSim/spike SMP, returning from main hits a benign load-fault on the
+	// shutdown path and the sim never cleanly exits, pinning the FPGA until the
+	// run timeout. Reboot for a clean tohost exit (mirrors modelblaster/harness).
+#if defined(__ZEPHYR__)
+	sys_reboot(SYS_REBOOT_COLD);
+#endif
 	return 0;
 }
