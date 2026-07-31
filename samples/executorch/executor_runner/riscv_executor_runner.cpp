@@ -69,9 +69,22 @@ using executorch::runtime::TensorInfo;
  * used and other data used like the planned memory pool (e.g. memory-planned
  * buffers to use for mutable tensor data).
  */
-const size_t method_allocation_pool_size = 96 * 1024 * 1024;  // bumped from 20MB for MobileNetV2-224 planned activations
+// Sized to hold the (largest, when batched) model's planned activations +
+// setup + inputs. Bump via -DMB_ET_POOL_MB for the utilization-aware default
+// sizing (256 MB baked io needs >96 MB of activations). Needs ram0 to hold it.
+#ifndef MB_ET_POOL_MB
+#define MB_ET_POOL_MB 96
+#endif
+const size_t method_allocation_pool_size = (size_t)MB_ET_POOL_MB * 1024 * 1024;
+// .bss (zeroed, NOLOAD): the previous `input_data_sec` was a LOADED section, so
+// MB_ET_POOL_MB of zeros got baked into the ELF and streamed over the (per-word
+// MMIO) FireSim loader — a 256 MB pool turned a ~12 MB code image into a 268 MB
+// load (~15 min). Plain .bss is NOLOAD (only real code/model bytes transfer) AND
+// boot-zeroed. Zeroing matters: the ET allocator/planner reads pool memory that
+// must start zero — an unzeroed (.noinit) pool faults with a NULL-deref
+// (mcause 5, mtval 0) mid-execute once allocations succeed.
 unsigned char
-	__attribute__((section("input_data_sec"), aligned(16))) method_allocation_pool[method_allocation_pool_size];
+	__attribute__((aligned(16))) method_allocation_pool[method_allocation_pool_size];
 
 /**
  * The temp_allocation_pool is used for allocating temporary data during kernel
@@ -80,7 +93,7 @@ unsigned char
  * a better fit
  */
 const size_t temp_allocation_pool_size = 1 * 1024 * 1024;
-unsigned char __attribute__((section("input_data_sec"), aligned(16))) temp_allocation_pool[temp_allocation_pool_size];
+unsigned char __attribute__((aligned(16))) temp_allocation_pool[temp_allocation_pool_size];
 
 /* void et_pal_init(void)
 {
@@ -422,14 +435,19 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 				printf("Output[%d][%d]: %f\n", i, j, t.const_data_ptr<float>()[j]);
 		}
 #else
+		// The checksum alone is enough to validate against the host golden; the
+		// first-few-element dump is pure HTIF overhead on FireSim (each line
+		// ~millions of cycles). Gate it behind MB_ET_SAMPLE_OUTPUT for debugging.
 		if (t.scalar_type() == ScalarType::Int)
 		{
 			const int *p = t.const_data_ptr<int>();
 			long long sum = 0;
 			for (int j = 0; j < n; ++j) sum += p[j];
 			printf("Output[%d] numel=%d checksum=%lld\n", i, n, sum);
+#ifdef MB_ET_SAMPLE_OUTPUT
 			for (int j = 0; j < n && j < 8; ++j)
 				printf("Output[%d][%d]: %d\n", i, j, p[j]);
+#endif
 		}
 		else
 		{
@@ -437,8 +455,10 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 			double sum = 0.0;
 			for (int j = 0; j < n; ++j) sum += (double)p[j];
 			printf("Output[%d] numel=%d checksum=%f\n", i, n, sum);
+#ifdef MB_ET_SAMPLE_OUTPUT
 			for (int j = 0; j < n && j < 8; ++j)
 				printf("Output[%d][%d]: %f\n", i, j, p[j]);
+#endif
 		}
 #endif
 	}
