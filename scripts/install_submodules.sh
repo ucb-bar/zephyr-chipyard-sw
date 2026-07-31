@@ -91,17 +91,17 @@ main() {
   fi
 
   # Create conda environment if it doesn't exist
-  log "Setting up conda environment 'zephyr'..."
-  if conda env list 2>/dev/null | grep -q "^zephyr "; then
-    log "Conda environment 'zephyr' already exists (skipping creation)."
+  log "Setting up conda environment 'zephyr-new'..."
+  if conda env list 2>/dev/null | grep -q "^zephyr-new "; then
+    log "Conda environment 'zephyr-new' already exists (skipping creation)."
   else
-    run_cmd "conda create -yn zephyr python=3.12"
+    run_cmd "conda create -yn zephyr-new python=3.12"
   fi
 
   # Use conda run instead of activate - safer for non-interactive scripts
   # This avoids issues with conda activate in scripts that can cause shell exits
-  log "Using conda run to execute commands in zephyr environment..."
-  CONDA_RUN="conda run -n zephyr --no-capture-output"
+  log "Using conda run to execute commands in zephyr-new environment..."
+  CONDA_RUN="conda run -n zephyr-new --no-capture-output"
 
   # Install the west dependencies
   log "Installing west dependencies..."
@@ -116,7 +116,7 @@ main() {
   run_cmd "${CONDA_RUN} pip install matplotlib"
 
   # Install the zephyr/scripts/list_boards.py dependency (jsonschema) 
-  log "Installing zephyr/scripts/list_boards.py dependency (jsonschema) ..."
+  log "Installing zephyr-new/scripts/list_boards.py dependency (jsonschema) ..."
   run_cmd "${CONDA_RUN} pip install jsonschema"
 
   # Init submodules
@@ -136,7 +136,7 @@ main() {
   if ! eval "${CONDA_RUN} pip install -e ./tools/gym-pybullet-drones" >> "${LOG_FILE}" 2>&1; then
     WARNINGS+=("gym-pybullet-drones installation failed (pybullet build error). This is optional and can be installed later if needed.")
     log_error "gym-pybullet-drones installation failed - continuing with other installations"
-    log "You can try installing it later manually: conda run -n zephyr pip install -e ./tools/gym-pybullet-drones"
+    log "You can try installing it later manually: conda run -n zephyr-new pip install -e ./tools/gym-pybullet-drones"
   else
     log "gym-pybullet-drones installed successfully"
   fi
@@ -194,7 +194,7 @@ main() {
     if grep -q "ERROR: update failed for project" "${LOG_FILE}" 2>/dev/null; then
       WARNINGS+=("Some west projects failed to update (check ${LOG_FILE} for details). This may be non-critical - the workspace may still be usable.")
       log_error "Some west projects failed to update - continuing with installation"
-      log "You can try updating specific projects later with: conda run -n zephyr west update <project-name>"
+      log "You can try updating specific projects later with: conda run -n zephyr-new west update <project-name>"
       log "Or update all projects individually if needed"
     else
       log_error "Failed to update west workspace"
