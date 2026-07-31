@@ -134,5 +134,19 @@ if(MB_MULTI_MODEL)
 else()
     target_sources(app PRIVATE riscv_executor_runner.cpp model_pte.c)
 endif()
+
+# ET method_allocation_pool size (MiB). Default 96; bump for the 256MB-io
+# default sizing (needs ram0 bumped too, via -DEXTRA_DTC_OVERLAY_FILE=<ram0>).
+if(DEFINED MB_ET_POOL_MB)
+    target_compile_definitions(app PRIVATE MB_ET_POOL_MB=${MB_ET_POOL_MB})
+    message(STATUS "modelblaster ET runner: method pool = ${MB_ET_POOL_MB} MiB")
+endif()
+
+# Number of rdcycle-bracketed execute() iterations per model (default 5 in the
+# .cpp; iter 0 is cold, the rest warm). Lower for sweeps to cut FireSim time.
+if(DEFINED MB_EXEC_ITERS)
+    target_compile_definitions(app PRIVATE MB_EXEC_ITERS=${MB_EXEC_ITERS})
+    message(STATUS "modelblaster ET runner: exec iters = ${MB_EXEC_ITERS}")
+endif()
 zephyr_linker_sources(DATA_SECTIONS  custom-sections.ld)
 
