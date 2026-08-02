@@ -61,7 +61,23 @@ endif()
 # See samples/tacit/TACIT_TRACING.md.
 if(MB_TACIT_TRACE_MODEL)
   add_compile_definitions(MB_TACIT_TRACE_MODEL=1)
-  message(STATUS "executor_runner: TACIT model tracing enabled")
+  message(STATUS "executor_runner: TACIT model tracing enabled (spike TARGET_PRINT)")
+endif()
+
+# Opt-in: TACIT tracing on FIRESIM. The encoder can't print over HTIF there, so
+# it streams to DRAM via TraceSinkDMA into a fixed .bss buffer; the host reads it
+# back with `+dump-mem=<addr>:<len>:<file>` (addr = `nm zephyr.elf | grep
+# mb_tacit_dma_buf`). Requires a TACIT-encoder bitstream. Implies MB_TACIT_TRACE_MODEL.
+#   -DMB_TACIT_TRACE_DMA=1 [-DMB_TACIT_DMA_BUF_MB=N] [-DMB_TACIT_DMA_BYPASS=0|1]
+if(MB_TACIT_TRACE_DMA)
+  add_compile_definitions(MB_TACIT_TRACE_MODEL=1 MB_TACIT_TRACE_DMA=1)
+  if(DEFINED MB_TACIT_DMA_BUF_MB)
+    add_compile_definitions(MB_TACIT_DMA_BUF_MB=${MB_TACIT_DMA_BUF_MB})
+  endif()
+  if(DEFINED MB_TACIT_DMA_BYPASS)
+    add_compile_definitions(MB_TACIT_DMA_BYPASS=${MB_TACIT_DMA_BYPASS})
+  endif()
+  message(STATUS "executor_runner: TACIT FireSim DMA-sink tracing enabled")
 endif()
 
 # The ExecuTorch/XNNPACK targets below are added as a plain subdirectory and do
@@ -147,6 +163,25 @@ endif()
 if(DEFINED MB_EXEC_ITERS)
     target_compile_definitions(app PRIVATE MB_EXEC_ITERS=${MB_EXEC_ITERS})
     message(STATUS "modelblaster ET runner: exec iters = ${MB_EXEC_ITERS}")
+endif()
+
+# Per-element output dump for numerics debugging: MB_ET_SAMPLE_OUTPUT prints the
+# first MB_ET_SAMPLE_N elems + a strided sample; MB_ET_FULL_OUTPUT prints all.
+if(MB_ET_SAMPLE_OUTPUT)
+    target_compile_definitions(app PRIVATE MB_ET_SAMPLE_OUTPUT=1)
+    message(STATUS "modelblaster ET runner: MB_ET_SAMPLE_OUTPUT on")
+endif()
+if(DEFINED MB_ET_SAMPLE_N)
+    target_compile_definitions(app PRIVATE MB_ET_SAMPLE_N=${MB_ET_SAMPLE_N})
+endif()
+if(MB_ET_FULL_OUTPUT)
+    target_compile_definitions(app PRIVATE MB_ET_FULL_OUTPUT=1)
+endif()
+# MB_MEMDBG: input/output address prints + input-side fence + scalar readback,
+# to localize the FireSim ITERS=1 zero-output (vector<->scalar memory visibility).
+if(MB_MEMDBG)
+    target_compile_definitions(app PRIVATE MB_MEMDBG=1)
+    message(STATUS "modelblaster ET runner: MB_MEMDBG on")
 endif()
 zephyr_linker_sources(DATA_SECTIONS  custom-sections.ld)
 
