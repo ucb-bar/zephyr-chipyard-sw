@@ -45,9 +45,16 @@ def main():
                     help="level1 stem / filename / path; repeatable")
     ap.add_argument("--target-mb", type=int,
                     default=int(os.environ.get("BENCH_TARGET_MB", "4")))
+    ap.add_argument("--target-gflops", type=float,
+                    default=float(os.environ.get("BENCH_TARGET_GFLOPS", "0")),
+                    help="if >0, size each bench to this forward-FLOP budget "
+                         "(bounds COMPUTE, not just io); target-mb stays an io "
+                         "ceiling. Fixes large-K matmuls / 3D convs that have "
+                         "tiny io but huge FLOPs.")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     tgt = a.target_mb * 2**20
+    tflops = int(a.target_gflops * 1e9) if a.target_gflops > 0 else None
     os.makedirs(f"{a.out_dir}/pte", exist_ok=True)
 
     rows = []
@@ -56,7 +63,7 @@ def main():
         if not os.path.isfile(bf):
             print(f"SKIP {b}: not found ({bf})", file=sys.stderr); continue
         torch.manual_seed(a.seed)
-        m, s, name = _load_kernelbench(bf, target_bytes=tgt)
+        m, s, name = _load_kernelbench(bf, target_bytes=tgt, target_flops=tflops)
         m = m.eval()
         args = (s,) if torch.is_tensor(s) else tuple(s)
         ones = tuple(torch.ones_like(x) for x in args)
