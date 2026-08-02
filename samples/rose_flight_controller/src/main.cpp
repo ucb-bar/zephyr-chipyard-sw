@@ -62,8 +62,8 @@ static TinyWorkspace work;
 static TinySettings  settings;
 static TinySolver    solver;
 
-/* State estimator */
-static StateEstimator est;
+/* State estimator: build-time-selected pluggable filter (EKF by default). */
+static IStateEstimator &est = active_estimator();
 
 static void mpc_init(void)
 {
@@ -147,7 +147,8 @@ int main(void)
 	/* Hover setpoint the estimated state is regulated to (TinyMPC drives error -> 0). */
 	const float setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-	printk("ROSE flight_controller: estimator + TinyMPC ready, entering control loop\n");
+	printk("ROSE flight_controller: estimator=%s + TinyMPC ready, entering control loop\n",
+	       est.name());
 
 	float imu[6];        /* [ax,ay,az, gx,gy,gz]     */
 	float flow[3];       /* [vx,vy, h] (flow + ToF)  */
