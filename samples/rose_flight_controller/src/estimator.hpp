@@ -4,19 +4,20 @@
  *
  * Full-state estimator for the RoSE flight controller. Fuses the sensors a real
  * Crazyflie carries — a 6-axis IMU (accelerometer specific force + rate gyro) and a
- * downward optical-flow sensor (body-frame horizontal velocity) — into the 12-DoF state
- * TinyMPC expects:  [x, y, z, r1, r2, r3, vx, vy, vz, wx, wy, wz]  (Rodrigues attitude).
+ * Flow deck (optical-flow horizontal velocity + downward ToF height) — into the 12-DoF
+ * state TinyMPC expects:  [x, y, z, r1, r2, r3, vx, vy, vz, wx, wy, wz]  (Rodrigues
+ * attitude).
  *
- * Method (a complementary filter + dead reckoning, extending samples/flight_controller's
- * attitude_estimator.c):
- *   - attitude: gyro integration corrected toward the accelerometer gravity vector
- *     (roll/pitch); yaw from gyro only (no magnetometer -> yaw drifts).
- *   - horizontal velocity: accel integration fused with the optical-flow measurement
- *     (flow bounds the velocity error; without it accel integration runs away).
- *   - altitude (z, vz): accel integration corrected by the downward ToF height (a
- *     fixed-gain observer), so altitude is observable and the hover holds.
- *   - x/y position + yaw: pure integration. There is NO absolute horizontal-position or
- *     heading reference, so these drift over time — expected ("no global pose feedback").
+ * Method:
+ *   - attitude: a QUATERNION Mahony complementary filter. The gyro is integrated on the
+ *     quaternion manifold (singularity-free, valid at large angles); the accelerometer
+ *     nudges roll/pitch toward gravity, but that correction is GATED by |accel|: during
+ *     accelerated flight the accelerometer is gravity + linear acceleration, so trusting
+ *     it would inject false tilt and the controller would oscillate/flip. Yaw has no
+ *     reference (no magnetometer) -> gyro only, drifts.
+ *   - horizontal velocity: accel integration fused with the optical-flow measurement.
+ *   - altitude (z, vz): accel integration corrected by the downward ToF height.
+ *   - x/y position + yaw: pure integration (no absolute reference -> drift).
  */
 
 #ifndef ROSE_ESTIMATOR_HPP
@@ -25,17 +26,19 @@
 #define EST_NSTATES 12
 
 struct StateEstimator {
-	/* estimated state */
-	float roll, pitch, yaw;   /* attitude, rad          */
-	float x, y, z;            /* world position, m       */
-	float vx, vy, vz;         /* world velocity, m/s     */
-	float gx, gy, gz;         /* last body rates, rad/s  */
+	/* attitude quaternion (body->world), w,x,y,z */
+	float qw, qx, qy, qz;
+	/* world position + velocity */
+	float x, y, z;
+	float vx, vy, vz;
+	/* last body rates, rad/s */
+	float gx, gy, gz;
 
 	/* tuning */
-	float alpha;      /* complementary-filter gyro weight (0..1), higher = trust gyro */
+	float mahony_kp;  /* accelerometer -> attitude correction gain (gravity trim)     */
 	float flow_gain;  /* optical-flow weight for horizontal velocity (0..1)           */
 	float z_gain;     /* ToF height -> z position observer gain (0..1)                 */
-	float vz_gain;    /* ToF height residual -> vz observer gain (per step)           */
+	float vz_gain;    /* ToF height residual -> vz observer gain                       */
 
 	/* Initialize at a known takeoff pose (level, at rest). */
 	void init(float x0, float y0, float z0);
