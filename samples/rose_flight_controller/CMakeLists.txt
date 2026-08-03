@@ -25,9 +25,10 @@ include(${TINYMPC}/external/matlib/matlib_header.cmake)
 # State estimator selection (modular IStateEstimator; both are compiled, factory picks):
 #   -DROSE_USE_EKF=0 -> complementary (quaternion Mahony + fixed-gain + lead compensation)
 #   -DROSE_USE_EKF=1 -> EKF (quaternion Mahony + per-axis Kalman)
-# Default is the complementary filter: with lead compensation it holds a clean altitude
-# hover; the EKF is provided as a pluggable option (still being tuned for the horizontal
-# channel). Both share the Mahony attitude core (attitude_mahony.hpp).
+# Estimator selection (both compiled; factory picks). Default is the complementary filter,
+# which currently holds the ALTITUDE loop best (its explicit vz correction beats the EKF's
+# Kalman vz for control). The EKF is the robustness target (Q/R for noise) but its vz needs
+# a direct velocity measurement to match; both use model-based delay compensation.
 set(ROSE_USE_EKF 0 CACHE STRING "1=EKF, 0=complementary filter")
 
 target_sources(app PRIVATE
