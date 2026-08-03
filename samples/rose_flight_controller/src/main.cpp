@@ -46,13 +46,17 @@
 #define ROSE_FLOW_CH      1       /* reqrsp0 (ROSE_RX_DATA_1)                 */
 
 /* Loop timing + setpoint (must match the env: 50 Hz, takeoff z=0.5, hover z=1.0). */
-#define CTRL_DT      0.02f
+/* Control period. MUST match the co-sim rate (gym_timestep = firesim_step/firesim_freq):
+ * 0.02 = 50 Hz, 0.005 = 200 Hz. The TinyMPC LQR gain is rate-tolerant, so running the
+ * 50 Hz policy at a higher rate just tightens the loop (better phase margin for the fast
+ * attitude dynamics). */
+#define CTRL_DT      0.005f
 /* Start near the hover setpoint: from the estimated state the controller cannot brake a
  * hard max-thrust takeoff without overshoot (unlike the ground-truth loop), so a gentle
  * initial transient keeps the estimator-in-the-loop stable. */
 #define START_Z      0.9f
 #define TARGET_Z     1.0f
-#define CTRL_ITERS   250     /* ~5 s of flight, then land the loop */
+#define CTRL_ITERS   5000    /* bounded by max_sim_time; ~25 s at 200 Hz */
 
 static const struct device *rose = DEVICE_DT_GET_ONE(ucbbar_roseadapter);
 
@@ -168,6 +172,8 @@ int main(void)
 
 		/* Estimate the full state from the sensors, then form the regulation error.
 		 * flow[0..1] = body horizontal velocity, flow[2] = ToF height above ground. */
+		uint64_t c0;
+		__asm__ volatile("rdcycle %0" : "=r"(c0));
 		est.update(&imu[0], &imu[3], flow, flow[2], CTRL_DT);
 		est.get_state(state);
 		for (int i = 0; i < NSTATES; i++) {
@@ -187,9 +193,15 @@ int main(void)
 		matset(work.g.data, 0.0, work.g.outer, work.g.inner);
 
 		tiny_solve(&solver);
+		uint64_t c1;
+		__asm__ volatile("rdcycle %0" : "=r"(c1));
 
 		for (int i = 0; i < NACTIONS; i++) {
 			u[i] = work.u.vector[0][i];
+		}
+		if ((iter % 200) == 10) {
+			printk("ROSE flight_controller: compute cycles (estimator+solve) = %u\n",
+			       (unsigned)(c1 - c0));
 		}
 		if ((iter % 10) == 0) {
 			printk("ROSE flight_controller: iter=%d z_est=%d.%03d z_err=%d.%03d "
