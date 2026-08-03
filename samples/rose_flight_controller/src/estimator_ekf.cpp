@@ -33,7 +33,7 @@ void EkfEstimator::init(float x0, float y0, float z0)
 }
 
 void EkfEstimator::update(const float accel[3], const float gyro[3],
-			  const float flow[2], float height, bool tof_valid, float dt)
+			  const float flow[2], bool flow_valid, float height, bool tof_valid, float dt)
 {
 	gx = gyro[0]; gy = gyro[1]; gz = gyro[2];
 	att.update(accel, gyro, dt);
@@ -50,11 +50,15 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 	ky.predict(ay_w, dt);
 	kz.predict(az_w, dt);
 
-	/* update: horizontal velocity from optical flow (body->world) */
-	float vfx = R[0]*flow[0] + R[1]*flow[1];
-	float vfy = R[3]*flow[0] + R[4]*flow[1];
-	kx.update_vel(vfx, r_flow, flow_gate);
-	ky.update_vel(vfy, r_flow, flow_gate);
+	/* update: horizontal velocity from optical flow (body->world). On a flow dropout the
+	 * sample is stale, so skip the velocity correction and let the KF run predict-only (its
+	 * covariance grows, so the next valid sample is weighted more) -- mirrors the ToF path. */
+	if (flow_valid) {
+		float vfx = R[0]*flow[0] + R[1]*flow[1];
+		float vfy = R[3]*flow[0] + R[4]*flow[1];
+		kx.update_vel(vfx, r_flow, flow_gate);
+		ky.update_vel(vfy, r_flow, flow_gate);
+	}
 
 	/* update: altitude from downward ToF (position measurement) -- only when a fresh
 	 * low-rate ToF sample is available. Between samples the z-axis KF runs predict-only

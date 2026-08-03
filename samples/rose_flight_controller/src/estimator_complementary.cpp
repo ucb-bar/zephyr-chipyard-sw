@@ -23,7 +23,7 @@ void ComplementaryEstimator::init(float x0, float y0, float z0)
 }
 
 void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
-				    const float flow[2], float height, bool tof_valid, float dt)
+				    const float flow[2], bool flow_valid, float height, bool tof_valid, float dt)
 {
 	gx = gyro[0]; gy = gyro[1]; gz = gyro[2];
 	att.update(accel, gyro, dt);
@@ -37,11 +37,15 @@ void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
 
 	vx += ax_w*dt; vy += ay_w*dt; vz += az_w*dt;
 
-	/* optical-flow fusion for horizontal velocity */
-	float vfx = R[0]*flow[0] + R[1]*flow[1];
-	float vfy = R[3]*flow[0] + R[4]*flow[1];
-	vx = (1.0f - flow_gain)*vx + flow_gain*vfx;
-	vy = (1.0f - flow_gain)*vy + flow_gain*vfy;
+	/* optical-flow fusion for horizontal velocity -- only when the sample is fresh. On a
+	 * dropout the flow is stale, so keep the accel dead-reckoned velocity (predict-only)
+	 * rather than snapping to a stale measurement. */
+	if (flow_valid) {
+		float vfx = R[0]*flow[0] + R[1]*flow[1];
+		float vfy = R[3]*flow[0] + R[4]*flow[1];
+		vx = (1.0f - flow_gain)*vx + flow_gain*vfx;
+		vy = (1.0f - flow_gain)*vy + flow_gain*vfy;
+	}
 
 	x += vx*dt; y += vy*dt; z += vz*dt;
 
