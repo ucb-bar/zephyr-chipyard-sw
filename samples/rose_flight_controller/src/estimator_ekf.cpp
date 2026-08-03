@@ -10,10 +10,13 @@
 void EkfEstimator::init(float x0, float y0, float z0)
 {
 	att.init();
-	/* process accel-noise ~2 m/s^2 (model/attitude error); tune for stability */
-	kx.init(x0, 2.0f);
-	ky.init(y0, 2.0f);
-	kz.init(z0, 2.0f);
+	/* process accel-noise ~2 m/s^2 (model/attitude error); accel-bias random walk ~0.05
+	 * m/s^2/sqrt(s) with an initial 1-sigma bias uncertainty of 0.5 m/s^2 (covers the L1/L2
+	 * injected biases). The bias state converges within a few seconds and removes the steady
+	 * altitude offset / horizontal drift a fixed-gain filter leaves under a biased IMU. */
+	kx.init(x0, 2.0f, 0.05f, 0.25f);
+	ky.init(y0, 2.0f, 0.05f, 0.25f);
+	kz.init(z0, 2.0f, 0.05f, 0.25f);
 	gx = gy = gz = 0.0f;
 	awx = awy = awz = 0.0f; dt_last = 0.0f;
 	r_flow = 4e-4f;      /* trust optical flow strongly for velocity (~0.02 m/s std) */
@@ -77,11 +80,14 @@ void EkfEstimator::get_state(float state[EST_NSTATES]) const
 	float wyw = R[3]*gx + R[4]*gy + R[5]*gz;
 	float wzw = R[6]*gx + R[7]*gy + R[8]*gz;
 
-	/* translation: predict pos += vel*h + 0.5 a h^2, vel += a*h */
-	state[0] = kx.p + kx.v*h + 0.5f*awx*h*h;
-	state[1] = ky.p + ky.v*h + 0.5f*awy*h*h;
-	state[2] = kz.p + kz.v*h + 0.5f*awz*h*h;
+	/* translation: predict pos += vel*h + 0.5 a h^2, vel += a*h, using the BIAS-CORRECTED
+	 * world acceleration (a - ba) consistent with the KF predict, so the lead prediction is
+	 * not re-corrupted by the estimated accel bias. */
+	float cax = awx - kx.ba, cay = awy - ky.ba, caz = awz - kz.ba;
+	state[0] = kx.p + kx.v*h + 0.5f*cax*h*h;
+	state[1] = ky.p + ky.v*h + 0.5f*cay*h*h;
+	state[2] = kz.p + kz.v*h + 0.5f*caz*h*h;
 	state[3] = px/qwv; state[4] = py/qwv; state[5] = pz/qwv;
-	state[6] = kx.v + awx*h; state[7] = ky.v + awy*h; state[8] = kz.v + awz*h;
+	state[6] = kx.v + cax*h; state[7] = ky.v + cay*h; state[8] = kz.v + caz*h;
 	state[9] = wxw;  state[10] = wyw; state[11] = wzw;
 }
