@@ -29,6 +29,8 @@ void EkfEstimator::init(float x0, float y0, float z0)
 	 * weakly re-observed and a wrongly-rejected ToF would let the height drift. */
 	flow_gate = 9.0f;
 	tof_gate  = 25.0f;
+	r_wall = 4e-3f;      /* wall-derived horizontal position ~ (0.06 m)^2 (multizone min + a
+	                      * modest margin for wall non-perpendicularity); anchors x/y position. */
 	delay_steps = 1.0f;  /* control acts 1 step later -> predict 1 step ahead */
 }
 
@@ -65,6 +67,24 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 	 * (accel), and its covariance grows so the next ToF correction is weighted more. */
 	if (tof_valid) {
 		kz.update_pos(height, r_tof, tof_gate);
+	}
+}
+
+void EkfEstimator::fuse_walls(float d_front, float d_back, float d_left, float d_right,
+			      float rmax)
+{
+	/* Only fuse a pair when BOTH facing walls are within range (a valid two-sided reference).
+	 * (d_right - d_left)/2 is the lateral position relative to the corridor center; likewise
+	 * (d_back - d_front)/2 for longitudinal. These are POSITION measurements (H=[1,0,0]) that
+	 * anchor kx/ky, which flow (velocity only) cannot -- removing horizontal drift and making
+	 * the position observable for waypoint control. The corridor center is the estimator's
+	 * origin (init pose), matching how the vehicle is placed at the corridor midline. */
+	const float lim = 0.95f * rmax;
+	if (d_left < lim && d_right < lim) {
+		ky.update_pos(0.5f * (d_right - d_left), r_wall, 0.0f);
+	}
+	if (d_front < lim && d_back < lim) {
+		kx.update_pos(0.5f * (d_back - d_front), r_wall, 0.0f);
 	}
 }
 

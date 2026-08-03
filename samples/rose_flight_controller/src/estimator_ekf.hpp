@@ -141,6 +141,8 @@ public:
 	void init(float x0, float y0, float z0) override;
 	void update(const float accel[3], const float gyro[3], const float flow[2],
 		    bool flow_valid, float height, bool tof_valid, float dt) override;
+	void fuse_walls(float d_front, float d_back, float d_left, float d_right,
+			float rmax) override;
 	void get_state(float state[EST_NSTATES]) const override;
 	const char *name() const override { return "EKF (Mahony + per-axis Kalman)"; }
 
@@ -154,6 +156,7 @@ private:
 	float r_tof;           /* ToF height measurement variance */
 	float flow_gate;       /* chi-square gate (NIS) for flow velocity updates */
 	float tof_gate;        /* chi-square gate (NIS) for ToF position updates */
+	float r_wall;          /* wall-derived horizontal position measurement variance */
 	float delay_steps;     /* known actuation delay, in control steps (model-based
 	                        * delay compensation; NOT a tuned per-channel gain) */
 };
