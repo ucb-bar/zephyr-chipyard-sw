@@ -157,24 +157,6 @@ static void mpc_init(void)
 	}
 }
 
-/* Read a 3-axis channel into a float[3] via the Zephyr sensor API. */
-static int read_xyz(const struct device *dev, enum sensor_channel chan, float out[3])
-{
-	struct sensor_value v[3];
-	int rc = sensor_sample_fetch(dev);
-	if (rc < 0) {
-		return rc;
-	}
-	rc = sensor_channel_get(dev, chan, v);
-	if (rc < 0) {
-		return rc;
-	}
-	for (int i = 0; i < 3; i++) {
-		out[i] = (float)sensor_value_to_double(&v[i]);
-	}
-	return 0;
-}
-
 int main(void)
 {
 	if (!device_is_ready(accel_dev) || !device_is_ready(gyro_dev)) {
@@ -196,14 +178,37 @@ int main(void)
 	float state[NSTATES], err[NSTATES], u[NACTIONS];
 
 	for (int iter = 0; iter < CTRL_ITERS; iter++) {
-		if (read_xyz(accel_dev, SENSOR_CHAN_ACCEL_XYZ, accel) < 0 ||
-		    read_xyz(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gyro) < 0) {
-			printk("flight_controller: IMU read error\n");
+		/* --- Phase 1: ISSUE all sensor requests. With the RoSE virtual drivers these are
+		 * non-blocking (TX only), so the whole sensor set streams to the bridge in ONE
+		 * grant; the ToF is low-rate (fetch returns -EAGAIN between its ~30 ms samples). On
+		 * real hardware each fetch performs its own transaction -- the batched pattern works
+		 * either way. --- */
+		int rc_a = sensor_sample_fetch(accel_dev);
+		int rc_g = sensor_sample_fetch(gyro_dev);
+#if HAVE_FLOW
+		sensor_sample_fetch(flow_dev);
+#endif
+		bool tof_valid = false;
+#if HAVE_TOF
+		tof_valid = (sensor_sample_fetch(tof_dev) == 0);
+#endif
+		if (rc_a < 0 || rc_g < 0) {
+			printk("flight_controller: IMU fetch error\n");
 			continue;
 		}
 
+		/* --- Phase 2: COLLECT all responses. With the RoSE drivers the first channel_get
+		 * does the (blocking) read, so all responses are collected together one grant after
+		 * the batched requests -> one grant of latency for the whole sensor set. --- */
+		struct sensor_value av[3], gv[3];
+		sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, av);
+		sensor_channel_get(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gv);
+		for (int i = 0; i < 3; i++) {
+			accel[i] = (float)sensor_value_to_double(&av[i]);
+			gyro[i]  = (float)sensor_value_to_double(&gv[i]);
+		}
 #if HAVE_FLOW
-		if (sensor_sample_fetch(flow_dev) == 0) {
+		{
 			struct sensor_value vx, vy;
 			sensor_channel_get(flow_dev, (enum sensor_channel)ROSE_SENSOR_CHAN_FLOW_VX, &vx);
 			sensor_channel_get(flow_dev, (enum sensor_channel)ROSE_SENSOR_CHAN_FLOW_VY, &vy);
@@ -211,15 +216,11 @@ int main(void)
 			flow[1] = (float)sensor_value_to_double(&vy);
 		}
 #endif
-		/* ToF is low-rate: fetch returns 0 only when a fresh sample is available, else
-		 * -EAGAIN. Fuse altitude only on fresh samples (multi-rate estimation). */
-		bool tof_valid = false;
 #if HAVE_TOF
-		if (sensor_sample_fetch(tof_dev) == 0) {
+		if (tof_valid) {
 			struct sensor_value h;
 			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
 			height = (float)sensor_value_to_double(&h);
-			tof_valid = true;
 		}
 #endif
 
