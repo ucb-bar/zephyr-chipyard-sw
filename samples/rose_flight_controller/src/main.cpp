@@ -57,6 +57,9 @@
 #define START_Z      0.9f
 #define TARGET_Z     1.0f
 #define CTRL_ITERS   5000    /* bounded by max_sim_time; ~25 s at 200 Hz */
+/* ToF is LOW-RATE (a real VL53L1x samples ~25-50 Hz). Fuse it every ROSE_TOF_PERIOD
+ * control steps; at 200 Hz, 6 -> ~33 Hz (30 ms). IMU + optical flow stay at 200 Hz. */
+#define ROSE_TOF_PERIOD 6
 
 static const struct device *rose = DEVICE_DT_GET_ONE(ucbbar_roseadapter);
 
@@ -174,7 +177,9 @@ int main(void)
 		 * flow[0..1] = body horizontal velocity, flow[2] = ToF height above ground. */
 		uint64_t c0;
 		__asm__ volatile("rdcycle %0" : "=r"(c0));
-		est.update(&imu[0], &imu[3], flow, flow[2], CTRL_DT);
+		/* ToF is low-rate: only treat it as a fresh sample every ROSE_TOF_PERIOD steps. */
+		bool tof_valid = (iter % ROSE_TOF_PERIOD) == 0;
+		est.update(&imu[0], &imu[3], flow, flow[2], tof_valid, CTRL_DT);
 		est.get_state(state);
 		for (int i = 0; i < NSTATES; i++) {
 			err[i] = state[i] - setpoint[i];

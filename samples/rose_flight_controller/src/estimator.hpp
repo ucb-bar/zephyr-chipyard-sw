@@ -26,14 +26,16 @@ struct IStateEstimator {
 	/* Initialize at a known takeoff pose (level, at rest). */
 	virtual void init(float x0, float y0, float z0) = 0;
 
-	/* One estimator step.
-	 *   accel:  body-frame specific force (m/s^2)   [ax, ay, az]
-	 *   gyro:   body-frame angular rate   (rad/s)   [gx, gy, gz]
-	 *   flow:   body-frame horizontal velocity (m/s)[vx, vy]
-	 *   height: downward ToF height above ground (m)
-	 *   dt:     control period (s)                                                     */
+	/* One estimator step. The IMU + optical flow are sampled every call (fast); the ToF
+	 * height is LOW-RATE (~20-40 ms) so it is only fused when a fresh sample is available.
+	 *   accel:     body-frame specific force (m/s^2)   [ax, ay, az]
+	 *   gyro:      body-frame angular rate   (rad/s)   [gx, gy, gz]
+	 *   flow:      body-frame horizontal velocity (m/s)[vx, vy]
+	 *   height:    downward ToF height above ground (m); used only if tof_valid
+	 *   tof_valid: true on steps where a fresh ToF sample arrived
+	 *   dt:        control period (s)                                                  */
 	virtual void update(const float accel[3], const float gyro[3], const float flow[2],
-			    float height, float dt) = 0;
+			    float height, bool tof_valid, float dt) = 0;
 
 	/* Fill the 12-DoF TinyMPC state from the current estimate. */
 	virtual void get_state(float state[EST_NSTATES]) const = 0;
