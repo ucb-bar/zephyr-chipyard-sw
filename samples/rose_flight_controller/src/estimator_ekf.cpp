@@ -22,7 +22,7 @@ void EkfEstimator::init(float x0, float y0, float z0)
 }
 
 void EkfEstimator::update(const float accel[3], const float gyro[3],
-			  const float flow[2], float height, float dt)
+			  const float flow[2], float height, bool tof_valid, float dt)
 {
 	gx = gyro[0]; gy = gyro[1]; gz = gyro[2];
 	att.update(accel, gyro, dt);
@@ -45,8 +45,12 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 	kx.update_vel(vfx, r_flow);
 	ky.update_vel(vfy, r_flow);
 
-	/* update: altitude from downward ToF (position measurement) */
-	kz.update_pos(height, r_tof);
+	/* update: altitude from downward ToF (position measurement) -- only when a fresh
+	 * low-rate ToF sample is available. Between samples the z-axis KF runs predict-only
+	 * (accel), and its covariance grows so the next ToF correction is weighted more. */
+	if (tof_valid) {
+		kz.update_pos(height, r_tof);
+	}
 }
 
 void EkfEstimator::get_state(float state[EST_NSTATES]) const

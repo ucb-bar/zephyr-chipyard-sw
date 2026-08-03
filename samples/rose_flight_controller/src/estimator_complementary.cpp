@@ -23,7 +23,7 @@ void ComplementaryEstimator::init(float x0, float y0, float z0)
 }
 
 void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
-				    const float flow[2], float height, float dt)
+				    const float flow[2], float height, bool tof_valid, float dt)
 {
 	gx = gyro[0]; gy = gyro[1]; gz = gyro[2];
 	att.update(accel, gyro, dt);
@@ -45,10 +45,14 @@ void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
 
 	x += vx*dt; y += vy*dt; z += vz*dt;
 
-	/* ToF altitude observer */
-	float rz = height - z;
-	z  += z_gain*rz;
-	vz += vz_gain*rz;
+	/* ToF altitude observer -- only on steps with a fresh (low-rate) ToF sample. Between
+	 * samples z/vz dead-reckon on the accelerometer (fast layer); the ToF corrects the
+	 * accumulated drift when it arrives (slow layer). */
+	if (tof_valid) {
+		float rz = height - z;
+		z  += z_gain*rz;
+		vz += vz_gain*rz;
+	}
 }
 
 void ComplementaryEstimator::get_state(float state[EST_NSTATES]) const
