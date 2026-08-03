@@ -19,8 +19,16 @@ void EkfEstimator::init(float x0, float y0, float z0)
 	kz.init(z0, 2.0f, 0.05f, 0.25f);
 	gx = gy = gz = 0.0f;
 	awx = awy = awz = 0.0f; dt_last = 0.0f;
-	r_flow = 4e-4f;      /* trust optical flow strongly for velocity (~0.02 m/s std) */
+	r_flow = 9e-4f;      /* optical-flow velocity variance ~ (0.03 m/s)^2, matched to the
+	                      * aggressive-noise flow std so the filter doesn't over-trust noisy
+	                      * flow (stress plan section 4, item 4). */
 	r_tof  = 1e-4f;      /* trust ToF height strongly (~0.01 m std) */
+	/* chi-square (NIS) outlier gates (item 3): reject a flow sample whose normalized
+	 * innovation^2 exceeds ~9 (a ~0.5 m/s flow outlier at hover is tens of sigma -> rejected,
+	 * while ordinary 0.03 m/s noise passes). ToF gate is looser (25) since altitude is only
+	 * weakly re-observed and a wrongly-rejected ToF would let the height drift. */
+	flow_gate = 9.0f;
+	tof_gate  = 25.0f;
 	delay_steps = 1.0f;  /* control acts 1 step later -> predict 1 step ahead */
 }
 
@@ -45,14 +53,14 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 	/* update: horizontal velocity from optical flow (body->world) */
 	float vfx = R[0]*flow[0] + R[1]*flow[1];
 	float vfy = R[3]*flow[0] + R[4]*flow[1];
-	kx.update_vel(vfx, r_flow);
-	ky.update_vel(vfy, r_flow);
+	kx.update_vel(vfx, r_flow, flow_gate);
+	ky.update_vel(vfy, r_flow, flow_gate);
 
 	/* update: altitude from downward ToF (position measurement) -- only when a fresh
 	 * low-rate ToF sample is available. Between samples the z-axis KF runs predict-only
 	 * (accel), and its covariance grows so the next ToF correction is weighted more. */
 	if (tof_valid) {
-		kz.update_pos(height, r_tof);
+		kz.update_pos(height, r_tof, tof_gate);
 	}
 }
 
