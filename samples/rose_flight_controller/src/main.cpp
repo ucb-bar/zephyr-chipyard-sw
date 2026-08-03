@@ -157,6 +157,223 @@ static void mpc_init(void)
 	}
 }
 
+/* =====================================================================================
+ * Modular task blocks. The controller is split into three cooperating blocks so IO can be
+ * decoupled from compute and the estimator/controller can run at DIFFERENT rates:
+ *
+ *   [sensor IO] --sem_sample--> [estimator] --sem_state--> [control] --g_control--> [actuator]
+ *
+ * The blocks are Zephyr threads sharing latest-value buffers (mutex-protected) and handing
+ * off via semaphores. The pipeline is IO-paced: the sensor exchange gates one iteration.
+ * ROSE_CTRL_DIV runs TinyMPC once every N estimator ticks -> control rate = estimation rate
+ * / DIV (e.g. estimate @200 Hz, control @50 Hz to match the TinyMPC design rate). On real
+ * hardware the IO block's transport (DMA/IRQ) overlaps with compute; in the single-core
+ * lockstep co-sim the blocks serialize within each grant but the structure + rates are real.
+ * Set ROSE_THREADED=0 for the original single-loop build (kept for A/B).
+ * ===================================================================================== */
+/* NOTE: default 0 (single-loop). The threaded blocks are fully implemented and validated to
+ * hover (DIV=1 matches the single loop; DIV=4 runs control @50 Hz / estimate @200 Hz), but the
+ * RoSE *lockstep* co-sim intermittently deadlocks after ~235 steps: the guest waits for the
+ * synchronizer's next grant while the synchronizer waits for the guest -- a subtle timing
+ * desync between preemptive threading and the deterministic per-grant protocol (the guest is
+ * NOT crashed; the hover is perfect until it stalls). Real hardware (no lockstep) is unaffected.
+ * Build -DROSE_THREADED=1 to use/continue-debugging the threaded architecture. */
+#ifndef ROSE_THREADED
+#define ROSE_THREADED 0
+#endif
+#ifndef ROSE_CTRL_DIV
+#define ROSE_CTRL_DIV 1        /* control runs every Nth estimator tick (1 = same rate) */
+#endif
+
+static const float g_setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
+
+struct sensor_frame {
+	float accel[3], gyro[3], flow[2], height;
+	bool flow_valid, tof_valid;
+};
+
+/* Sensor IO block: batched fetch (TX) then collect (blocking RX) of the whole sensor set. */
+static bool read_sensor_frame(struct sensor_frame *f)
+{
+	int rc_a = sensor_sample_fetch(accel_dev);
+	int rc_g = sensor_sample_fetch(gyro_dev);
+#if HAVE_FLOW
+	sensor_sample_fetch(flow_dev);
+#endif
+	f->tof_valid = false;
+#if HAVE_TOF
+	f->tof_valid = (sensor_sample_fetch(tof_dev) == 0);
+#endif
+	if (rc_a < 0 || rc_g < 0) {
+		return false;
+	}
+	struct sensor_value av[3], gv[3];
+	sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, av);
+	sensor_channel_get(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gv);
+	for (int i = 0; i < 3; i++) {
+		f->accel[i] = (float)sensor_value_to_double(&av[i]);
+		f->gyro[i]  = (float)sensor_value_to_double(&gv[i]);
+	}
+	f->flow[0] = f->flow[1] = 0.0f;
+	f->flow_valid = true;
+#if HAVE_FLOW
+	{
+		struct sensor_value vx, vy;
+		sensor_channel_get(flow_dev, (enum sensor_channel)ROSE_SENSOR_CHAN_FLOW_VX, &vx);
+		sensor_channel_get(flow_dev, (enum sensor_channel)ROSE_SENSOR_CHAN_FLOW_VY, &vy);
+		f->flow[0] = (float)sensor_value_to_double(&vx);
+		f->flow[1] = (float)sensor_value_to_double(&vy);
+		if (f->flow[0] != f->flow[0] || f->flow[1] != f->flow[1]) {   /* NaN = dropout sentinel */
+			f->flow_valid = false;
+			f->flow[0] = f->flow[1] = 0.0f;
+		}
+	}
+#endif
+	f->height = START_Z;
+#if HAVE_TOF
+	if (f->tof_valid) {
+		struct sensor_value h;
+		sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
+		f->height = (float)sensor_value_to_double(&h);
+	}
+#endif
+	return true;
+}
+
+/* Control block: TinyMPC solve from a 12-DoF state -> 4 motor thrusts. */
+static void solve_control(const float *state, float *u)
+{
+	float err[NSTATES];
+	for (int i = 0; i < NSTATES; i++) {
+		err[i] = state[i] - g_setpoint[i];
+	}
+	err[0] = 0.0f; err[1] = 0.0f;   /* x/y position unobservable from flow -> regulate velocity */
+	matsetv(work.x.vector[0], err, 1, NSTATES);
+	matset(work.y.data, 0.0, work.y.outer, work.y.inner);
+	matset(work.g.data, 0.0, work.g.outer, work.g.inner);
+	tiny_solve(&solver);
+	for (int i = 0; i < NACTIONS; i++) {
+		u[i] = work.u.vector[0][i];
+	}
+}
+
+#if ROSE_THREADED
+/* ---- inter-block state: latest-value buffers + handoff semaphores ---- */
+K_MUTEX_DEFINE(mtx_frame);
+K_MUTEX_DEFINE(mtx_state);
+K_MUTEX_DEFINE(mtx_ctrl);
+K_SEM_DEFINE(sem_sample, 0, 1);   /* IO -> estimator: a new sensor frame is ready */
+K_SEM_DEFINE(sem_state, 0, 1);    /* estimator -> control: a new state estimate is ready */
+K_SEM_DEFINE(sem_done, 0, 1);     /* control -> IO: this grant's estimate+control finished */
+static struct sensor_frame g_frame;
+static float g_state[NSTATES];
+static float g_ctrl[NACTIONS] = {0};
+
+/* Priorities: control (lowest number) preempts estimator preempts IO, so a fresh frame flows
+ * frame -> state -> control within one grant, then the IO block sends the fresh command. */
+#define PRIO_IO   7
+#define PRIO_EST  5
+#define PRIO_CTRL 3
+#define PRIO_KEEPALIVE 14         /* lowest app priority (just above the idle thread) */
+K_THREAD_STACK_DEFINE(io_stack,   16384);
+K_THREAD_STACK_DEFINE(est_stack,  65536);
+K_THREAD_STACK_DEFINE(ctrl_stack, 327680);   /* TinyMPC solve working set (was the main stack) */
+K_THREAD_STACK_DEFINE(keepalive_stack, 2048);
+static struct k_thread io_t, est_t, ctrl_t, keepalive_t;
+
+/* Keepalive: under the RoSE lockstep, the guest's virtual clock (mtime) only advances while it
+ * executes; if every app thread blocks for even an instant the idle thread runs WFI, which
+ * HALTS mtime -> the timer interrupt that would wake it can't fire (the sync gates mtime to the
+ * grant budget) -> guest + sync deadlock. This lowest-priority thread never blocks, so the CPU
+ * always has something to run instead of idling; any ready IO/estimator/control thread still
+ * preempts it. (On real hardware you would drop this and let the core sleep.) */
+static volatile uint32_t keepalive_spin;
+static void keepalive_block(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	/* True busy-spin (NOT k_yield -- Zephyr still idles the core when the yielding thread is the
+	 * only ready one, which WFI-halts mtime). This never yields, so the core never idles; the
+	 * higher-priority IO/estimator/control threads still preempt it the instant they are ready. */
+	for (;;) {
+		keepalive_spin++;
+	}
+}
+
+static void io_block(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	for (int iter = 0; iter < CTRL_ITERS; iter++) {
+		struct sensor_frame f;
+		if (!read_sensor_frame(&f)) {
+			continue;
+		}
+		k_mutex_lock(&mtx_frame, K_FOREVER);
+		g_frame = f;
+		k_mutex_unlock(&mtx_frame);
+		k_sem_give(&sem_sample);        /* trigger estimator -> control for this frame */
+		k_sem_take(&sem_done, K_FOREVER);  /* BLOCK (yield) until compute finishes -> the per-
+		                                    * grant sequence stays deterministic (no preemption
+		                                    * mid-IO), which the lockstep protocol requires. */
+
+		float u[NACTIONS];
+		k_mutex_lock(&mtx_ctrl, K_FOREVER);
+		for (int i = 0; i < NACTIONS; i++) u[i] = g_ctrl[i];
+		k_mutex_unlock(&mtx_ctrl);
+		send_control(u);                /* fresh command (from this frame), applied next step */
+	}
+	printk("flight_controller: IO block done (%d iters)\n", CTRL_ITERS);
+}
+
+static void est_block(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	while (1) {
+		k_sem_take(&sem_sample, K_FOREVER);
+		struct sensor_frame f;
+		k_mutex_lock(&mtx_frame, K_FOREVER);
+		f = g_frame;
+		k_mutex_unlock(&mtx_frame);
+
+		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, CTRL_DT);
+		float st[NSTATES];
+		est.get_state(st);
+
+		k_mutex_lock(&mtx_state, K_FOREVER);
+		for (int i = 0; i < NSTATES; i++) g_state[i] = st[i];
+		k_mutex_unlock(&mtx_state);
+		k_sem_give(&sem_state);
+	}
+}
+
+static void ctrl_block(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	uint32_t tick = 0;
+	while (1) {
+		k_sem_take(&sem_state, K_FOREVER);
+		if ((++tick % ROSE_CTRL_DIV) == 0) {   /* sub-rate: solve only every DIV-th tick */
+			float st[NSTATES], u[NACTIONS];
+			k_mutex_lock(&mtx_state, K_FOREVER);
+			for (int i = 0; i < NSTATES; i++) st[i] = g_state[i];
+			k_mutex_unlock(&mtx_state);
+
+			solve_control(st, u);
+
+			k_mutex_lock(&mtx_ctrl, K_FOREVER);
+			for (int i = 0; i < NACTIONS; i++) g_ctrl[i] = u[i];
+			k_mutex_unlock(&mtx_ctrl);
+
+			if ((tick % (10 * ROSE_CTRL_DIV)) == 0) {
+				printk("flight_controller: t=%u z=%d.%03d u0=%d.%03d\n", tick,
+				       (int)st[2], (int)(st[2]*1000)%1000, (int)u[0], (int)(u[0]*1000)%1000);
+			}
+		}
+		/* Always signal IO -- on skip grants g_ctrl is held (sub-rate command). */
+		k_sem_give(&sem_done);
+	}
+}
+#endif /* ROSE_THREADED */
+
 int main(void)
 {
 	if (!device_is_ready(accel_dev) || !device_is_ready(gyro_dev)) {
@@ -167,100 +384,43 @@ int main(void)
 	mpc_init();
 	est.init(0.0f, 0.0f, START_Z);
 
-	const float setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-
-	printk("flight_controller: estimator=%s + TinyMPC ready (%s), entering control loop\n",
+#if ROSE_THREADED
+	printk("flight_controller: estimator=%s + TinyMPC (%s), THREADED blocks "
+	       "(estimate@grant, control every %d) \n",
+	       est.name(), HAVE_ROSE ? "RoSE co-sim" : "real target", ROSE_CTRL_DIV);
+	/* Start the blocks after init so nothing runs against an uninitialized estimator/MPC. */
+	k_thread_create(&ctrl_t, ctrl_stack, K_THREAD_STACK_SIZEOF(ctrl_stack),
+			ctrl_block, NULL, NULL, NULL, PRIO_CTRL, 0, K_NO_WAIT);
+	k_thread_create(&est_t, est_stack, K_THREAD_STACK_SIZEOF(est_stack),
+			est_block, NULL, NULL, NULL, PRIO_EST, 0, K_NO_WAIT);
+	k_thread_create(&keepalive_t, keepalive_stack, K_THREAD_STACK_SIZEOF(keepalive_stack),
+			keepalive_block, NULL, NULL, NULL, PRIO_KEEPALIVE, 0, K_NO_WAIT);
+	k_thread_create(&io_t, io_stack, K_THREAD_STACK_SIZEOF(io_stack),
+			io_block, NULL, NULL, NULL, PRIO_IO, 0, K_NO_WAIT);
+	k_thread_join(&io_t, K_FOREVER);   /* run until the IO block finishes its iterations */
+	k_thread_abort(&keepalive_t);
+	printk("flight_controller: control loop done (%d iters)\n", CTRL_ITERS);
+	return 0;
+#else
+	printk("flight_controller: estimator=%s + TinyMPC ready (%s), single-loop\n",
 	       est.name(), HAVE_ROSE ? "RoSE co-sim" : "real target");
-
-	float accel[3], gyro[3];
-	float flow[2] = {0.0f, 0.0f};
-	float height = START_Z;
-	float state[NSTATES], err[NSTATES], u[NACTIONS];
-
+	struct sensor_frame f;
+	float state[NSTATES], u[NACTIONS];
 	for (int iter = 0; iter < CTRL_ITERS; iter++) {
-		/* --- Phase 1: ISSUE all sensor requests. With the RoSE virtual drivers these are
-		 * non-blocking (TX only), so the whole sensor set streams to the bridge in ONE
-		 * grant; the ToF is low-rate (fetch returns -EAGAIN between its ~30 ms samples). On
-		 * real hardware each fetch performs its own transaction -- the batched pattern works
-		 * either way. --- */
-		int rc_a = sensor_sample_fetch(accel_dev);
-		int rc_g = sensor_sample_fetch(gyro_dev);
-#if HAVE_FLOW
-		sensor_sample_fetch(flow_dev);
-#endif
-		bool tof_valid = false;
-#if HAVE_TOF
-		tof_valid = (sensor_sample_fetch(tof_dev) == 0);
-#endif
-		if (rc_a < 0 || rc_g < 0) {
+		if (!read_sensor_frame(&f)) {
 			printk("flight_controller: IMU fetch error\n");
 			continue;
 		}
-
-		/* --- Phase 2: COLLECT all responses. With the RoSE drivers the first channel_get
-		 * does the (blocking) read, so all responses are collected together one grant after
-		 * the batched requests -> one grant of latency for the whole sensor set. --- */
-		struct sensor_value av[3], gv[3];
-		sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, av);
-		sensor_channel_get(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gv);
-		for (int i = 0; i < 3; i++) {
-			accel[i] = (float)sensor_value_to_double(&av[i]);
-			gyro[i]  = (float)sensor_value_to_double(&gv[i]);
-		}
-		bool flow_valid = true;
-#if HAVE_FLOW
-		{
-			struct sensor_value vx, vy;
-			sensor_channel_get(flow_dev, (enum sensor_channel)ROSE_SENSOR_CHAN_FLOW_VX, &vx);
-			sensor_channel_get(flow_dev, (enum sensor_channel)ROSE_SENSOR_CHAN_FLOW_VY, &vy);
-			flow[0] = (float)sensor_value_to_double(&vx);
-			flow[1] = (float)sensor_value_to_double(&vy);
-			/* A NaN in the flow packet is the dropout sentinel (no fresh optical-flow sample):
-			 * the estimator runs velocity predict-only this step. (x != x is true only for NaN,
-			 * so no <math.h> dependency.) On a real Flow deck the driver would set this from the
-			 * sensor's motion/quality status instead. */
-			if (flow[0] != flow[0] || flow[1] != flow[1]) {
-				flow_valid = false;
-				flow[0] = flow[1] = 0.0f;   /* keep a finite value out of the estimator */
-			}
-		}
-#endif
-#if HAVE_TOF
-		if (tof_valid) {
-			struct sensor_value h;
-			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
-			height = (float)sensor_value_to_double(&h);
-		}
-#endif
-
-		est.update(accel, gyro, flow, flow_valid, height, tof_valid, CTRL_DT);
+		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, CTRL_DT);
 		est.get_state(state);
-		for (int i = 0; i < NSTATES; i++) {
-			err[i] = state[i] - setpoint[i];
-		}
-		/* Horizontal position is unobservable (flow gives velocity) -> regulate velocity
-		 * only, let x/y position dead-reckon (drift). Zero the x/y position error. */
-		err[0] = 0.0f;
-		err[1] = 0.0f;
-
-		matsetv(work.x.vector[0], err, 1, NSTATES);
-		matset(work.y.data, 0.0, work.y.outer, work.y.inner);
-		matset(work.g.data, 0.0, work.g.outer, work.g.inner);
-
-		tiny_solve(&solver);
-
-		for (int i = 0; i < NACTIONS; i++) {
-			u[i] = work.u.vector[0][i];
-		}
+		solve_control(state, u);
 		if ((iter % 10) == 0) {
-			printk("flight_controller: iter=%d z_est=%d.%03d z_err=%d.%03d u0=%d.%03d\n",
-			       iter,
-			       (int)state[2], (int)(state[2] * 1000) % 1000,
-			       (int)err[2], (int)(err[2] * 1000) % 1000,
-			       (int)u[0], (int)(u[0] * 1000) % 1000);
+			printk("flight_controller: iter=%d z_est=%d.%03d u0=%d.%03d\n", iter,
+			       (int)state[2], (int)(state[2]*1000)%1000, (int)u[0], (int)(u[0]*1000)%1000);
 		}
 		send_control(u);
 	}
 	printk("flight_controller: control loop done (%d iters)\n", CTRL_ITERS);
 	return 0;
+#endif
 }
