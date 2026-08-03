@@ -34,10 +34,18 @@
 #include "glob_opts.hpp"
 
 #include "estimator.hpp"
-#include <rose/rose_sensor.h>   /* private optical-flow channels */
 
 #define NSTATES   12
 #define NACTIONS  4
+
+/* Optional sensors: present iff the board overlay declares the alias. On the RoSE target
+ * both are virtual ucbbar,rose-* devices; on real hardware they bind to PMW3901 / VL53L1x
+ * (flow may be absent on a given board -> the app compiles and runs without it). */
+#define HAVE_FLOW DT_NODE_EXISTS(DT_ALIAS(flow))
+#define HAVE_TOF  DT_NODE_EXISTS(DT_ALIAS(tof))
+#if HAVE_FLOW
+#include <rose/rose_sensor.h>   /* RoSE private optical-flow channels */
+#endif
 
 /* Control period — MUST match the co-sim rate (gym_timestep = firesim_step/firesim_freq):
  * 0.005 = 200 Hz. The 50 Hz TinyMPC LQR gain is rate-tolerant; running it faster tightens
@@ -51,8 +59,6 @@
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
 static const struct device *gyro_dev  = DEVICE_DT_GET(DT_ALIAS(bmi088_gyro));
 
-#define HAVE_FLOW DT_NODE_EXISTS(DT_ALIAS(flow))
-#define HAVE_TOF  DT_NODE_EXISTS(DT_ALIAS(tof))
 #if HAVE_FLOW
 static const struct device *flow_dev = DEVICE_DT_GET(DT_ALIAS(flow));
 #endif

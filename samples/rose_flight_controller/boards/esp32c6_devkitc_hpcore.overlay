@@ -10,6 +10,9 @@
  * Gaps for full real flight (out of scope here, see docs/ROSE_SENSOR_ABSTRACTION.md):
  *   - optical flow: needs a PMW3901 driver (not vendored in this Zephyr fork), so no
  *     `flow` alias -> the app compiles with flow disabled (HAVE_FLOW guard).
+ *   - ToF: the st,vl53l1x driver needs the ST HAL module (hal_st, not installed here), so
+ *     no `tof` alias -> the app compiles with ToF disabled (HAVE_TOF guard). Add hal_st +
+ *     a vl53l1x@29 node + `tof` alias to enable it (see riskybird sensor_bringup).
  *   - motors: actuator parity is future work; with no `motors` alias the app's output is
  *     a no-op stub. Add a PWM `motors` node here to drive real ESC/motors.
  */
@@ -47,18 +50,15 @@
 		status = "okay";
 	};
 
-	/* VL53L1X downward Time-of-Flight rangefinder */
-	vl53l1x: vl53l1x@29 {
-		compatible = "st,vl53l1x";
-		reg = <0x29>;
-		status = "okay";
-	};
+	/* VL53L1X ToF: uncomment once the ST HAL module (hal_st) is installed.
+	 * vl53l1x: vl53l1x@29 { compatible = "st,vl53l1x"; reg = <0x29>; status = "okay"; };
+	 */
 };
 
 / {
 	aliases {
 		bmi088-accel = &bmi088_accel;
 		bmi088-gyro  = &bmi088_gyro;
-		tof          = &vl53l1x;
+		/* tof = &vl53l1x;  (enable with hal_st, see above) */
 	};
 };
