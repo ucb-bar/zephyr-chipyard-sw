@@ -1,0 +1,62 @@
+/* RoSE co-sim overlay for the multizone-ToF probe: the RoSE bridge adapter + the four
+ * horizontal VL53L5CX multizone ToF sensors. Command IDs / reqrsp channels match
+ * config_gym_IsaacCrazyflieMultiSensorEnv-v0.yaml (front 0x30/ch1, right 0x31/ch2,
+ * back 0x32/ch1, left 0x33/ch2). The app binds them through the aliases tof_front/right/
+ * back/left, exactly as a real board would bind st,vl53l5cx.
+ */
+/ {
+	rose0: rose@2000 {
+		compatible = "ucbbar,RoseAdapter";
+		reg = <0x2000 0x1000>;
+		interrupt-parent = <&plic>;
+		interrupts = <3 1>;
+		num-reqrsp-channels = <2>;
+		num-dma-channels = <1>;
+		dma-base-address = <0x88000000>;
+		status = "okay";
+	};
+
+	rose_tof_front: rose-tof-front {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>;
+		rose-cmd = <0x30>;
+		rose-channel = <1>;
+		zones = <64>;
+		decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_right: rose-tof-right {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>;
+		rose-cmd = <0x31>;
+		rose-channel = <2>;
+		zones = <64>;
+		decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_back: rose-tof-back {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>;
+		rose-cmd = <0x32>;
+		rose-channel = <1>;
+		zones = <64>;
+		decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_left: rose-tof-left {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>;
+		rose-cmd = <0x33>;
+		rose-channel = <2>;
+		zones = <64>;
+		decimation = <13>;
+		status = "okay";
+	};
+
+	aliases {
+		tof-front = &rose_tof_front;
+		tof-right = &rose_tof_right;
+		tof-back  = &rose_tof_back;
+		tof-left  = &rose_tof_left;
+	};
+};
