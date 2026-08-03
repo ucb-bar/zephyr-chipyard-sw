@@ -8,20 +8,34 @@ Overview
 
 A step toward prepping a **real** flight controller with RoSE. Where
 ``samples/rose/drone_control`` is handed the full ground-truth state (which no real
-vehicle has), this sample receives only what onboard **sensors** measure over the RoSE
-bridge and runs a **state estimator** to reconstruct the state before TinyMPC:
+vehicle has), this sample receives only what onboard **sensors** measure and runs a
+**state estimator** to reconstruct the state before TinyMPC.
+
+Sensors are read through the **standard Zephyr sensor API** (``DEVICE_DT_GET(DT_ALIAS(...))``
++ ``sensor_sample_fetch`` / ``sensor_channel_get``), so this ONE application builds two ways
+-- ``main`` / estimator / TinyMPC are byte-for-byte identical; only the board overlay +
+``.conf`` differ (see ``docs/ROSE_SENSOR_ABSTRACTION.md``):
+
+* **RoSE co-sim** (``-b spike_riscv64``): aliases bind to the virtual ``ucbbar,rose-*``
+  sensor drivers (in the ``zephyr-rose`` module), which fetch from the RoSE bridge / Isaac
+  Sim virtual sensors. ``boards/spike_riscv64.{overlay,conf}``.
+* **Real hardware** (``-b esp32c6_devkitc/esp32c6/hpcore``, the "riskybird" PCB): aliases
+  bind to the real ``bosch,bmi08x-*`` IMU over I2C. ``boards/esp32c6_devkitc_hpcore.{overlay,conf}``.
+
+Underlying wire packets (RoSE build): IMU ``0x12`` ch2 ``[ax,ay,az, gx,gy,gz]``; optical
+flow ``0x13`` ch1 ``[vx,vy]``; low-rate ToF ``0x14`` ch1 ``[h]``. Data flow:
 
 .. code-block:: none
 
-   IMU  (0x12, ch2): [ax,ay,az, gx,gy,gz]  accelerometer specific force + rate gyro (body)
-   FLOW (0x13, ch1): [vx,vy, h]            optical-flow horizontal velocity + ToF height
-                                           (models a Crazyflie Flow deck v2)
-        |
+   IMU  (BMI088)  : accel [ax,ay,az] + gyro [gx,gy,gz]   (SENSOR_CHAN_ACCEL_XYZ/GYRO_XYZ)
+   FLOW (PMW3901) : body-frame horizontal velocity [vx,vy]  (private FLOW_VX/VY channels)
+   ToF  (VL53L1x) : downward height [h], LOW-RATE          (SENSOR_CHAN_DISTANCE, -EAGAIN)
+        |  (Zephyr sensor API: same calls on RoSE and real hardware)
         v
    StateEstimator.update()  ->  12-DoF state  [x,y,z, r1,r2,r3, vx,vy,vz, wx,wy,wz]
         |
         v
-   err = state - hover setpoint  ->  TinyMPC  ->  4 normalized thrusts (0x20)
+   err = state - hover setpoint  ->  TinyMPC  ->  4 normalized thrusts
 
 The estimator (``src/estimator.{hpp,cpp}``) is a complementary filter + dead-reckoning,
 extending ``samples/flight_controller``'s ``attitude_estimator.c``:
@@ -67,6 +81,26 @@ Then, from the RoSE repo root (uses the in-tree Zephyr toolchain):
 
    soc/sim/build_zephyr_rose.sh rose_flight_controller
    # -> soc/sim/zephyr_rose_builds/rose_flight_controller/zephyr/zephyr.elf
+
+Build for real hardware (ESP32C6 riskybird)
+-------------------------------------------
+
+The SAME sources build for the ESP32C6 board with the real BMI088 IMU. ESP32C6 SoC support
+needs the Espressif HAL, which the lean RISC-V RoSE workspace does not fetch by default;
+add it once (copy ``modules/hal/espressif`` from an espressif-enabled Zephyr workspace into
+this workspace, or ``west update`` against the full manifest) and ``pip install
+"esptool>=5.0.2"``. Then:
+
+.. code-block:: console
+
+   soc/sim/build_zephyr_esp32c6.sh
+   # -> soc/sim/zephyr_rose_builds/rose_flight_controller_esp32c6/zephyr/zephyr.elf
+
+Builds today with the real ``bosch,bmi08x`` IMU (SRAM ~90% of the C6's 437 KB). The ToF
+(``st,vl53l1x``) additionally needs ``hal_st`` and optical flow needs a PMW3901 driver
+(neither vendored here) -- they are guarded off (``HAVE_TOF``/``HAVE_FLOW``) until added;
+see the notes in ``boards/esp32c6_devkitc_hpcore.overlay``. Actuator output (motors) is the
+only other target-specific piece and is a no-op stub on real HW pending a PWM ``motors`` node.
 
 Control rate (important)
 ************************
