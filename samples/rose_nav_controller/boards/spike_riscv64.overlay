@@ -1,0 +1,71 @@
+/* RoSE co-sim overlay for the navigation controller: the RoSE bridge adapter + the full
+ * flight sensor set (IMU accel/gyro, optical flow, downward ToF) AND the four horizontal
+ * VL53L5CX multizone ToFs. Command IDs / reqrsp channels match
+ * config_gym_IsaacCrazyflieMultiSensorEnv-v0.yaml. Aliases match the shared app / a real
+ * riskybird board (bmi088-accel/-gyro, flow, tof, tof-front/right/back/left).
+ */
+/ {
+	rose0: rose@2000 {
+		compatible = "ucbbar,RoseAdapter";
+		reg = <0x2000 0x1000>;
+		interrupt-parent = <&plic>;
+		interrupts = <3 1>;
+		num-reqrsp-channels = <2>;
+		num-dma-channels = <1>;
+		dma-base-address = <0x88000000>;
+		status = "okay";
+	};
+
+	rose_imu_accel: rose-imu-accel {
+		compatible = "ucbbar,rose-imu";
+		rose = <&rose0>; rose-cmd = <0x12>; rose-channel = <2>;
+		status = "okay";
+	};
+	rose_imu_gyro: rose-imu-gyro {
+		compatible = "ucbbar,rose-imu";
+		rose = <&rose0>; rose-cmd = <0x15>; rose-channel = <2>; is-gyro;
+		status = "okay";
+	};
+	rose_flow: rose-flow {
+		compatible = "ucbbar,rose-flow";
+		rose = <&rose0>; rose-cmd = <0x13>; rose-channel = <1>;
+		status = "okay";
+	};
+	rose_tof: rose-tof {
+		compatible = "ucbbar,rose-tof";
+		rose = <&rose0>; rose-cmd = <0x14>; rose-channel = <1>; decimation = <6>;
+		status = "okay";
+	};
+
+	rose_tof_front: rose-tof-front {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x30>; rose-channel = <1>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_right: rose-tof-right {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x31>; rose-channel = <2>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_back: rose-tof-back {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x32>; rose-channel = <1>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_left: rose-tof-left {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x33>; rose-channel = <2>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+
+	aliases {
+		bmi088-accel = &rose_imu_accel;
+		bmi088-gyro  = &rose_imu_gyro;
+		flow         = &rose_flow;
+		tof          = &rose_tof;
+		tof-front    = &rose_tof_front;
+		tof-right    = &rose_tof_right;
+		tof-back     = &rose_tof_back;
+		tof-left     = &rose_tof_left;
+	};
+};

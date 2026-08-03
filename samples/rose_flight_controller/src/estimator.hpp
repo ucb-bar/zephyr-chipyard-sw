@@ -38,6 +38,17 @@ struct IStateEstimator {
 	virtual void update(const float accel[3], const float gyro[3], const float flow[2],
 			    bool flow_valid, float height, bool tof_valid, float dt) = 0;
 
+	/* Optional: fuse horizontal wall distances (4x multizone ToF, nearest-wall per direction)
+	 * for obstacle-relative position. In a corridor, (d_right - d_left)/2 is an exact lateral
+	 * position relative to the corridor center, and (d_back - d_front)/2 the longitudinal one --
+	 * position observability the flow-only filter lacks (flow gives velocity; position drifts).
+	 * Each pair is fused only when BOTH facing walls are within range (rmax). Distances are the
+	 * nearest wall in metres per body direction; rmax is the sensor's max range. Default no-op
+	 * (filters that don't use walls, or builds without the sensors, ignore it).            */
+	virtual void fuse_walls(float d_front, float d_back, float d_left, float d_right,
+				float rmax) { (void)d_front; (void)d_back; (void)d_left;
+				(void)d_right; (void)rmax; }
+
 	/* Fill the 12-DoF TinyMPC state from the current estimate. */
 	virtual void get_state(float state[EST_NSTATES]) const = 0;
 
