@@ -1,5 +1,10 @@
-/* RoSE co-sim adapter node for RoseTLRocketMMIOOnlyConfig (control MMIO @0x2000,
- * DMA-complete IRQ = PLIC source 3). Shared by all samples/rose apps.
+/* RoSE co-sim overlay for the shared flight controller.
+ *
+ * Declares the RoSE bridge adapter (control MMIO @0x2000, DMA-complete IRQ = PLIC src 3)
+ * and the VIRTUAL sensor devices that hang off it. The app binds sensors through the
+ * standard aliases (bmi088-accel/-gyro, flow, tof) exactly as on real hardware; here they
+ * resolve to the ucbbar,rose-* drivers that fetch from the RoSE bridge. Command IDs /
+ * reqrsp channels match config_gym_IsaacCrazyflieSensorEnv-v0.yaml.
  */
 / {
 	rose0: rose@2000 {
@@ -11,5 +16,43 @@
 		num-dma-channels = <1>;
 		dma-base-address = <0x88000000>;
 		status = "okay";
+	};
+
+	rose_imu_accel: rose-imu-accel {
+		compatible = "ucbbar,rose-imu";
+		rose = <&rose0>;
+		rose-cmd = <0x12>;      /* IMU packet: 6 words [ax,ay,az, gx,gy,gz] */
+		rose-channel = <2>;     /* reqrsp1 */
+		status = "okay";
+	};
+	rose_imu_gyro: rose-imu-gyro {
+		compatible = "ucbbar,rose-imu";
+		rose = <&rose0>;
+		rose-cmd = <0x12>;      /* same packet carries accel+gyro */
+		rose-channel = <2>;
+		is-gyro;
+		status = "okay";
+	};
+	rose_flow: rose-flow {
+		compatible = "ucbbar,rose-flow";
+		rose = <&rose0>;
+		rose-cmd = <0x13>;      /* flow packet: 2 words [vx,vy] */
+		rose-channel = <1>;     /* reqrsp0 */
+		status = "okay";
+	};
+	rose_tof: rose-tof {
+		compatible = "ucbbar,rose-tof";
+		rose = <&rose0>;
+		rose-cmd = <0x14>;      /* tof packet: 1 word [height], low-rate */
+		rose-channel = <1>;
+		decimation = <6>;       /* 200 Hz / 6 ~= 33 Hz ToF */
+		status = "okay";
+	};
+
+	aliases {
+		bmi088-accel = &rose_imu_accel;
+		bmi088-gyro  = &rose_imu_gyro;
+		flow         = &rose_flow;
+		tof          = &rose_tof;
 	};
 };
