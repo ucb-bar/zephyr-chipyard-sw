@@ -140,7 +140,7 @@ class EkfEstimator : public IStateEstimator {
 public:
 	void init(float x0, float y0, float z0) override;
 	void update(const float accel[3], const float gyro[3], const float flow[2],
-		    float height, bool tof_valid, float dt) override;
+		    bool flow_valid, float height, bool tof_valid, float dt) override;
 	void get_state(float state[EST_NSTATES]) const override;
 	const char *name() const override { return "EKF (Mahony + per-axis Kalman)"; }
 

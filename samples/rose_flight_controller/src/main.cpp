@@ -207,6 +207,7 @@ int main(void)
 			accel[i] = (float)sensor_value_to_double(&av[i]);
 			gyro[i]  = (float)sensor_value_to_double(&gv[i]);
 		}
+		bool flow_valid = true;
 #if HAVE_FLOW
 		{
 			struct sensor_value vx, vy;
@@ -214,6 +215,14 @@ int main(void)
 			sensor_channel_get(flow_dev, (enum sensor_channel)ROSE_SENSOR_CHAN_FLOW_VY, &vy);
 			flow[0] = (float)sensor_value_to_double(&vx);
 			flow[1] = (float)sensor_value_to_double(&vy);
+			/* A NaN in the flow packet is the dropout sentinel (no fresh optical-flow sample):
+			 * the estimator runs velocity predict-only this step. (x != x is true only for NaN,
+			 * so no <math.h> dependency.) On a real Flow deck the driver would set this from the
+			 * sensor's motion/quality status instead. */
+			if (flow[0] != flow[0] || flow[1] != flow[1]) {
+				flow_valid = false;
+				flow[0] = flow[1] = 0.0f;   /* keep a finite value out of the estimator */
+			}
 		}
 #endif
 #if HAVE_TOF
@@ -224,7 +233,7 @@ int main(void)
 		}
 #endif
 
-		est.update(accel, gyro, flow, height, tof_valid, CTRL_DT);
+		est.update(accel, gyro, flow, flow_valid, height, tof_valid, CTRL_DT);
 		est.get_state(state);
 		for (int i = 0; i < NSTATES; i++) {
 			err[i] = state[i] - setpoint[i];
