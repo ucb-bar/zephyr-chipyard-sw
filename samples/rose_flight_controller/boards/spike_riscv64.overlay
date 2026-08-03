@@ -21,14 +21,14 @@
 	rose_imu_accel: rose-imu-accel {
 		compatible = "ucbbar,rose-imu";
 		rose = <&rose0>;
-		rose-cmd = <0x12>;      /* IMU packet: 6 words [ax,ay,az, gx,gy,gz] */
+		rose-cmd = <0x12>;      /* accelerometer packet: 3 words [ax,ay,az] */
 		rose-channel = <2>;     /* reqrsp1 */
 		status = "okay";
 	};
 	rose_imu_gyro: rose-imu-gyro {
 		compatible = "ucbbar,rose-imu";
 		rose = <&rose0>;
-		rose-cmd = <0x12>;      /* same packet carries accel+gyro */
+		rose-cmd = <0x15>;      /* gyroscope packet: 3 words [gx,gy,gz] (separate device) */
 		rose-channel = <2>;
 		is-gyro;
 		status = "okay";
