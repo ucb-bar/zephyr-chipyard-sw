@@ -119,8 +119,11 @@ static void mpc_init(void)
 
 static float read_dist(const struct device *dev)
 {
+	/* CENTER (perpendicular) zone, not MIN: for position-relative-to-a-wall the bore zone is
+	 * the distance to the FACING wall, whereas MIN catches the side-wall corner in a narrow
+	 * corridor (which made the longitudinal estimate lag / the waypoint overshoot). */
 	struct sensor_value v;
-	if (sensor_channel_get(dev, SENSOR_CHAN_DISTANCE, &v) < 0) {
+	if (sensor_channel_get(dev, (enum sensor_channel)ROSE_SENSOR_CHAN_TOF_ZONE_CENTER, &v) < 0) {
 		return TOF_MAX_RANGE;
 	}
 	return (float)sensor_value_to_double(&v);
