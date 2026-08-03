@@ -68,6 +68,24 @@ Then, from the RoSE repo root (uses the in-tree Zephyr toolchain):
    soc/sim/build_zephyr_rose.sh rose_flight_controller
    # -> soc/sim/zephyr_rose_builds/rose_flight_controller/zephyr/zephyr.elf
 
+Control rate (important)
+************************
+
+The controller runs at **200 Hz**, not 50 Hz. With the sensor-based estimator in the loop,
+50 Hz is too slow for the Crazyflie's fast attitude dynamics (the estimator's latency
+erodes the phase margin and the attitude loop rings, then diverges). The TinyMPC LQR gain
+is rate-tolerant, so running the 50 Hz-designed policy at 200 Hz simply tightens the loop
+and yields a stable >10 s hover. The estimator+solve costs ~0.69 M cycles/step, so 200 Hz
+uses ~14% of a 5 M-cycle budget at 1 GHz (headroom to ~1.4 kHz). Set in the configs:
+
+* ``config_gym_IsaacCrazyflieSensorEnv-v0.yaml``: ``gym_timestep: 0.005``, ``ctrl_freq: 200``
+* ``config_deploy_gym.yaml``: ``firesim_freq: 1_000_000_000``, ``firesim_step: 5_000_000``
+  (5M / 1e9 = 0.005 s = 200 Hz, one control per env step)
+* the guest's ``CTRL_DT`` must match (0.005 s)
+
+Result: stable hover for >10 s -- altitude z in [1.015, 1.023] m, horizontal drift < 0.1 mm
+(velocity held ~0 by optical flow; x/y position dead-reckoned, drifts sub-mm).
+
 Run (Spike, closed loop)
 ************************
 
