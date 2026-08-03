@@ -1,0 +1,64 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * REAL-hardware overlay for the shared flight controller on the ESP32C6 "riskybird" PCB.
+ * The SAME application binds its sensors through the standard aliases (bmi088-accel/-gyro,
+ * tof) -- here they resolve to the real bosch,bmi08x-* and st,vl53l1x drivers over I2C,
+ * instead of the RoSE virtual drivers used on spike_riscv64. Pin map mirrors the
+ * riskybird bmi088_test / sensor_bringup samples.
+ *
+ * Gaps for full real flight (out of scope here, see docs/ROSE_SENSOR_ABSTRACTION.md):
+ *   - optical flow: needs a PMW3901 driver (not vendored in this Zephyr fork), so no
+ *     `flow` alias -> the app compiles with flow disabled (HAVE_FLOW guard).
+ *   - motors: actuator parity is future work; with no `motors` alias the app's output is
+ *     a no-op stub. Add a PWM `motors` node here to drive real ESC/motors.
+ */
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO15>, <I2C0_SCL_GPIO14>;
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	/* BMI088 6-axis IMU (accel @0x18, gyro @0x68) */
+	bmi088_accel: bmi08x@18 {
+		compatible = "bosch,bmi08x-accel";
+		reg = <0x18>;
+		accel-hz = "800";
+		accel-fs = <6>;
+		status = "okay";
+	};
+	bmi088_gyro: bmi08x@68 {
+		compatible = "bosch,bmi08x-gyro";
+		reg = <0x68>;
+		gyro-hz = "1000_116";
+		gyro-fs = <1000>;
+		status = "okay";
+	};
+
+	/* VL53L1X downward Time-of-Flight rangefinder */
+	vl53l1x: vl53l1x@29 {
+		compatible = "st,vl53l1x";
+		reg = <0x29>;
+		status = "okay";
+	};
+};
+
+/ {
+	aliases {
+		bmi088-accel = &bmi088_accel;
+		bmi088-gyro  = &bmi088_gyro;
+		tof          = &vl53l1x;
+	};
+};
