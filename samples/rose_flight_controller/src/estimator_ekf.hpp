@@ -84,12 +84,24 @@ struct Kf3 {
 		P00 = np00; P01 = np01; P02 = np02; P11 = np11; P12 = np12; P22 = np22;
 	}
 
-	/* Correct with a position measurement (H = [1,0,0], variance r). */
-	void update_pos(float meas, float r)
+	/* Normalized innovation squared for a scalar measurement -> chi-square outlier gate. A
+	 * measurement is rejected (predict-only this step, covariance keeps growing) when
+	 * resid^2 / S exceeds `gate` (gate <= 0 disables). Rejects flow/ToF spikes that would
+	 * otherwise corrupt velocity/altitude (stress plan section 4, item 3). */
+	static bool gated(float resid, float S, float gate)
+	{
+		return gate > 0.0f && resid * resid > gate * S;
+	}
+
+	/* Correct with a position measurement (H = [1,0,0], variance r); chi-square gated. */
+	bool update_pos(float meas, float r, float gate)
 	{
 		float S = P00 + r;
-		float K0 = P00 / S, K1 = P01 / S, K2 = P02 / S;
 		float resid = meas - p;
+		if (gated(resid, S, gate)) {
+			return false;
+		}
+		float K0 = P00 / S, K1 = P01 / S, K2 = P02 / S;
 		p += K0 * resid; v += K1 * resid; ba += K2 * resid;
 		/* P = (I - K H) P, H picks row 0 -> subtract K * [P00,P01,P02] */
 		float np00 = P00 - K0 * P00;
@@ -99,14 +111,18 @@ struct Kf3 {
 		float np12 = P12 - K1 * P02;
 		float np22 = P22 - K2 * P02;
 		P00 = np00; P01 = np01; P02 = np02; P11 = np11; P12 = np12; P22 = np22;
+		return true;
 	}
 
-	/* Correct with a velocity measurement (H = [0,1,0], variance r). */
-	void update_vel(float meas, float r)
+	/* Correct with a velocity measurement (H = [0,1,0], variance r); chi-square gated. */
+	bool update_vel(float meas, float r, float gate)
 	{
 		float S = P11 + r;
-		float K0 = P01 / S, K1 = P11 / S, K2 = P12 / S;
 		float resid = meas - v;
+		if (gated(resid, S, gate)) {
+			return false;
+		}
+		float K0 = P01 / S, K1 = P11 / S, K2 = P12 / S;
 		p += K0 * resid; v += K1 * resid; ba += K2 * resid;
 		/* P = (I - K H) P, H picks row 1 -> subtract K * [P01,P11,P12] */
 		float np00 = P00 - K0 * P01;
@@ -116,6 +132,7 @@ struct Kf3 {
 		float np12 = P12 - K1 * P12;
 		float np22 = P22 - K2 * P12;
 		P00 = np00; P01 = np01; P02 = np02; P11 = np11; P12 = np12; P22 = np22;
+		return true;
 	}
 };
 
@@ -135,6 +152,8 @@ private:
 	float dt_last;
 	float r_flow;          /* optical-flow velocity measurement variance */
 	float r_tof;           /* ToF height measurement variance */
+	float flow_gate;       /* chi-square gate (NIS) for flow velocity updates */
+	float tof_gate;        /* chi-square gate (NIS) for ToF position updates */
 	float delay_steps;     /* known actuation delay, in control steps (model-based
 	                        * delay compensation; NOT a tuned per-channel gain) */
 };
