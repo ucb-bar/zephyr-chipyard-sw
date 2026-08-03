@@ -30,6 +30,10 @@ include(${TINYMPC}/external/matlib/matlib_header.cmake)
 # Kalman vz for control). The EKF is the robustness target (Q/R for noise) but its vz needs
 # a direct velocity measurement to match; both use model-based delay compensation.
 set(ROSE_USE_EKF 0 CACHE STRING "1=EKF, 0=complementary filter")
+# Architecture knobs: ROSE_THREADED (1=modular threaded blocks, 0=single loop) and
+# ROSE_CTRL_DIV (control runs every Nth estimator tick -> control rate = estimation / N).
+set(ROSE_THREADED 0 CACHE STRING "1=threaded blocks, 0=single loop (default; see main.cpp note)")
+set(ROSE_CTRL_DIV 1 CACHE STRING "control every Nth estimator tick (multi-rate)")
 
 target_sources(app PRIVATE
   src/main.cpp
@@ -38,7 +42,8 @@ target_sources(app PRIVATE
   src/estimator_factory.cpp
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
-target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF})
+target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
+  ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include
