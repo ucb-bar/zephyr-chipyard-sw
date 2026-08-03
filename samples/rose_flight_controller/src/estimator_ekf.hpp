@@ -89,8 +89,12 @@ private:
 	MahonyAttitude att;
 	Kf2 kx, ky, kz;
 	float gx, gy, gz;
-	float r_flow;   /* optical-flow velocity measurement variance */
-	float r_tof;    /* ToF height measurement variance */
+	float awx, awy, awz;   /* last world-frame acceleration (for delay prediction) */
+	float dt_last;
+	float r_flow;          /* optical-flow velocity measurement variance */
+	float r_tof;           /* ToF height measurement variance */
+	float delay_steps;     /* known actuation delay, in control steps (model-based
+	                        * delay compensation; NOT a tuned per-channel gain) */
 };
 
 #endif /* ROSE_ESTIMATOR_EKF_HPP */

@@ -15,8 +15,10 @@ void EkfEstimator::init(float x0, float y0, float z0)
 	ky.init(y0, 2.0f);
 	kz.init(z0, 2.0f);
 	gx = gy = gz = 0.0f;
-	r_flow = 4e-4f;   /* trust optical flow strongly for velocity (~0.02 m/s std) */
-	r_tof  = 1e-4f;   /* trust ToF height strongly (~0.01 m std) */
+	awx = awy = awz = 0.0f; dt_last = 0.0f;
+	r_flow = 4e-4f;      /* trust optical flow strongly for velocity (~0.02 m/s std) */
+	r_tof  = 1e-4f;      /* trust ToF height strongly (~0.01 m std) */
+	delay_steps = 1.0f;  /* control acts 1 step later -> predict 1 step ahead */
 }
 
 void EkfEstimator::update(const float accel[3], const float gyro[3],
@@ -30,6 +32,7 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 	float ax_w = R[0]*accel[0] + R[1]*accel[1] + R[2]*accel[2];
 	float ay_w = R[3]*accel[0] + R[4]*accel[1] + R[5]*accel[2];
 	float az_w = R[6]*accel[0] + R[7]*accel[1] + R[8]*accel[2] - GRAVITY;
+	awx = ax_w; awy = ay_w; awz = az_w; dt_last = dt;
 
 	/* predict */
 	kx.predict(ax_w, dt);
@@ -48,15 +51,33 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 
 void EkfEstimator::get_state(float state[EST_NSTATES]) const
 {
-	float r[3]; att.rodrigues(r);
-	/* world-frame angular velocity (R * body-rate) to match the ground-truth env /
-	 * TinyMPC convention (the loop is stable with world rates). */
+	/* Model-based delay compensation: the control acts delay_steps later, so report the
+	 * state predicted that far ahead using the estimator's own model (kinematics + last
+	 * acceleration / body rate). One knob = the known delay; not per-channel tuning. */
+	float h = delay_steps * dt_last;
+
+	/* attitude: integrate the quaternion forward by the body rate over h */
+	float pw = att.qw, px = att.qx, py = att.qy, pz = att.qz;
+	float dpw = -0.5f*(px*gx + py*gy + pz*gz);
+	float dpx =  0.5f*(pw*gx + py*gz - pz*gy);
+	float dpy =  0.5f*(pw*gy - px*gz + pz*gx);
+	float dpz =  0.5f*(pw*gz + px*gy - py*gx);
+	pw += dpw*h; px += dpx*h; py += dpy*h; pz += dpz*h;
+	float qn = sqrtf(pw*pw + px*px + py*py + pz*pz);
+	if (qn > 1e-9f) { pw/=qn; px/=qn; py/=qn; pz/=qn; }
+	float qwv = (fabsf(pw) < 1e-9f) ? (pw >= 0.0f ? 1e-9f : -1e-9f) : pw;
+
+	/* world-frame angular velocity (R * body-rate), matching the ground-truth convention */
 	float R[9]; att.rot(R);
 	float wxw = R[0]*gx + R[1]*gy + R[2]*gz;
 	float wyw = R[3]*gx + R[4]*gy + R[5]*gz;
 	float wzw = R[6]*gx + R[7]*gy + R[8]*gz;
-	state[0] = kx.p; state[1] = ky.p; state[2] = kz.p;
-	state[3] = r[0]; state[4] = r[1]; state[5] = r[2];
-	state[6] = kx.v; state[7] = ky.v; state[8] = kz.v;
+
+	/* translation: predict pos += vel*h + 0.5 a h^2, vel += a*h */
+	state[0] = kx.p + kx.v*h + 0.5f*awx*h*h;
+	state[1] = ky.p + ky.v*h + 0.5f*awy*h*h;
+	state[2] = kz.p + kz.v*h + 0.5f*awz*h*h;
+	state[3] = px/qwv; state[4] = py/qwv; state[5] = pz/qwv;
+	state[6] = kx.v + awx*h; state[7] = ky.v + awy*h; state[8] = kz.v + awz*h;
 	state[9] = wxw;  state[10] = wyw; state[11] = wzw;
 }

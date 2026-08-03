@@ -20,7 +20,12 @@ struct MahonyAttitude {
 	void init()
 	{
 		qw = 1.0f; qx = qy = qz = 0.0f;
-		kp = 1.0f;
+		/* Low gain: lean on the (drift-free short-term) gyro; the accelerometer only
+		 * slowly trims roll/pitch. A |accel|-magnitude gate can't reject small LATERAL
+		 * accelerations (|accel| stays ~g while its direction tilts), so a high gain
+		 * corrupts attitude during maneuvers -> horizontal instability. (Raise kp again
+		 * once gyro noise/bias is modeled, trading gyro drift vs accel corruption.) */
+		kp = 0.5f;
 	}
 
 	/* Advance the quaternion with body rate + gated gravity trim. */
