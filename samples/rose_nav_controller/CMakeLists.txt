@@ -22,6 +22,9 @@ include(${TINYMPC}/external/matlib/matlib_header.cmake)
 # EKF is required for wall fusion (fuse_walls is a no-op in the complementary filter).
 set(ROSE_USE_EKF 1 CACHE STRING "1=EKF (wall fusion), 0=complementary")
 
+# Navigation mode: 0 = waypoint (ramp an x position setpoint), 1 = velocity (constant cruise).
+set(NAV_MODE 0 CACHE STRING "0=waypoint position control, 1=velocity/cruise control")
+
 target_sources(app PRIVATE
   src/main.cpp
   ${FC}/src/estimator_complementary.cpp
@@ -29,7 +32,7 @@ target_sources(app PRIVATE
   ${FC}/src/estimator_factory.cpp
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
-target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF})
+target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF} NAV_MODE=${NAV_MODE})
 
 target_include_directories(app PRIVATE
   ${FC}/src

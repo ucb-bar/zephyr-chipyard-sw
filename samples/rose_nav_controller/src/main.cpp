@@ -44,6 +44,19 @@
 #define RAMP_ITERS    1000     /* 5 s: ramp x 0 -> WAYPOINT_X */
 #define WAYPOINT_X    1.0f      /* advance 1 m down the corridor */
 
+/* Navigation mode (compile-time; select with -DNAV_MODE via CMake, default waypoint):
+ *   0 = WAYPOINT: regulate an x POSITION setpoint that ramps 0 -> WAYPOINT_X and holds. The
+ *       forward velocity is emergent (the slope of the ramp); x position is servo'd.
+ *   1 = VELOCITY: command a constant forward CRUISE velocity. The x-position error is dropped
+ *       and vx is regulated to CRUISE_VX instead, so the drone holds a set speed regardless of
+ *       distance. Lateral y + altitude z stay position-held to corridor center (y via walls).
+ * Both keep the same estimator + TinyMPC; only the reference/error construction differs. */
+#ifndef NAV_MODE
+#define NAV_MODE 0
+#endif
+#define CRUISE_VX          0.4f   /* m/s forward cruise setpoint (NAV_MODE=1) */
+#define CRUISE_RAMP_ITERS  200    /* ramp vx 0 -> CRUISE_VX (~1 s) so the MPC stays in-constraint */
+
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
 static const struct device *gyro_dev  = DEVICE_DT_GET(DT_ALIAS(bmi088_gyro));
 #define HAVE_FLOW DT_NODE_EXISTS(DT_ALIAS(flow))
@@ -202,20 +215,39 @@ int main(void)
 		}
 		est.get_state(state);
 
-		/* Waypoint setpoint: hold corridor center (y=0), ramp x -> WAYPOINT_X after settle. */
+		/* Reference + error for the selected navigation mode. State layout:
+		 * [0..2] x,y,z pos | [3..5] att | [6..8] vx,vy,vz | [9..11] ang-rate. */
+		float setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
+		float logcmd;   /* the commanded quantity, for the status line */
+#if NAV_MODE == 1
+		/* VELOCITY (cruise): regulate forward velocity vx -> CRUISE_VX (ramped in over ~1 s so
+		 * the step doesn't violate the MPC's input constraints). x position is left FREE. */
+		float vx_cmd = 0.0f;
+		if (iter > SETTLE_ITERS) {
+			float f = (float)(iter - SETTLE_ITERS) / (float)CRUISE_RAMP_ITERS;
+			if (f > 1.0f) f = 1.0f;
+			vx_cmd = CRUISE_VX * f;
+		}
+		setpoint[6] = vx_cmd;                       /* target forward velocity */
+		for (int i = 0; i < NSTATES; i++) err[i] = state[i] - setpoint[i];
+		err[0] = 0.0f;                              /* do NOT regulate x position (cruise) */
+		if (!have_walls) err[1] = 0.0f;             /* no walls -> drop lateral position hold */
+		logcmd = vx_cmd;
+#else
+		/* WAYPOINT (position): hold corridor center (y=0), ramp x -> WAYPOINT_X after settle. */
 		float sx = 0.0f;
 		if (iter > SETTLE_ITERS) {
 			float f = (float)(iter - SETTLE_ITERS) / (float)RAMP_ITERS;
 			if (f > 1.0f) f = 1.0f;
 			sx = WAYPOINT_X * f;
 		}
-		const float setpoint[NSTATES] = {sx, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
-		for (int i = 0; i < NSTATES; i++) {
-			err[i] = state[i] - setpoint[i];
-		}
+		setpoint[0] = sx;
+		for (int i = 0; i < NSTATES; i++) err[i] = state[i] - setpoint[i];
 		/* x/y position error is KEPT (observable via the walls) -> waypoint tracking. Without
 		 * walls, fall back to velocity-only regulation (zero the position error) as before. */
 		if (!have_walls) { err[0] = 0.0f; err[1] = 0.0f; }
+		logcmd = sx;
+#endif
 
 		matsetv(work.x.vector[0], err, 1, NSTATES);
 		matset(work.y.data, 0.0, work.y.outer, work.y.inner);
@@ -225,11 +257,13 @@ int main(void)
 			u[i] = work.u.vector[0][i];
 		}
 		if ((iter % 20) == 0) {
-			printk("nav: iter=%d x=%d.%03d y=%d.%03d z=%d.%03d  sx=%d.%03d\n", iter,
+			printk("nav[%s]: iter=%d x=%d.%03d y=%d.%03d z=%d.%03d vx=%d.%03d  cmd=%d.%03d\n",
+			       (NAV_MODE == 1 ? "vel" : "wp"), iter,
 			       (int)state[0], (int)(state[0]*1000)%1000,
 			       (int)state[1], (int)(state[1]*1000)%1000,
 			       (int)state[2], (int)(state[2]*1000)%1000,
-			       (int)sx, (int)(sx*1000)%1000);
+			       (int)state[6], (int)(state[6]*1000)%1000,
+			       (int)logcmd, (int)(logcmd*1000)%1000);
 		}
 		send_control(u);
 	}
