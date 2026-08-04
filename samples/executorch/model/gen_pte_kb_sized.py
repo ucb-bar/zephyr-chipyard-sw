@@ -28,6 +28,19 @@ from modelblaster.pipeline.extract_graph import _load_kernelbench
 REPO = os.environ.get("MB_REPO", "/scratch2/dima/misc_sw/FreshScheduler/zephyr-chipyard-sw")
 L1 = f"{REPO}/modelblaster/bench/level1"
 
+# --bmm: route 2D/ND@2D matmul through torch.bmm so XNNPACK's BMMConfig delegates it to
+# the RVV GEMM instead of leaving it as the scalar portable aten::mm. Same math => same
+# golden. Patched around sizing + golden + export so all three see the identical graph.
+_orig_matmul = torch.matmul
+def _bmm_matmul(a, b):
+    if torch.is_tensor(a) and torch.is_tensor(b) and b.dim() == 2 and a.dim() >= 2:
+        M, K = a.shape[-2], a.shape[-1]; N = b.shape[-1]
+        batch = a.shape[:-2]; nb = 1
+        for d in batch: nb *= int(d)
+        out = torch.bmm(a.reshape(nb, M, K), b.unsqueeze(0).expand(nb, K, N).contiguous())
+        return out.reshape(*batch, M, N) if batch else out.reshape(M, N)
+    return _orig_matmul(a, b)
+
 
 def bench_path(b):
     """Accept a level1 stem, a filename, or an absolute path."""
@@ -52,10 +65,15 @@ def main():
                          "ceiling. Fixes large-K matmuls / 3D convs that have "
                          "tiny io but huge FLOPs.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--bmm", action="store_true",
+                    help="lower 2D/ND matmul -> torch.bmm so XNNPACK delegates it to "
+                         "RVV GEMM (else plain aten::mm stays scalar/undelegated)")
     a = ap.parse_args()
     tgt = a.target_mb * 2**20
     tflops = int(a.target_gflops * 1e9) if a.target_gflops > 0 else None
     os.makedirs(f"{a.out_dir}/pte", exist_ok=True)
+    if a.bmm:
+        torch.matmul = _bmm_matmul   # patched for the whole run (sizing+golden+export)
 
     rows = []
     for b in a.bench:
