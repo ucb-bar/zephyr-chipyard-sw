@@ -1,0 +1,33 @@
+# App-level west manifest for zephyr-chipyard-sw.
+#
+# Makes this repo a self-contained west workspace: it imports the ucb-bar/zephyr
+# fork's curated RISC-V module set (west-riscv.yml) and adds the RoSE bridge guest
+# module (ucb-bar/zephyr-rose) as a project, so the rose samples build with no
+# -DZEPHYR_EXTRA_MODULES injection.
+#
+# Bootstrap a workspace:
+#   west init -l .            # from this repo's root
+#   west update
+#   west build -b spike_riscv64 samples/rose_flight_controller
+manifest:
+  remotes:
+    - name: ucb-bar
+      url-base: https://github.com/ucb-bar
+
+  defaults:
+    remote: ucb-bar
+
+  projects:
+    # The Zephyr RTOS fork; import its RISC-V manifest to pull the curated module set.
+    - name: zephyr
+      repo-path: zephyr
+      revision: 4329bf61c4fe97dd11715faa138d0500694e6096
+      import: west-riscv.yml
+    # RoSE co-sim bridge guest module (split out of ucb-bar/RoSE:soc/sw/zephyr-rose).
+    - name: zephyr-rose
+      repo-path: zephyr-rose
+      revision: main
+      path: modules/lib/zephyr-rose
+
+  self:
+    path: zephyr-chipyard-sw
