@@ -114,6 +114,11 @@ main() {
   log "Installing west dependencies..."
   run_cmd "${CONDA_RUN} pip install west pyelftools rich"
 
+  # ESP32 flashing/console deps (esp32c6 riskybird bring-up: west flash / esptool over the
+  # USB Serial/JTAG, pyserial to read /dev/ttyACM*). See samples/riskybird/PROGRAMMING.md.
+  log "Installing ESP32 flash/console deps (esptool, pyserial)..."
+  run_cmd "${CONDA_RUN} pip install esptool pyserial"
+
   # Install toolchain build dependencies (meson and ninja)
   log "Installing toolchain build dependencies (meson, ninja)..."
   run_cmd "${CONDA_RUN} pip install meson ninja"
