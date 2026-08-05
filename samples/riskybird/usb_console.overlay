@@ -1,0 +1,24 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Route the Zephyr console + shell to the ESP32-C6 built-in USB Serial/JTAG
+ * (usb_serial) so boot/log output appears on the USB-C port (/dev/ttyACM*)
+ * instead of the default esp32c6_devkitc hpcore UART0 physical pins.
+ *
+ * Usage (any riskybird bring-up app), from the workspace (zephyr_ws):
+ *   west build -b esp32c6_devkitc/esp32c6/hpcore ../../samples/riskybird/<app> \
+ *     -- -DEXTRA_DTC_OVERLAY_FILE=$PWD/../../samples/riskybird/usb_console.overlay
+ *
+ * Or append these nodes to an app's boards/esp32c6_devkitc_hpcore.overlay.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
