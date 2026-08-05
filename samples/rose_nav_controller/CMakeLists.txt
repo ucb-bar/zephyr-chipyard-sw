@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.20.0)
+# Threaded build: splice the cooperative-transport + fine-tick overlay before Zephyr config.
+if(ROSE_THREADED)
+  set(EXTRA_CONF_FILE ${CMAKE_CURRENT_LIST_DIR}/threaded.conf)
+endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(rose_nav_controller)
 
@@ -40,6 +44,15 @@ if(DEFINED SETTLE_ITERS)
 endif()
 if(DEFINED CTRL_ITERS)
   target_compile_definitions(app PRIVATE CTRL_ITERS=${CTRL_ITERS})
+endif()
+if(DEFINED CTRL_HZ)
+  target_compile_definitions(app PRIVATE CTRL_HZ=${CTRL_HZ})
+endif()
+
+# Threaded producer/consumer build (-DROSE_THREADED=1): io/est/ctrl/vision/keepalive threads.
+set(ROSE_THREADED 0 CACHE STRING "1=threaded producer/consumer controller, 0=single loop")
+if(ROSE_THREADED)
+  target_compile_definitions(app PRIVATE ROSE_THREADED=1)
 endif()
 
 # DroNet vision navigation (-DROSE_DRONET_NAV=1). Compiles the generated quantized DroNet C
