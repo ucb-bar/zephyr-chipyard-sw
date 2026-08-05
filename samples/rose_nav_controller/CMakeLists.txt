@@ -34,6 +34,34 @@ target_sources(app PRIVATE
 
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF} NAV_MODE=${NAV_MODE})
 
+# Optional demo bounds (override the settle window / iteration count for a bounded co-sim run).
+if(DEFINED SETTLE_ITERS)
+  target_compile_definitions(app PRIVATE SETTLE_ITERS=${SETTLE_ITERS})
+endif()
+if(DEFINED CTRL_ITERS)
+  target_compile_definitions(app PRIVATE CTRL_ITERS=${CTRL_ITERS})
+endif()
+
+# DroNet vision navigation (-DROSE_DRONET_NAV=1). Compiles the generated quantized DroNet C
+# (pass -DMODEL_DIR=<ModelBlaster generated/<target> dir>, -DMB_POOL_INC=<modelblaster_pool>)
+# into the controller; a forward FPV frame -> DroNet -> setpoint (see src/main.cpp).
+set(ROSE_DRONET_NAV 0 CACHE STRING "1=drive the TinyMPC setpoint from DroNet vision")
+if(ROSE_DRONET_NAV)
+  if(NOT DEFINED MODEL_DIR)
+    message(FATAL_ERROR "ROSE_DRONET_NAV=1 needs -DMODEL_DIR=<generated DroNet C dir>")
+  endif()
+  get_filename_component(MODEL_DIR "${MODEL_DIR}" ABSOLUTE)
+  target_sources(app PRIVATE
+    ${MODEL_DIR}/model.c ${MODEL_DIR}/kernels.c ${MODEL_DIR}/weights.c ${MODEL_DIR}/buffers.c)
+  target_include_directories(app PRIVATE ${MODEL_DIR})
+  if(DEFINED MB_POOL_INC)
+    target_include_directories(app PRIVATE ${MB_POOL_INC})
+  endif()
+  target_compile_definitions(app PRIVATE ROSE_DRONET_NAV=1)
+  # DroNet conv weights overflow the gp-relative window — disable linker relaxation.
+  zephyr_link_libraries(-Wl,--no-relax)
+endif()
+
 target_include_directories(app PRIVATE
   ${FC}/src
   ${TINYMPC}/external/admm/include

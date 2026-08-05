@@ -12,7 +12,24 @@
 		interrupts = <3 1>;
 		num-reqrsp-channels = <2>;
 		num-dma-channels = <1>;
-		dma-base-address = <0x88000000>;
+		/* DMA landing zone ABOVE the 256 MB guest SRAM (0x80000000..0x90000000), matching
+		 * run_spike_rose_lockstep.sh --rose-dma-base (default 0x90000000). Used by the FPV
+		 * camera (large frames); a mid-SRAM base corrupts the kernel heap. */
+		dma-base-address = <0x90000000>;
+		status = "okay";
+	};
+
+	/* Forward FPV camera (HM01B0-ANA-00FT870, RGB) for DroNet vision nav (ROSE_DRONET_NAV=1).
+	 * Frame requested over the bridge (cmd 0x11) and delivered via DMA0. Real HW binds
+	 * himax,hm01b0 on DT_ALIAS(fpv) with no app change. */
+	rose_cam: rose-cam {
+		compatible = "ucbbar,rose-camera";
+		rose = <&rose0>;
+		rose-cmd = <0x11>;
+		dma-channel = <0>;
+		width = <320>;
+		height = <240>;
+		rgb;
 		status = "okay";
 	};
 
@@ -67,5 +84,6 @@
 		tof-right    = &rose_tof_right;
 		tof-back     = &rose_tof_back;
 		tof-left     = &rose_tof_left;
+		fpv          = &rose_cam;
 	};
 };
