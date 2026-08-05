@@ -1,0 +1,71 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Overlay for 3 motor PWMs on ESP32C6 (custom PCB).
+ * Motors on GPIOs 20, 21, 22 via LEDC channels 0, 1, 2.
+ * 20 kHz PWM (same as working single-motor setup).
+ */
+
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+/ {
+	aliases {
+		pwm-0 = &ledc0;
+		pwm-motor0 = &pwm_motor0;
+		pwm-motor1 = &pwm_motor1;
+		pwm-motor2 = &pwm_motor2;
+	};
+
+	pwmleds {
+		compatible = "pwm-leds";
+
+		pwm_motor0: pwm_motor_gpio20 {
+			label = "PWM Motor 0";
+			pwms = <&ledc0 0 20000 PWM_POLARITY_NORMAL>;
+		};
+
+		pwm_motor1: pwm_motor_gpio21 {
+			label = "PWM Motor 1";
+			pwms = <&ledc0 1 20000 PWM_POLARITY_NORMAL>;
+		};
+
+		pwm_motor2: pwm_motor_gpio22 {
+			label = "PWM Motor 2";
+			pwms = <&ledc0 2 20000 PWM_POLARITY_NORMAL>;
+		};
+	};
+};
+
+&pinctrl {
+	ledc0_default: ledc0_default {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO20>,
+				 <LEDC_CH1_GPIO21>,
+				 <LEDC_CH2_GPIO22>;
+			output-enable;
+		};
+	};
+};
+
+&ledc0 {
+	pinctrl-0 = <&ledc0_default>;
+	pinctrl-names = "default";
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel0@0 {
+		reg = <0x0>;
+		timer = <0>;
+	};
+
+	channel1@1 {
+		reg = <0x1>;
+		timer = <0>;
+	};
+
+	channel2@2 {
+		reg = <0x2>;
+		timer = <0>;
+	};
+};
