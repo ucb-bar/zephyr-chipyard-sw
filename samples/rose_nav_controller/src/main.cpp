@@ -28,19 +28,80 @@
 #include "estimator.hpp"
 #include <rose/rose_sensor.h>
 
+/* ---- DroNet vision navigation (compile-time; -DROSE_DRONET_NAV=1) ---------------------------
+ * A forward FPV camera frame is captured over the bridge, preprocessed (rose_preproc, the P1/P2
+ * pipeline), and run through the quantized DroNet on the SoC. Its (steer, collision) outputs
+ * drive the TinyMPC setpoint: collision -> forward speed (slow/stop near obstacles), steer ->
+ * yaw (turn away). DroNet runs at a low rate (every VISION_DIV control ticks) with the command
+ * zero-order-held between runs — the same multi-rate pattern as ROSE_CTRL_DIV. */
+#ifndef ROSE_DRONET_NAV
+#define ROSE_DRONET_NAV 0
+#endif
+#if ROSE_DRONET_NAV
+#include <zephyr/drivers/video.h>
+#include <zephyr/sys/crc.h>
+#include <rose/rose_preproc.h>
+extern "C" {
+#include "model.h"
+}
+/* DroNet output dequant scales (graph.json output tensors: linear1=steer, sigmoid1=collision). */
+#define DRONET_STEER_SCALE      0.0002903275954441761f
+#define DRONET_COLLISION_SCALE  0.003767134401741929f
+#define VISION_DIV        100      /* run DroNet every 100 control ticks (~2 Hz @ 200 Hz) */
+#define DRONET_CRUISE_VX  0.4f     /* max forward cruise (m/s), scaled by (1-collision) */
+#define DRONET_YAW_GAIN   1.0f     /* steer -> yaw-angle setpoint (rad per unit steer) */
+#define DRONET_CAM_NODE   DT_ALIAS(fpv)
+
+static uint8_t g_cam_frame[320 * 240 * 3];
+static int8_t  g_cam_tensor[ROSE_DRONET_INPUT_ELEMS];
+static int8_t  g_cam_out[MODEL_DRONET_OUTPUT_SIZE];
+static struct video_buffer g_cam_vbuf;
+
+struct vision_cmd { float steer; float collision; bool valid; };
+static struct vision_cmd g_vision = { 0.0f, 0.5f, false };   /* ZOH; start neutral */
+
+/* Capture one frame -> preproc -> DroNet -> update the (ZOH) vision command. */
+static void vision_step(const struct device *cam)
+{
+	struct video_buffer *out = NULL;
+	g_cam_vbuf.buffer = g_cam_frame;
+	g_cam_vbuf.size = sizeof(g_cam_frame);
+	g_cam_vbuf.type = VIDEO_BUF_TYPE_OUTPUT;
+	if (video_enqueue(cam, &g_cam_vbuf) != 0) {
+		return;
+	}
+	if (video_dequeue(cam, &out, K_FOREVER) != 0 || out == NULL) {
+		return;
+	}
+	struct video_format fmt = { .type = VIDEO_BUF_TYPE_OUTPUT };
+	video_get_format(cam, &fmt);
+	if (rose_preproc_rgb_to_dronet_i8(out->buffer, fmt.width, fmt.height, g_cam_tensor) != 0) {
+		return;
+	}
+	run_model_dronet(g_cam_tensor, g_cam_out, NULL);
+	g_vision.steer = (float)g_cam_out[0] * DRONET_STEER_SCALE;
+	g_vision.collision = (float)g_cam_out[1] * DRONET_COLLISION_SCALE;
+	g_vision.valid = true;
+}
+#endif /* ROSE_DRONET_NAV */
+
 #define NSTATES   12
 #define NACTIONS  4
 
 #define CTRL_DT      0.005f
 #define START_Z      0.9f
 #define TARGET_Z     1.0f
+#ifndef CTRL_ITERS
 #define CTRL_ITERS   6000
+#endif
 #define TOF_MAX_RANGE 4.0f
 
 /* Waypoint schedule (local maneuver): settle a hover holding the corridor center, then ramp
  * the forward (x) setpoint to WAYPOINT_X and hold, while keeping the lateral setpoint at the
  * corridor center (y=0). Gentle ramp so TinyMPC stays within its constraints. */
+#ifndef SETTLE_ITERS
 #define SETTLE_ITERS  600      /* 3 s: acquire walls + steady hover at center */
+#endif
 #define RAMP_ITERS    1000     /* 5 s: ramp x 0 -> WAYPOINT_X */
 #define WAYPOINT_X    1.0f      /* advance 1 m down the corridor */
 
@@ -154,6 +215,17 @@ int main(void)
 	mpc_init();
 	est.init(0.0f, 0.0f, START_Z);
 
+#if ROSE_DRONET_NAV
+	const struct device *cam = DEVICE_DT_GET(DRONET_CAM_NODE);
+	if (!device_is_ready(cam)) {
+		printk("nav_controller: WARN DroNet camera not ready — vision disabled\n");
+		cam = NULL;
+	} else {
+		printk("nav_controller: DroNet vision nav ENABLED (model=%s in=%d out=%d, every %d ticks)\n",
+		       MODEL_DRONET_NAME, MODEL_DRONET_INPUT_SIZE, MODEL_DRONET_OUTPUT_SIZE, VISION_DIV);
+	}
+#endif
+
 	printk("nav_controller: estimator=%s + TinyMPC ready, walls=%d, waypoint x->%d.%02d m\n",
 	       est.name(), have_walls, (int)WAYPOINT_X, (int)(WAYPOINT_X * 100) % 100);
 
@@ -215,11 +287,30 @@ int main(void)
 		}
 		est.get_state(state);
 
+#if ROSE_DRONET_NAV
+		/* Low-rate vision: refresh the DroNet command (ZOH between refreshes). */
+		if (cam && (iter % VISION_DIV) == 0) {
+			vision_step(cam);
+		}
+#endif
+
 		/* Reference + error for the selected navigation mode. State layout:
 		 * [0..2] x,y,z pos | [3..5] att | [6..8] vx,vy,vz | [9..11] ang-rate. */
 		float setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
 		float logcmd;   /* the commanded quantity, for the status line */
-#if NAV_MODE == 1
+#if ROSE_DRONET_NAV
+		/* DroNet vision nav: collision -> forward speed (slow near obstacles), steer -> yaw
+		 * (turn away). Hover through the settle window, then let vision drive. */
+		float vx_cmd = (1.0f - g_vision.collision) * DRONET_CRUISE_VX;
+		if (vx_cmd < 0.0f) vx_cmd = 0.0f;
+		if (iter <= SETTLE_ITERS) vx_cmd = 0.0f;
+		setpoint[5] = g_vision.steer * DRONET_YAW_GAIN;   /* yaw angle from steer */
+		setpoint[6] = vx_cmd;                             /* forward velocity from collision */
+		for (int i = 0; i < NSTATES; i++) err[i] = state[i] - setpoint[i];
+		err[0] = 0.0f;                                    /* cruise: x position free */
+		if (!have_walls) err[1] = 0.0f;
+		logcmd = vx_cmd;
+#elif NAV_MODE == 1
 		/* VELOCITY (cruise): regulate forward velocity vx -> CRUISE_VX (ramped in over ~1 s so
 		 * the step doesn't violate the MPC's input constraints). x position is left FREE. */
 		float vx_cmd = 0.0f;
@@ -258,13 +349,21 @@ int main(void)
 		}
 		if ((iter % 20) == 0) {
 			printk("nav[%s]: iter=%d x=%d.%03d y=%d.%03d z=%d.%03d vx=%d.%03d  cmd=%d.%03d\n",
-			       (NAV_MODE == 1 ? "vel" : "wp"), iter,
+			       (ROSE_DRONET_NAV ? "dronet" : (NAV_MODE == 1 ? "vel" : "wp")), iter,
 			       (int)state[0], (int)(state[0]*1000)%1000,
 			       (int)state[1], (int)(state[1]*1000)%1000,
 			       (int)state[2], (int)(state[2]*1000)%1000,
 			       (int)state[6], (int)(state[6]*1000)%1000,
 			       (int)logcmd, (int)(logcmd*1000)%1000);
 		}
+#if ROSE_DRONET_NAV
+		if ((iter % 20) == 0) {
+			printk("  dronet: steer_m=%d coll_m=%d -> vx_m=%d yaw_m=%d out_i8=[%d,%d] valid=%d\n",
+			       (int)(g_vision.steer * 1000), (int)(g_vision.collision * 1000),
+			       (int)(vx_cmd * 1000), (int)(setpoint[5] * 1000),
+			       g_cam_out[0], g_cam_out[1], g_vision.valid);
+		}
+#endif
 		send_control(u);
 	}
 	printk("nav_controller: done (%d iters)\n", CTRL_ITERS);
