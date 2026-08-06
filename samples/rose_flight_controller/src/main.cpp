@@ -380,10 +380,11 @@ static bool read_sensor_frame(struct sensor_frame *f)
 }
 
 /* Control block: run the active controller (TinyMPC or PID) from a 12-DoF state -> 4 motor
- * thrusts. Setpoint/state error handling and the solve live behind IController now. */
-static void solve_control(const float *state, float *u)
+ * thrusts. Setpoint/state error handling and the solve live behind IController now. dt is the
+ * REAL measured loop period (s) -- pass the same value used for est.update so time bases match. */
+static void solve_control(const float *state, float *u, float dt)
 {
-	ctrl.compute(state, g_setpoint, u, CTRL_DT);
+	ctrl.compute(state, g_setpoint, u, dt);
 }
 
 #if ROSE_THREADED
@@ -486,7 +487,7 @@ static void ctrl_block(void *a, void *b, void *c)
 			for (int i = 0; i < NSTATES; i++) st[i] = g_state[i];
 			k_mutex_unlock(&mtx_state);
 
-			solve_control(st, u);
+			solve_control(st, u, CTRL_DT);   /* threaded path (experimental): nominal dt */
 
 			k_mutex_lock(&mtx_ctrl, K_FOREVER);
 			for (int i = 0; i < NACTIONS; i++) g_ctrl[i] = u[i];
@@ -548,14 +549,22 @@ int main(void)
 	       est.name(), ctrl.name(), HAVE_ROSE ? "RoSE co-sim" : "real target");
 	struct sensor_frame f;
 	float state[NSTATES], u[NACTIONS];
+	/* Use the REAL measured loop period, not the nominal CTRL_DT. On this soft-float target the
+	 * loop runs ~15 Hz (dt ~67 ms), not the 200 Hz the design assumes; feeding the fixed 5 ms made
+	 * the estimator integrate ~13x too slow, so real tilts barely registered. Measure dt each iter. */
+	int64_t t_prev = k_uptime_get();
 	for (int iter = 0; iter < CTRL_ITERS; iter++) {
 		if (!read_sensor_frame(&f)) {
 			printk("flight_controller: IMU fetch error\n");
 			continue;
 		}
-		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, CTRL_DT);
+		int64_t t_now = k_uptime_get();
+		float dt = (float)(t_now - t_prev) * 1e-3f;   /* real loop period (s) */
+		if (dt <= 0.0f || dt > 0.5f) dt = CTRL_DT;     /* first-iter / stall guard */
+		t_prev = t_now;
+		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, dt);
 		est.get_state(state);
-		solve_control(state, u);
+		solve_control(state, u, dt);
 		if ((iter % 10) == 0) {
 #if defined(ROSE_IMU_DEBUG) && ROSE_IMU_DEBUG
 			/* Body-frame IMU dump for the axis/sign tilt test (see IMU_REMAP note). */
@@ -564,8 +573,8 @@ int main(void)
 			       FP3(f.accel[0]), FP3(f.accel[1]), FP3(f.accel[2]),
 			       FP3(f.gyro[0]),  FP3(f.gyro[1]),  FP3(f.gyro[2]));
 #else
-			printk("flight_controller: iter=%d z_est=%s%d.%03d roll=%s%d.%03d pitch=%s%d.%03d "
-			       "h_meas=%s%d.%03d tof=%d u0=%s%d.%03d\n", iter,
+			printk("flight_controller: iter=%d dt=%dms z_est=%s%d.%03d roll=%s%d.%03d pitch=%s%d.%03d "
+			       "h_meas=%s%d.%03d tof=%d u0=%s%d.%03d\n", iter, (int)(dt * 1000.0f + 0.5f),
 			       FP3(state[2]), FP3(state[3]), FP3(state[4]),
 			       FP3(f.height), (int)f.tof_valid, FP3(u[0]));
 #endif
