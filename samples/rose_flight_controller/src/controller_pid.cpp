@@ -45,36 +45,44 @@ static const float J[3]               = {16e-6f, 16e-6f, 29e-6f}; /* diag inerti
 static const float l_arm              = 33e-3f;
 static const float k_drag             = 0.01f;
 
-/* --- force (Newtons) -> normalized motor duty [0,1], verbatim from the original firmware ---
- * NOTE: propConstant (F = k*w^2, k=2.0e-8) and the w->pwm linear fit (a,b) below are the OLD
- * riskybird calibration. They do NOT match Bitcraze's published curve for the stock 7x16 motor +
- * 47-17 prop (which this board uses): Bitcraze's 2015 fit is thrust[g] = 1.0942e-7*rpm^2
- * - 2.1059e-4*rpm + 0.15417 (45-35 prop; the 47-17 adds ~15% thrust, no full polynomial
- * published). Under the old constants hover (~8.75 g/motor) lands near 63% duty; the Bitcraze
- * data puts it near ~20%. Recalibrate against a bench thrust stand before removing the 10% cap. */
-static float speedFromForce(float desiredForce_N)
-{
-	const float propConstant = 2.0e-08f;
-	if (desiredForce_N <= 0.0f) {
-		return 0.0f;
-	}
-	return sqrtf(desiredForce_N / propConstant);
-}
-static int pwmCommandFromSpeed(float desiredSpeed_rad_per_sec)
-{
-	const float a = -100.849f;
-	const float b = 0.1261846f;
-	return (int)(a + b * desiredSpeed_rad_per_sec);
-}
+/* --- force (Newtons) -> normalized motor duty [0,1] ---------------------------------------------
+ * Replaces the old riskybird hand-measured chain (propConstant F=k*w^2 + a linear w->pwm fit,
+ * which had hover landing ~63% duty). We now use Bitcraze's PUBLISHED thrust stand data for the
+ * stock 7x16 coreless motor, which is the motor/prop this board uses:
+ *
+ *   thrust[g] = A*duty^2 + B*duty      (duty in [0,1]; A,B least-squares fit to their 2015
+ *                                       45-35 table, RMS 0.38 g, max 0.82 g over 0..94%)
+ *   https://www.bitcraze.io/documentation/repository/crazyflie-firmware/master/functional-areas/pwm-to-thrust/
+ *
+ * The 47-17 prop (what we spin) delivers ~15% more thrust than the 45-35 at the same drive
+ * (Bitcraze published only this relative figure, no full 47-17 polynomial), so we scale the
+ * curve by PROP_4717_GAIN. forceToVoltage() inverts thrust(duty) via the quadratic formula.
+ * Hover (~8 g/motor, before the mixer's 0.9/0.87 trims) now maps to ~14-18% duty, matching the
+ * Bitcraze data. Still recalibrate on a bench thrust stand before lifting the MOTOR_MAX_DUTY cap. */
+static const float THRUST_A        = 26.919633f;   /* g per duty^2 (45-35 fit) */
+static const float THRUST_B        = 35.754861f;   /* g per duty   (45-35 fit) */
+static const float PROP_4717_GAIN  = 1.15f;        /* 47-17 vs 45-35 thrust ratio */
+static const float GRAMS_PER_NEWTON = 101.9368f;   /* 1 / 9.80665e-3 */
+
 static float forceToVoltage(float forceNewtons)
 {
-	float cmd = pwmCommandFromSpeed(speedFromForce(forceNewtons)) / 255.0f;
-	if (cmd > 1.0f) {
-		cmd = 1.0f;
-	} else if (cmd < 0.0f) {
-		cmd = 0.0f;
+	if (forceNewtons <= 0.0f) {
+		return 0.0f;
 	}
-	return cmd;
+	/* desired per-motor thrust in grams, de-scaled to the base (45-35) curve */
+	float t = (forceNewtons * GRAMS_PER_NEWTON) / PROP_4717_GAIN;
+	/* solve THRUST_A*duty^2 + THRUST_B*duty - t = 0 for duty >= 0 */
+	float disc = THRUST_B * THRUST_B + 4.0f * THRUST_A * t;
+	if (disc < 0.0f) {
+		disc = 0.0f;
+	}
+	float duty = (-THRUST_B + sqrtf(disc)) / (2.0f * THRUST_A);
+	if (duty < 0.0f) {
+		duty = 0.0f;
+	} else if (duty > 1.0f) {
+		duty = 1.0f;
+	}
+	return duty;
 }
 
 void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
