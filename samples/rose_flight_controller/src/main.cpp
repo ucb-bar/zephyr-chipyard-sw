@@ -329,6 +329,43 @@ static uint32_t pf_est, pf_ctrl, pf_send, pf_iters; /* per-phase cycles + iterat
 #define PF_ACC(dst, t0)   do { (void)(t0); } while (0)
 #endif
 
+/* ---- Down-ToF decoupling (real HW) --------------------------------------------------------------
+ * The Zephyr st,vl53l1x driver is single-shot + BLOCKING: channel_get waits a full ranging budget
+ * (~66 ms measured) for a fresh sample, which stalled the whole control loop to ~15 Hz (profiling:
+ * 98.7% of the loop was this one call). The VL53L1X itself can range continuously up to 100 Hz with
+ * a non-blocking data-ready poll (ST AN5263), but this driver exposes neither continuous mode nor a
+ * timing-budget knob, and the INT/GPIO1 data-ready pin is not wired on riskybird -- so a non-blocking
+ * read would need driver surgery. Instead, run the blocking fetch on its OWN thread at the sensor's
+ * natural rate and let the control loop read the latest cached height non-blocking.
+ * (RoSE's virtual ToF does not block, so there the fetch stays inline; RoSE lockstep + extra threads
+ * is also the known-deadlock combo we avoid.) */
+#if HAVE_TOF && !HAVE_ROSE
+#define TOF_THREADED 1
+K_MUTEX_DEFINE(tof_mtx);
+static float g_tof_h = START_Z;
+static bool  g_tof_valid;
+K_THREAD_STACK_DEFINE(tof_stack, 4096);
+static struct k_thread tof_thread_data;
+static void tof_thread_fn(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	for (;;) {
+		if (sensor_sample_fetch(tof_dev) == 0) {   /* blocks ~1 ranging budget on this thread */
+			struct sensor_value h;
+			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
+			float hv = (float)sensor_value_to_double(&h);
+			k_mutex_lock(&tof_mtx, K_FOREVER);
+			g_tof_h = hv; g_tof_valid = true;
+			k_mutex_unlock(&tof_mtx);
+		} else {
+			k_msleep(5);   /* back off on error so a failing ToF can't spin the I2C bus */
+		}
+	}
+}
+#else
+#define TOF_THREADED 0
+#endif
+
 static bool read_sensor_frame(struct sensor_frame *f)
 {
 	uint32_t _pf = PF_NOW();
@@ -371,34 +408,41 @@ static bool read_sensor_frame(struct sensor_frame *f)
 #endif
 	f->height = START_Z;
 #if HAVE_TOF
-	/* The down-ranging ToF (VL53L1X) completes a measurement only every ~33-50 ms; fetching it
-	 * every control tick (100-200 Hz) outpaces the ranging budget and floods the shared I2C bus
-	 * with -13 (control-interface) errors. Poll at the sensor's own rate and hold the last valid
-	 * reading (zero-order hold) between updates -- the standard rangefinder pattern on a real
-	 * flight stack, and harmless for the RoSE virtual ToF. */
+#if TOF_THREADED
+	/* Real HW: read the latest cached height produced by the ToF thread (non-blocking). The
+	 * blocking VL53L1X fetch happens on that thread, so it never stalls the control loop. */
+	uint32_t _pt = PF_NOW();
+	k_mutex_lock(&tof_mtx, K_FOREVER);
+	f->tof_valid = g_tof_valid;
+	if (g_tof_valid) {
+		f->height = g_tof_h;
+	}
+	k_mutex_unlock(&tof_mtx);
+	PF_ACC(pf_tof, _pt);
+#if defined(ROSE_PROFILE) && ROSE_PROFILE
+	pf_tof_n++;
+#endif
+#else
+	/* RoSE (non-blocking virtual ToF): keep the inline rate-limited fetch + zero-order hold. */
 	static int64_t tof_next_ms = 0;
 	static float   tof_last_h  = START_Z;
 	static bool    tof_have    = false;
 	int64_t now_ms = k_uptime_get();
 	if (now_ms >= tof_next_ms) {
 		tof_next_ms = now_ms + TOF_FETCH_PERIOD_MS;
-		uint32_t _pt = PF_NOW();
 		if (sensor_sample_fetch(tof_dev) == 0) {
 			struct sensor_value h;
 			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
 			tof_last_h = (float)sensor_value_to_double(&h);
 			tof_have   = true;
 		}
-		PF_ACC(pf_tof, _pt);
-#if defined(ROSE_PROFILE) && ROSE_PROFILE
-		pf_tof_n++;
-#endif
 	}
 	f->tof_valid = tof_have;
 	if (tof_have) {
 		f->height = tof_last_h;
 	}
-#endif
+#endif /* TOF_THREADED */
+#endif /* HAVE_TOF */
 	return true;
 }
 
@@ -548,6 +592,16 @@ int main(void)
 		printk("flight_controller: vl53l1x_reinit rc=%d (%s)\n", rc,
 		       rc == 0 ? "down-ToF ranging" : "ToF init failed -- altitude unaided");
 	}
+#endif
+
+#if TOF_THREADED
+	/* Start the down-ToF fetcher AFTER vl53l1x_reinit so it never fetches an uninitialized device.
+	 * Priority below the main control loop (higher number) -- it mostly blocks on I2C anyway, and
+	 * the control loop must always preempt it. */
+	k_thread_create(&tof_thread_data, tof_stack, K_THREAD_STACK_SIZEOF(tof_stack),
+			tof_thread_fn, NULL, NULL, NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
+	k_thread_name_set(&tof_thread_data, "tof");
+	printk("flight_controller: down-ToF on dedicated thread (control loop reads cached height)\n");
 #endif
 
 #if ROSE_THREADED
