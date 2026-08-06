@@ -13,8 +13,9 @@
  *   - ToF: the st,vl53l1x driver needs the ST HAL module (hal_st, not installed here), so
  *     no `tof` alias -> the app compiles with ToF disabled (HAVE_TOF guard). Add hal_st +
  *     a vl53l1x@29 node + `tof` alias to enable it (see riskybird sensor_bringup).
- *   - motors: actuator parity is future work; with no `motors` alias the app's output is
- *     a no-op stub. Add a PWM `motors` node here to drive real ESC/motors.
+ *   - motors: 4 brushed motors on low-side SI2302 FETs, driven by LEDC PWM below
+ *     (`motors` alias). send_control() HARD-CAPS duty to MOTOR_MAX_DUTY (10%) for
+ *     early bench bring-up -- enough to observe response, NOT to fly. Raise for flight.
  */
 
 &pinctrl {
@@ -24,6 +25,16 @@
 			bias-pull-up;
 			drive-open-drain;
 			output-high;
+		};
+	};
+
+	/* Motor PWM (low-side SI2302 gates): M1=GPIO21/CH0 M2=GPIO20/CH1
+	 * M3=GPIO23/CH2 M4=GPIO22/CH3 (mirrors samples/riskybird/actuator_bringup). */
+	ledc0_default: ledc0_default {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO21>, <LEDC_CH1_GPIO20>,
+				 <LEDC_CH2_GPIO23>, <LEDC_CH3_GPIO22>;
+			output-enable;
 		};
 	};
 };
@@ -61,10 +72,35 @@
 	};
 };
 
+&ledc0 {
+	status = "okay";
+	pinctrl-0 = <&ledc0_default>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel0@0 { reg = <0x0>; timer = <0>; };
+	channel1@1 { reg = <0x1>; timer = <0>; };
+	channel2@2 { reg = <0x2>; timer = <0>; };
+	channel3@3 { reg = <0x3>; timer = <0>; };
+};
+
 / {
+	/* 4 motor PWM outputs for the flight controller's `motors` alias.
+	 * Index maps: u[0]->M1(GPIO21) u[1]->M2(GPIO20) u[2]->M3(GPIO23) u[3]->M4(GPIO22).
+	 * 20 kHz (50000 ns); app maps thrust->duty and HARD-CAPS it in send_control(). */
+	pwm_motors: pwm_motors {
+		compatible = "riskybird,pwm-motors";
+		pwms = <&ledc0 0 50000 0>,
+		       <&ledc0 1 50000 0>,
+		       <&ledc0 2 50000 0>,
+		       <&ledc0 3 50000 0>;
+	};
+
 	aliases {
 		bmi088-accel = &bmi088_accel;
 		bmi088-gyro  = &bmi088_gyro;
 		tof = &vl53l1x;
+		motors = &pwm_motors;
 	};
 };

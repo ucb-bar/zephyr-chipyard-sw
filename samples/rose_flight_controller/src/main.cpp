@@ -172,13 +172,39 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
 	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 2),
 	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 3),
 };
+/* SAFETY (early bench bring-up): hard ceiling on motor duty. The controller
+ * regulates to a hover setpoint, so its raw command ramps toward hover/takeoff
+ * thrust; this scales the full [0,1] duty into [0, MOTOR_MAX_DUTY] so the
+ * controller can respond and be observed, but CANNOT produce flight thrust.
+ * Raise deliberately only for actual flight testing. */
+#ifndef MOTOR_MAX_DUTY
+#define MOTOR_MAX_DUTY 0.10f
+#endif
 static void send_control(const float *u)
 {
+#if ROSE_ACTUATE_TIMEOUT_MS > 0
+	/* Bench safety: cut all motors ROSE_ACTUATE_TIMEOUT_MS after boot. The
+	 * controller/estimator keep running (still logging) — only the actuator stops. */
+	if (k_uptime_get() >= (int64_t)ROSE_ACTUATE_TIMEOUT_MS) {
+		static bool stopped;
+		for (int i = 0; i < NACTIONS; i++) {
+			pwm_set_pulse_dt(&motors[i], 0);
+		}
+		if (!stopped) {
+			printk("send_control: actuation timeout (%d ms) reached -- motors OFF\n",
+			       (int)ROSE_ACTUATE_TIMEOUT_MS);
+			stopped = true;
+		}
+		return;
+	}
+#endif
 	for (int i = 0; i < NACTIONS; i++) {
 		/* normalized thrust u in ~[-0.583, 0.417] -> [0,1] duty */
 		float duty = u[i] + 0.583f;
 		if (duty < 0.0f) duty = 0.0f;
 		if (duty > 1.0f) duty = 1.0f;
+		duty *= MOTOR_MAX_DUTY;                            /* scale [0,1] -> [0, cap] */
+		if (duty > MOTOR_MAX_DUTY) duty = MOTOR_MAX_DUTY;  /* absolute backstop */
 		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * duty));
 	}
 }
