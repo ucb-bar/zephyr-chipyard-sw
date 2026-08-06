@@ -160,6 +160,7 @@ static void send_control(const float *u)
 		rose_tx(rose, w);
 	}
 }
+static void motors_startup_pulse(void) { /* no motors on the RoSE target */ }
 #else /* real target: drive 4 PWM motors (thrust ~ duty). Actuator parity is future work. */
 #include <zephyr/drivers/pwm.h>
 #define MOTORS_NODE DT_ALIAS(motors)
@@ -206,8 +207,25 @@ static void send_control(const float *u)
 		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * duty));
 	}
 }
+/* Optional boot "go" signal: pulse all motors at the safety cap for ROSE_START_PULSE_MS, then
+ * stop. Used by the handheld IMU tilt test so the operator knows when the stream has started.
+ * Runs once in main() BEFORE the control loop, so it is independent of the actuation timeout. */
+static void motors_startup_pulse(void)
+{
+#if defined(ROSE_START_PULSE_MS) && ROSE_START_PULSE_MS > 0
+	for (int i = 0; i < NACTIONS; i++) {
+		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * MOTOR_MAX_DUTY));
+	}
+	k_msleep(ROSE_START_PULSE_MS);
+	for (int i = 0; i < NACTIONS; i++) {
+		pwm_set_pulse_dt(&motors[i], 0);
+	}
+	k_msleep(400);   /* settle gap so the pulse is distinct from the first tilt motion */
+#endif
+}
 #else
 static void send_control(const float *u) { (void)u; /* no actuator bound */ }
+static void motors_startup_pulse(void) { /* no motors bound */ }
 #endif
 #endif
 
@@ -271,13 +289,14 @@ struct sensor_frame {
  *     then resolves the in-plane part to a SWAP (proper rotation, det +1):
  *       body_x = +sensor_y ,  body_y = +sensor_x ,  body_z = -sensor_z
  *
- * VERIFY ON HARDWARE before flight (the in-plane part is figure-derived and easy to mis-read; Z is
- * solid). Hold the board and watch the per-iter accel/gyro prints:
- *   level at rest        -> accel ~ (0, 0, +9.81)
- *   tilt NOSE-UP         -> accel_x goes negative (gravity leaks onto -x); gyro_y transient
- *   tilt RIGHT-WING-DOWN -> accel_y goes negative;                          gyro_x transient
- *   yaw NOSE-LEFT (+y)   -> gyro_z positive
- * If a channel is wrong, fix the SRC index / SIGN below. RoSE's virtual IMU is already body-frame. */
+ * VERIFIED ON HARDWARE 2026-08-06 via the ROSE_IMU_DEBUG tilt test (all six channels correct;
+ * accel uses the +g-up / specific-force convention, so the axis tilted UP reads POSITIVE):
+ *   level at rest        -> accel ~ (0, 0, +9.6)                       [observed +9.6]
+ *   tilt NOSE-UP         -> accel_x positive; gyro_y transient NEGATIVE [ax +6.9, gy -0.85]
+ *   tilt RIGHT-WING-DOWN -> accel_y positive; gyro_x transient positive [ay +7.0, gx +0.88]
+ *   yaw NOSE-LEFT (+y)   -> gyro_z positive                            [gz +1.06]
+ * If the board is ever re-spun and a channel changes, fix the SRC index / SIGN below and re-run the
+ * tilt test. RoSE's virtual IMU is already body-frame (the HAVE_ROSE branch is identity). */
 #if HAVE_ROSE
 #define IMU_REMAP(dst, src) do { (dst)[0]=(src)[0]; (dst)[1]=(src)[1]; (dst)[2]=(src)[2]; } while (0)
 #else
@@ -492,6 +511,8 @@ int main(void)
 	}
 	ctrl.init();
 	est.init(0.0f, 0.0f, START_Z);
+
+	motors_startup_pulse();   /* optional boot "go" signal (ROSE_START_PULSE_MS); no-op if unset */
 
 #if DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
 	/* The st,vl53l1x driver defers the full ST boot (DataInit/StaticInit); nothing runs it unless
