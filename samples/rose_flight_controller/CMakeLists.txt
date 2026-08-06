@@ -41,6 +41,9 @@ set(ROSE_CTRL_DIV 1 CACHE STRING "control every Nth estimator tick (multi-rate)"
 # Bench safety: stop driving motors this many ms after boot (0 = never). Real-HW bench
 # bring-up builds with 10000 so the props auto-stop 10 s after reset. Keep 0 for flight.
 set(ROSE_ACTUATE_TIMEOUT_MS 0 CACHE STRING "stop motor actuation N ms after boot (0=never)")
+# Control-loop iteration count. Default 5000 suits the RoSE co-sim; on real HW the loop runs
+# ~1 kHz, so raise this for a longer bench run (e.g. 120000 ~= 2 min).
+set(CTRL_ITERS 5000 CACHE STRING "control-loop iteration count")
 
 target_sources(app PRIVATE
   src/main.cpp
@@ -55,7 +58,7 @@ target_sources(app PRIVATE
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_USE_PID=${ROSE_USE_PID}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
-  ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS})
+  ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include
