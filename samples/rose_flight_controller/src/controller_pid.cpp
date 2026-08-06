@@ -45,7 +45,13 @@ static const float J[3]               = {16e-6f, 16e-6f, 29e-6f}; /* diag inerti
 static const float l_arm              = 33e-3f;
 static const float k_drag             = 0.01f;
 
-/* --- force (Newtons) -> normalized motor duty [0,1], verbatim from the original firmware --- */
+/* --- force (Newtons) -> normalized motor duty [0,1], verbatim from the original firmware ---
+ * NOTE: propConstant (F = k*w^2, k=2.0e-8) and the w->pwm linear fit (a,b) below are the OLD
+ * riskybird calibration. They do NOT match Bitcraze's published curve for the stock 7x16 motor +
+ * 47-17 prop (which this board uses): Bitcraze's 2015 fit is thrust[g] = 1.0942e-7*rpm^2
+ * - 2.1059e-4*rpm + 0.15417 (45-35 prop; the 47-17 adds ~15% thrust, no full polynomial
+ * published). Under the old constants hover (~8.75 g/motor) lands near 63% duty; the Bitcraze
+ * data puts it near ~20%. Recalibrate against a bench thrust stand before removing the 10% cap. */
 static float speedFromForce(float desiredForce_N)
 {
 	const float propConstant = 2.0e-08f;
@@ -140,8 +146,10 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 		}
 	}
 
-	/* Per-motor force -> duty [0,1] (original firmware's motor permutation + trim factors; these
-	 * were tuned to the old frame's motor wiring and thrust match -- revisit for riskybird v3). */
+	/* Per-motor force -> duty [0,1]. The ctrl[] permutation + trim factors are the original
+	 * firmware's motor MAPPING, which carries over verbatim: riskybird v3 copies the old
+	 * schematic's motor wiring, so motor<->corner assignment is unchanged. (The absolute
+	 * force->duty scale in forceToVoltage below is a separate concern -- see note there.) */
 	float duty[4];
 	duty[0] = forceToVoltage(0.9f * ctrl[1]);
 	duty[1] = forceToVoltage(0.9f * ctrl[2]);
