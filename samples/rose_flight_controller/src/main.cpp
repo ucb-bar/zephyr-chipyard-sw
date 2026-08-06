@@ -679,10 +679,13 @@ int main(void)
 			       FP3(f.accel[0]), FP3(f.accel[1]), FP3(f.accel[2]),
 			       FP3(f.gyro[0]),  FP3(f.gyro[1]),  FP3(f.gyro[2]));
 #else
-			printk("flight_controller: iter=%d dt=%dms z_est=%s%d.%03d roll=%s%d.%03d pitch=%s%d.%03d "
-			       "h_meas=%s%d.%03d tof=%d u0=%s%d.%03d\n", iter, (int)(dt * 1000.0f + 0.5f),
-			       FP3(state[2]), FP3(state[3]), FP3(state[4]),
-			       FP3(f.height), (int)f.tof_valid, FP3(u[0]));
+			/* Attitude + ALL 4 motor commands, so the restoring differential is visible: a
+			 * pitch tilt should split the fore/aft motor pair, a roll tilt the left/right pair. */
+			printk("flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d "
+			       "z=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]\n",
+			       iter, (int)(dt * 1000.0f + 0.5f),
+			       FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
+			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]));
 #endif
 		}
 		/* send_control() is issued (and timed) above, before this telemetry print. */
