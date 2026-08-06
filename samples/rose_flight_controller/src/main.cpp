@@ -51,7 +51,11 @@
 #define CTRL_DT      0.005f
 #define START_Z      0.9f     /* gentle takeoff from near the setpoint */
 #define TARGET_Z     1.0f
-#define CTRL_ITERS   5000     /* bounded by max_sim_time / run time */
+/* Iteration count. Default 5000 suits the RoSE co-sim (~max_sim_time). On real HW the loop now
+ * runs ~1 kHz, so 5000 iters is only ~7 s -- override (-DCTRL_ITERS=...) for a longer bench run. */
+#ifndef CTRL_ITERS
+#define CTRL_ITERS   5000
+#endif
 
 /* Sign-correct fixed-point print of a float as "[-]int.frac(3)" without needing %f (portable to
  * builds with printf FP support off). Expands to the sign string + magnitude int + 3-digit frac. */
