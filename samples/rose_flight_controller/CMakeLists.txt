@@ -34,6 +34,9 @@ set(ROSE_USE_EKF 0 CACHE STRING "1=EKF, 0=complementary filter")
 # ROSE_CTRL_DIV (control runs every Nth estimator tick -> control rate = estimation / N).
 set(ROSE_THREADED 0 CACHE STRING "1=threaded blocks, 0=single loop (default; see main.cpp note)")
 set(ROSE_CTRL_DIV 1 CACHE STRING "control every Nth estimator tick (multi-rate)")
+# Bench safety: stop driving motors this many ms after boot (0 = never). Real-HW bench
+# bring-up builds with 10000 so the props auto-stop 10 s after reset. Keep 0 for flight.
+set(ROSE_ACTUATE_TIMEOUT_MS 0 CACHE STRING "stop motor actuation N ms after boot (0=never)")
 
 target_sources(app PRIVATE
   src/main.cpp
@@ -43,7 +46,8 @@ target_sources(app PRIVATE
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
-  ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV})
+  ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
+  ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include
