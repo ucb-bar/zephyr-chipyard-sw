@@ -18,6 +18,20 @@
  *     early bench bring-up -- enough to observe response, NOT to fly. Raise for flight.
  */
 
+/* Route console + shell to the ESP32-C6 built-in USB Serial/JTAG so boot/telemetry appears on the
+ * riskybird USB-C port (/dev/ttyACM*). The hpcore board defaults the console to UART0 physical pins
+ * which are not broken out here, so without this the flight-controller logs go nowhere reachable. */
+/ {
+	chosen {
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
+
 &pinctrl {
 	i2c0_default: i2c0_default {
 		group1 {
