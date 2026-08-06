@@ -1,0 +1,49 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * riskybird v3 motor PWM — low-side brushed FETs Q1-Q4 (SI2302), gate active-high.
+ *   M1 = /MOTOR1 = GPIO21 -> LEDC CH0
+ *   M2 = /MOTOR2 = GPIO20 -> LEDC CH1
+ *   M3 = /MOTOR3 = GPIO23 -> LEDC CH2
+ *   M4 = /MOTOR4 = GPIO22 -> LEDC CH3
+ *
+ * Each gate also connects to the FPGA (JB1) via a parallel 47R; a 10k pulldown
+ * holds the FET off until driven. All four channels share LEDC timer 0 (same freq).
+ */
+
+&pinctrl {
+	ledc0_default: ledc0_default {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO21>,
+				 <LEDC_CH1_GPIO20>,
+				 <LEDC_CH2_GPIO23>,
+				 <LEDC_CH3_GPIO22>;
+			output-enable;
+		};
+	};
+};
+
+&ledc0 {
+	status = "okay";
+	pinctrl-0 = <&ledc0_default>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel0@0 {
+		reg = <0x0>;
+		timer = <0>;
+	};
+	channel1@1 {
+		reg = <0x1>;
+		timer = <0>;
+	};
+	channel2@2 {
+		reg = <0x2>;
+		timer = <0>;
+	};
+	channel3@3 {
+		reg = <0x3>;
+		timer = <0>;
+	};
+};
