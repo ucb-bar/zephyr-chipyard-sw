@@ -50,15 +50,21 @@
 		status = "okay";
 	};
 
-	/* VL53L1X ToF: uncomment once the ST HAL module (hal_st) is installed.
-	 * vl53l1x: vl53l1x@29 { compatible = "st,vl53l1x"; reg = <0x29>; status = "okay"; };
-	 */
+	/* VL53L1X down-ToF @0x29 (power-on address; the 4x VL53L5CX that would collide at 0x29 are
+	 * not populated, so no readdress needed). Powered via the ADS7128 GPIO6 XSHUT by the
+	 * board_sensor_init() SYS_INIT hook (main.cpp) before this driver inits. hal_st is now
+	 * vendored (west workspace), so CONFIG_VL53L1X builds. */
+	vl53l1x: vl53l1x@29 {
+		compatible = "st,vl53l1x";
+		reg = <0x29>;
+		status = "okay";
+	};
 };
 
 / {
 	aliases {
 		bmi088-accel = &bmi088_accel;
 		bmi088-gyro  = &bmi088_gyro;
-		/* tof = &vl53l1x;  (enable with hal_st, see above) */
+		tof = &vl53l1x;
 	};
 };
