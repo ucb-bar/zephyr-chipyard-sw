@@ -55,6 +55,11 @@
 #define TARGET_Z     1.0f
 #define CTRL_ITERS   5000     /* bounded by max_sim_time / run time */
 
+/* Sign-correct fixed-point print of a float as "[-]int.frac(3)" without needing %f (portable to
+ * builds with printf FP support off). Expands to the sign string + magnitude int + 3-digit frac. */
+#include <math.h>
+#define FP3(x) ((x) < 0 ? "-" : ""), (int)fabsf(x), ((int)(fabsf(x) * 1000.0f)) % 1000
+
 /* ---- Sensor devices (Zephyr sensor API; bound per board overlay) ---- */
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
 static const struct device *gyro_dev  = DEVICE_DT_GET(DT_ALIAS(bmi088_gyro));
@@ -64,7 +69,82 @@ static const struct device *flow_dev = DEVICE_DT_GET(DT_ALIAS(flow));
 #endif
 #if HAVE_TOF
 static const struct device *tof_dev  = DEVICE_DT_GET(DT_ALIAS(tof));
+#define TOF_FETCH_PERIOD_MS 33   /* ~30 Hz: matches the VL53L1X ranging budget */
 #endif
+
+/* ---- Board sensor-init hook (HW-specific power/enable; no-op on RoSE) --------------------------
+ * On the riskybird ESP32 the on-board VL53L1X down-ToF is powered through the ADS7128 I/O
+ * expander's GPIO6 (XSHUT). The ADS7128 has no Zephyr gpio-controller driver, so raise the rail
+ * here via raw I2C BEFORE the vl53l1x sensor driver inits (SYS_INIT POST_KERNEL/80, ahead of the
+ * default sensor init at 90). This block is compiled ONLY when an st,vl53l1x node is present
+ * (the real board); on RoSE the ToF is a virtual ucbbar,rose-* device, so this is a no-op. */
+#if DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/init.h>
+#include <zephyr/drivers/sensor/vl53l1x.h>   /* vl53l1x_reinit(): run the deferred ST init */
+#define ADS7128_I2C_ADDR      0x17
+#define ADS7128_CMD_REG_WRITE 0x08
+#define ADS7128_CMD_REG_READ  0x10
+#define ADS7128_PIN_CFG       0x05
+#define ADS7128_GPIO_CFG      0x07
+#define ADS7128_GPO_DRIVE_CFG 0x09
+#define ADS7128_GPO_VALUE     0x0B
+#define VL53L1X_XSHUT_CH      6      /* ADS7128 GPIO6 = VL53L1X XSHUT (riskybird v3) */
+
+static int ads7128_rd(const struct device *bus, uint8_t reg, uint8_t *v)
+{
+	uint8_t tx[2] = { ADS7128_CMD_REG_READ, reg };
+	int rc = i2c_write(bus, tx, sizeof(tx), ADS7128_I2C_ADDR);
+	return rc ? rc : i2c_read(bus, v, 1, ADS7128_I2C_ADDR);
+}
+static int ads7128_wr(const struct device *bus, uint8_t reg, uint8_t v)
+{
+	uint8_t tx[3] = { ADS7128_CMD_REG_WRITE, reg, v };
+	return i2c_write(bus, tx, sizeof(tx), ADS7128_I2C_ADDR);
+}
+static int ads7128_set_bit(const struct device *bus, uint8_t reg, uint8_t ch)
+{
+	uint8_t v;
+	int rc = ads7128_rd(bus, reg, &v);
+	if (rc) return rc;
+	return ads7128_wr(bus, reg, (uint8_t)(v | (1U << ch)));
+}
+static int ads7128_clr_bit(const struct device *bus, uint8_t reg, uint8_t ch)
+{
+	uint8_t v;
+	int rc = ads7128_rd(bus, reg, &v);
+	if (rc) return rc;
+	return ads7128_wr(bus, reg, (uint8_t)(v & ~(1U << ch)));
+}
+
+/* Power the VL53L1X via the ADS7128 GPIO6 XSHUT rail. This runs on every boot, but a warm reset
+ * (ESP EN pin) does NOT power-cycle the ADS7128, so GPIO6 stays high and the VL53L1X keeps stale
+ * state from the previous boot (its address/ranging config), which then makes the ST DataInit fail
+ * and the sensor NAK at 0x29. So drive XSHUT LOW first (force the part into reset), then HIGH, to
+ * guarantee a clean boot regardless of prior state. */
+static int board_sensor_init(void)
+{
+	const struct device *bus = DEVICE_DT_GET(DT_BUS(DT_INST(0, st_vl53l1x)));
+	if (!device_is_ready(bus)) {
+		printk("board_sensor_init: I2C bus not ready — ToF stays unpowered\n");
+		return 0;   /* non-fatal: the app still runs on the IMU */
+	}
+	int rc = ads7128_set_bit(bus, ADS7128_PIN_CFG, VL53L1X_XSHUT_CH)        /* GPIO mode */
+	       | ads7128_set_bit(bus, ADS7128_GPIO_CFG, VL53L1X_XSHUT_CH)       /* output */
+	       | ads7128_set_bit(bus, ADS7128_GPO_DRIVE_CFG, VL53L1X_XSHUT_CH); /* push-pull */
+	rc |= ads7128_clr_bit(bus, ADS7128_GPO_VALUE, VL53L1X_XSHUT_CH);        /* XSHUT LOW (reset) */
+	k_msleep(5);
+	rc |= ads7128_set_bit(bus, ADS7128_GPO_VALUE, VL53L1X_XSHUT_CH);        /* XSHUT HIGH (boot) */
+	if (rc) {
+		printk("board_sensor_init: ADS7128 VL53L1X power-up failed (rc=%d) — ToF may be absent\n", rc);
+		return 0;   /* non-fatal */
+	}
+	k_msleep(10);   /* let the VL53L1X boot before the sensor driver (prio 90) talks to it */
+	printk("board_sensor_init: VL53L1X powered via ADS7128 GPIO%d\n", VL53L1X_XSHUT_CH);
+	return 0;
+}
+SYS_INIT(board_sensor_init, POST_KERNEL, 80);   /* before CONFIG_SENSOR_INIT_PRIORITY (90) */
+#endif /* st_vl53l1x present */
 
 /* ---- Actuator output: RoSE bridge (co-sim) vs PWM motors (real) ---- */
 #define HAVE_ROSE DT_HAS_COMPAT_STATUS_OKAY(ucbbar_roseadapter)
@@ -201,9 +281,6 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	sensor_sample_fetch(flow_dev);
 #endif
 	f->tof_valid = false;
-#if HAVE_TOF
-	f->tof_valid = (sensor_sample_fetch(tof_dev) == 0);
-#endif
 	if (rc_a < 0 || rc_g < 0) {
 		return false;
 	}
@@ -231,10 +308,27 @@ static bool read_sensor_frame(struct sensor_frame *f)
 #endif
 	f->height = START_Z;
 #if HAVE_TOF
-	if (f->tof_valid) {
-		struct sensor_value h;
-		sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
-		f->height = (float)sensor_value_to_double(&h);
+	/* The down-ranging ToF (VL53L1X) completes a measurement only every ~33-50 ms; fetching it
+	 * every control tick (100-200 Hz) outpaces the ranging budget and floods the shared I2C bus
+	 * with -13 (control-interface) errors. Poll at the sensor's own rate and hold the last valid
+	 * reading (zero-order hold) between updates -- the standard rangefinder pattern on a real
+	 * flight stack, and harmless for the RoSE virtual ToF. */
+	static int64_t tof_next_ms = 0;
+	static float   tof_last_h  = START_Z;
+	static bool    tof_have    = false;
+	int64_t now_ms = k_uptime_get();
+	if (now_ms >= tof_next_ms) {
+		tof_next_ms = now_ms + TOF_FETCH_PERIOD_MS;
+		if (sensor_sample_fetch(tof_dev) == 0) {
+			struct sensor_value h;
+			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
+			tof_last_h = (float)sensor_value_to_double(&h);
+			tof_have   = true;
+		}
+	}
+	f->tof_valid = tof_have;
+	if (tof_have) {
+		f->height = tof_last_h;
 	}
 #endif
 	return true;
@@ -364,8 +458,8 @@ static void ctrl_block(void *a, void *b, void *c)
 			k_mutex_unlock(&mtx_ctrl);
 
 			if ((tick % (10 * ROSE_CTRL_DIV)) == 0) {
-				printk("flight_controller: t=%u z=%d.%03d u0=%d.%03d\n", tick,
-				       (int)st[2], (int)(st[2]*1000)%1000, (int)u[0], (int)(u[0]*1000)%1000);
+				printk("flight_controller: t=%u z=%s%d.%03d u0=%s%d.%03d\n", tick,
+				       FP3(st[2]), FP3(u[0]));
 			}
 		}
 		/* Always signal IO -- on skip grants g_ctrl is held (sub-rate command). */
@@ -383,6 +477,18 @@ int main(void)
 	enable_vector_operations();
 	mpc_init();
 	est.init(0.0f, 0.0f, START_Z);
+
+#if DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
+	/* The st,vl53l1x driver defers the full ST boot (DataInit/StaticInit); nothing runs it unless
+	 * the app asks. Trigger it once here (XSHUT rail already raised by board_sensor_init) so the
+	 * down-ToF actually ranges -- without this every sample_fetch hits an uninitialized device and
+	 * floods "Failed to write". No-op on RoSE (virtual ToF is a different compat). */
+	{
+		int rc = vl53l1x_reinit(tof_dev);
+		printk("flight_controller: vl53l1x_reinit rc=%d (%s)\n", rc,
+		       rc == 0 ? "down-ToF ranging" : "ToF init failed -- altitude unaided");
+	}
+#endif
 
 #if ROSE_THREADED
 	printk("flight_controller: estimator=%s + TinyMPC (%s), THREADED blocks "
@@ -415,8 +521,10 @@ int main(void)
 		est.get_state(state);
 		solve_control(state, u);
 		if ((iter % 10) == 0) {
-			printk("flight_controller: iter=%d z_est=%d.%03d u0=%d.%03d\n", iter,
-			       (int)state[2], (int)(state[2]*1000)%1000, (int)u[0], (int)(u[0]*1000)%1000);
+			printk("flight_controller: iter=%d z_est=%s%d.%03d roll=%s%d.%03d pitch=%s%d.%03d "
+			       "h_meas=%s%d.%03d tof=%d u0=%s%d.%03d\n", iter,
+			       FP3(state[2]), FP3(state[3]), FP3(state[4]),
+			       FP3(f.height), (int)f.tof_valid, FP3(u[0]));
 		}
 		send_control(u);
 	}
