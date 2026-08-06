@@ -30,6 +30,10 @@ include(${TINYMPC}/external/matlib/matlib_header.cmake)
 # Kalman vz for control). The EKF is the robustness target (Q/R for noise) but its vz needs
 # a direct velocity measurement to match; both use model-based delay compensation.
 set(ROSE_USE_EKF 0 CACHE STRING "1=EKF, 0=complementary filter")
+# Controller selection (modular IController; both are compiled, factory picks):
+#   -DROSE_USE_PID=0 -> TinyMPC constrained MPC (default)
+#   -DROSE_USE_PID=1 -> hierarchical PID cascade (ported from the old riskybird FreeRTOS firmware)
+set(ROSE_USE_PID 0 CACHE STRING "1=hierarchical PID, 0=TinyMPC")
 # Architecture knobs: ROSE_THREADED (1=modular threaded blocks, 0=single loop) and
 # ROSE_CTRL_DIV (control runs every Nth estimator tick -> control rate = estimation / N).
 set(ROSE_THREADED 0 CACHE STRING "1=threaded blocks, 0=single loop (default; see main.cpp note)")
@@ -43,9 +47,13 @@ target_sources(app PRIVATE
   src/estimator_complementary.cpp
   src/estimator_ekf.cpp
   src/estimator_factory.cpp
+  src/controller_tinympc.cpp
+  src/controller_pid.cpp
+  src/controller_factory.cpp
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
+  ROSE_USE_PID=${ROSE_USE_PID}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS})
 

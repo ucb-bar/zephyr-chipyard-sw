@@ -10,8 +10,8 @@
  *                       RoSE bridge from the Isaac Sim virtual sensors);
  *   - on real hardware: aliases bind to the real bosch,bmi08x-* / st,vl53l1x / flow
  *                       drivers over I2C/SPI (ESP32C6 "riskybird" board).
- * Only the board overlay + prj.conf differ; main, the estimator (IStateEstimator), and
- * TinyMPC are byte-for-byte shared. See docs/ROSE_SENSOR_ABSTRACTION.md.
+ * Only the board overlay + prj.conf differ; main, the estimator (IStateEstimator), and the
+ * controller (IController) are byte-for-byte shared. See docs/ROSE_SENSOR_ABSTRACTION.md.
  *
  * The only target-specific code here is the actuator OUTPUT (a RoSE-bridge TX packet in
  * co-sim vs PWM motors on hardware) — actuator parity is future work; the sensor/estimator/
@@ -21,7 +21,8 @@
  *   1. sample_fetch/channel_get IMU (accel+gyro), optical flow, and (low-rate) ToF height
  *   2. estimator.update(...) -> 12-DoF state; ToF fused only on fresh samples (multi-rate)
  *   3. subtract the hover setpoint (regulate velocity, not the unobservable x/y position)
- *   4. TinyMPC -> 4 normalized motor thrusts -> actuator output
+ *   4. controller.compute(...) -> 4 normalized motor thrusts -> actuator output
+ *      (controller = TinyMPC by default, or hierarchical PID via -DROSE_USE_PID=1)
  */
 
 #include <zephyr/kernel.h>
@@ -29,11 +30,8 @@
 #include <zephyr/drivers/sensor.h>
 #include <string.h>
 
-#include "admm.hpp"
-#include "problem_data/quadrotor_50hz_params_constrained.hpp"
-#include "glob_opts.hpp"
-
 #include "estimator.hpp"
+#include "controller.hpp"
 
 #define NSTATES   12
 #define NACTIONS  4
@@ -213,55 +211,13 @@ static void send_control(const float *u) { (void)u; /* no actuator bound */ }
 #endif
 #endif
 
-/* TinyMPC (single drone) */
-static TinyCache     cache;
-static TinyWorkspace work;
-static TinySettings  settings;
-static TinySolver    solver;
-
 /* State estimator: build-time-selected pluggable filter (default complementary). */
 static IStateEstimator &est = active_estimator();
 
-static void mpc_init(void)
-{
-	solver.cache    = &cache;
-	solver.work     = &work;
-	solver.settings = &settings;
-	tiny_init(&solver);
-
-	init_VectorNx(&work.x1);
-	init_VectorNx(&work.x2);
-	init_VectorNx(&work.x3);
-	init_VectorNu(&work.u1);
-	init_VectorNu(&work.u2);
-
-	cache.rho = rho_value;
-	matsetv(cache.Kinf.data, Kinf_data, cache.Kinf.outer, cache.Kinf.inner);
-	transpose(cache.Kinf.data, cache.KinfT.data, NINPUTS, NSTATES);
-	matsetv(cache.Pinf.data, Pinf_data, cache.Pinf.outer, cache.Pinf.inner);
-	transpose(cache.Pinf.data, cache.PinfT.data, NSTATES, NSTATES);
-	matsetv(cache.Quu_inv.data, Quu_inv_data, cache.Quu_inv.outer, cache.Quu_inv.inner);
-	matsetv(cache.AmBKt.data, AmBKt_data, cache.AmBKt.outer, cache.AmBKt.inner);
-	transpose(cache.AmBKt.data, cache.AmBKtT.data, NSTATES, NSTATES);
-	matsetv(cache.coeff_d2p.data, coeff_d2p_data, cache.coeff_d2p.outer, cache.coeff_d2p.inner);
-
-	matsetv(work.Adyn.data, Adyn_data, work.Adyn.outer, work.Adyn.inner);
-	transpose(work.Adyn.data, work.AdynT.data, NSTATES, NSTATES);
-	matsetv(work.Bdyn.data, Bdyn_data, work.Bdyn.outer, work.Bdyn.inner);
-	transpose(work.Bdyn.data, work.BdynT.data, NSTATES, NINPUTS);
-	matsetv(work.Q.data, Q_data, work.Q.outer, work.Q.inner);
-	matsetv(work.R.data, R_data, work.R.outer, work.R.inner);
-
-	matset(work.u_min.data, -0.583, work.u_min.outer, work.u_min.inner);
-	matset(work.u_max.data, 1 - 0.583, work.u_max.outer, work.u_max.inner);
-	matset(work.x_min.data, -5, work.x_min.outer, work.x_min.inner);
-	matset(work.x_max.data, 5, work.x_max.outer, work.x_max.inner);
-
-	float Xref_origin[NSTATES] = {0};
-	for (int j = 0; j < NHORIZON; j++) {
-		matsetv(work.Xref.vector[j], Xref_origin, 1, NSTATES);
-	}
-}
+/* Controller: build-time-selected pluggable control law. Default is TinyMPC (constrained MPC);
+ * build -DROSE_USE_PID=1 for the hierarchical PID cascade. The solver/gain internals live in the
+ * controller_*.cpp behind IController, so main only talks to ctrl.init()/ctrl.compute(). */
+static IController &ctrl = active_controller();
 
 /* =====================================================================================
  * Modular task blocks. The controller is split into three cooperating blocks so IO can be
@@ -360,21 +316,11 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	return true;
 }
 
-/* Control block: TinyMPC solve from a 12-DoF state -> 4 motor thrusts. */
+/* Control block: run the active controller (TinyMPC or PID) from a 12-DoF state -> 4 motor
+ * thrusts. Setpoint/state error handling and the solve live behind IController now. */
 static void solve_control(const float *state, float *u)
 {
-	float err[NSTATES];
-	for (int i = 0; i < NSTATES; i++) {
-		err[i] = state[i] - g_setpoint[i];
-	}
-	err[0] = 0.0f; err[1] = 0.0f;   /* x/y position unobservable from flow -> regulate velocity */
-	matsetv(work.x.vector[0], err, 1, NSTATES);
-	matset(work.y.data, 0.0, work.y.outer, work.y.inner);
-	matset(work.g.data, 0.0, work.g.outer, work.g.inner);
-	tiny_solve(&solver);
-	for (int i = 0; i < NACTIONS; i++) {
-		u[i] = work.u.vector[0][i];
-	}
+	ctrl.compute(state, g_setpoint, u, CTRL_DT);
 }
 
 #if ROSE_THREADED
@@ -500,8 +446,7 @@ int main(void)
 		printk("flight_controller: FAIL (IMU not ready)\n");
 		return -1;
 	}
-	enable_vector_operations();
-	mpc_init();
+	ctrl.init();
 	est.init(0.0f, 0.0f, START_Z);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
@@ -517,9 +462,9 @@ int main(void)
 #endif
 
 #if ROSE_THREADED
-	printk("flight_controller: estimator=%s + TinyMPC (%s), THREADED blocks "
+	printk("flight_controller: estimator=%s + controller=%s (%s), THREADED blocks "
 	       "(estimate@grant, control every %d) \n",
-	       est.name(), HAVE_ROSE ? "RoSE co-sim" : "real target", ROSE_CTRL_DIV);
+	       est.name(), ctrl.name(), HAVE_ROSE ? "RoSE co-sim" : "real target", ROSE_CTRL_DIV);
 	/* Start the blocks after init so nothing runs against an uninitialized estimator/MPC. */
 	k_thread_create(&ctrl_t, ctrl_stack, K_THREAD_STACK_SIZEOF(ctrl_stack),
 			ctrl_block, NULL, NULL, NULL, PRIO_CTRL, 0, K_NO_WAIT);
@@ -534,8 +479,8 @@ int main(void)
 	printk("flight_controller: control loop done (%d iters)\n", CTRL_ITERS);
 	return 0;
 #else
-	printk("flight_controller: estimator=%s + TinyMPC ready (%s), single-loop\n",
-	       est.name(), HAVE_ROSE ? "RoSE co-sim" : "real target");
+	printk("flight_controller: estimator=%s + controller=%s ready (%s), single-loop\n",
+	       est.name(), ctrl.name(), HAVE_ROSE ? "RoSE co-sim" : "real target");
 	struct sensor_frame f;
 	float state[NSTATES], u[NACTIONS];
 	for (int iter = 0; iter < CTRL_ITERS; iter++) {
