@@ -315,17 +315,34 @@ struct sensor_frame {
 	} while (0)
 #endif
 
+/* ---- optional per-phase profiling (build -DROSE_PROFILE=1) -------------------------------------
+ * Accumulate cycle counts per sub-phase; main() prints avg microseconds periodically. Off by
+ * default (zero overhead) -- purely a bring-up instrument to see what dominates the loop period. */
+#if defined(ROSE_PROFILE) && ROSE_PROFILE
+static uint32_t pf_imu_fetch, pf_imu_get, pf_tof;   /* accumulated cycles in the current window */
+static uint32_t pf_tof_n;                           /* # of real ToF fetches in the window */
+static uint32_t pf_est, pf_ctrl, pf_send, pf_iters; /* per-phase cycles + iteration count */
+#define PF_NOW()          k_cycle_get_32()
+#define PF_ACC(dst, t0)   do { (dst) += k_cycle_get_32() - (t0); } while (0)
+#else
+#define PF_NOW()          0u
+#define PF_ACC(dst, t0)   do { (void)(t0); } while (0)
+#endif
+
 static bool read_sensor_frame(struct sensor_frame *f)
 {
+	uint32_t _pf = PF_NOW();
 	int rc_a = sensor_sample_fetch(accel_dev);
 	int rc_g = sensor_sample_fetch(gyro_dev);
 #if HAVE_FLOW
 	sensor_sample_fetch(flow_dev);
 #endif
+	PF_ACC(pf_imu_fetch, _pf);
 	f->tof_valid = false;
 	if (rc_a < 0 || rc_g < 0) {
 		return false;
 	}
+	_pf = PF_NOW();
 	struct sensor_value av[3], gv[3];
 	sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, av);
 	sensor_channel_get(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gv);
@@ -336,6 +353,7 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	}
 	IMU_REMAP(f->accel, araw);   /* sensor -> drone body frame (no-op on RoSE) */
 	IMU_REMAP(f->gyro,  graw);
+	PF_ACC(pf_imu_get, _pf);
 	f->flow[0] = f->flow[1] = 0.0f;
 	f->flow_valid = true;
 #if HAVE_FLOW
@@ -364,12 +382,17 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	int64_t now_ms = k_uptime_get();
 	if (now_ms >= tof_next_ms) {
 		tof_next_ms = now_ms + TOF_FETCH_PERIOD_MS;
+		uint32_t _pt = PF_NOW();
 		if (sensor_sample_fetch(tof_dev) == 0) {
 			struct sensor_value h;
 			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
 			tof_last_h = (float)sensor_value_to_double(&h);
 			tof_have   = true;
 		}
+		PF_ACC(pf_tof, _pt);
+#if defined(ROSE_PROFILE) && ROSE_PROFILE
+		pf_tof_n++;
+#endif
 	}
 	f->tof_valid = tof_have;
 	if (tof_have) {
@@ -562,9 +585,34 @@ int main(void)
 		float dt = (float)(t_now - t_prev) * 1e-3f;   /* real loop period (s) */
 		if (dt <= 0.0f || dt > 0.5f) dt = CTRL_DT;     /* first-iter / stall guard */
 		t_prev = t_now;
+		uint32_t _pe = PF_NOW();
 		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, dt);
 		est.get_state(state);
+		PF_ACC(pf_est, _pe);
+		uint32_t _pc = PF_NOW();
 		solve_control(state, u, dt);
+		PF_ACC(pf_ctrl, _pc);
+		uint32_t _ps = PF_NOW();
+		send_control(u);
+		PF_ACC(pf_send, _ps);
+#if defined(ROSE_PROFILE) && ROSE_PROFILE
+		if (++pf_iters >= 30) {
+			/* read_sensor_frame was already timed into pf_imu_fetch/get/tof (read total = their
+			 * sum). Print avg microseconds per phase over the window, then reset. */
+			uint32_t rd = pf_imu_fetch + pf_imu_get + pf_tof;
+			printk("PROFILE/%u: read=%uus [imu_fetch=%uus imu_get=%uus tof=%uus x%u] "
+			       "est=%uus ctrl=%uus send=%uus\n", pf_iters,
+			       k_cyc_to_us_floor32(rd / pf_iters),
+			       k_cyc_to_us_floor32(pf_imu_fetch / pf_iters),
+			       k_cyc_to_us_floor32(pf_imu_get / pf_iters),
+			       pf_tof_n ? k_cyc_to_us_floor32(pf_tof / pf_tof_n) : 0u, pf_tof_n,
+			       k_cyc_to_us_floor32(pf_est / pf_iters),
+			       k_cyc_to_us_floor32(pf_ctrl / pf_iters),
+			       k_cyc_to_us_floor32(pf_send / pf_iters));
+			pf_imu_fetch = pf_imu_get = pf_tof = pf_tof_n = 0;
+			pf_est = pf_ctrl = pf_send = pf_iters = 0;
+		}
+#endif
 		if ((iter % 10) == 0) {
 #if defined(ROSE_IMU_DEBUG) && ROSE_IMU_DEBUG
 			/* Body-frame IMU dump for the axis/sign tilt test (see IMU_REMAP note). */
@@ -579,7 +627,7 @@ int main(void)
 			       FP3(f.height), (int)f.tof_valid, FP3(u[0]));
 #endif
 		}
-		send_control(u);
+		/* send_control() is issued (and timed) above, before this telemetry print. */
 	}
 	printk("flight_controller: control loop done (%d iters)\n", CTRL_ITERS);
 	return 0;
