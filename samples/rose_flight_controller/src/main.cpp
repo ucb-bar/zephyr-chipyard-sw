@@ -255,6 +255,47 @@ struct sensor_frame {
 };
 
 /* Sensor IO block: batched fetch (TX) then collect (blocking RX) of the whole sensor set. */
+/* ---- IMU mounting -> drone body frame (forward +x, left +y, up +z) ----------------------------
+ * On riskybird v3 the BMI088 (U3) is on the BOARD BOTTOM, rotated 180 deg, so its sensor axes do
+ * NOT equal the drone body frame; raw readings must be rotated before the estimator uses them.
+ *
+ * Derivation (datasheet BST-BMI088-DS001 rev 1.9 + this layout + "pin 1 faces +x,+y"):
+ *   - Accel & gyro SHARE one coordinate system (datasheet Fig 12 labels both on one axis triad),
+ *     so the SAME rotation applies to both.
+ *   - Pin-1 sits at the sensor's (+X,+Y) corner (datasheet Table 15: landscape/pin-top-left reads
+ *     +1g on X, so +X and +Y meet at the pin-1 corner).
+ *   - Bottom-side mount => the marking/top face points DOWN => sensor +Z = drone -Z. This part is
+ *     CERTAIN: the estimator wants body accel_z = +9.81 at rest (az_w = R*a - GRAVITY); with +Z
+ *     facing down the part reads -9.81 on +Z, so negating Z yields the required +9.81.
+ *   - Pin-1's (+X,+Y) diagonal is aligned to the drone (+x,+y) diagonal; the bottom-side mirror
+ *     then resolves the in-plane part to a SWAP (proper rotation, det +1):
+ *       body_x = +sensor_y ,  body_y = +sensor_x ,  body_z = -sensor_z
+ *
+ * VERIFY ON HARDWARE before flight (the in-plane part is figure-derived and easy to mis-read; Z is
+ * solid). Hold the board and watch the per-iter accel/gyro prints:
+ *   level at rest        -> accel ~ (0, 0, +9.81)
+ *   tilt NOSE-UP         -> accel_x goes negative (gravity leaks onto -x); gyro_y transient
+ *   tilt RIGHT-WING-DOWN -> accel_y goes negative;                          gyro_x transient
+ *   yaw NOSE-LEFT (+y)   -> gyro_z positive
+ * If a channel is wrong, fix the SRC index / SIGN below. RoSE's virtual IMU is already body-frame. */
+#if HAVE_ROSE
+#define IMU_REMAP(dst, src) do { (dst)[0]=(src)[0]; (dst)[1]=(src)[1]; (dst)[2]=(src)[2]; } while (0)
+#else
+/* body[k] = SIGN_k * sensor[SRC_k] ; defaults = swap X/Y + negate Z (see derivation above) */
+#define IMU_BX_SRC 1
+#define IMU_BX_SIGN (+1.0f)
+#define IMU_BY_SRC 0
+#define IMU_BY_SIGN (+1.0f)
+#define IMU_BZ_SRC 2
+#define IMU_BZ_SIGN (-1.0f)
+#define IMU_REMAP(dst, src) do {                          \
+		float _r0 = IMU_BX_SIGN * (src)[IMU_BX_SRC];      \
+		float _r1 = IMU_BY_SIGN * (src)[IMU_BY_SRC];      \
+		float _r2 = IMU_BZ_SIGN * (src)[IMU_BZ_SRC];      \
+		(dst)[0] = _r0; (dst)[1] = _r1; (dst)[2] = _r2;   \
+	} while (0)
+#endif
+
 static bool read_sensor_frame(struct sensor_frame *f)
 {
 	int rc_a = sensor_sample_fetch(accel_dev);
@@ -269,10 +310,13 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	struct sensor_value av[3], gv[3];
 	sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, av);
 	sensor_channel_get(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gv);
+	float araw[3], graw[3];
 	for (int i = 0; i < 3; i++) {
-		f->accel[i] = (float)sensor_value_to_double(&av[i]);
-		f->gyro[i]  = (float)sensor_value_to_double(&gv[i]);
+		araw[i] = (float)sensor_value_to_double(&av[i]);
+		graw[i] = (float)sensor_value_to_double(&gv[i]);
 	}
+	IMU_REMAP(f->accel, araw);   /* sensor -> drone body frame (no-op on RoSE) */
+	IMU_REMAP(f->gyro,  graw);
 	f->flow[0] = f->flow[1] = 0.0f;
 	f->flow_valid = true;
 #if HAVE_FLOW
@@ -492,10 +536,18 @@ int main(void)
 		est.get_state(state);
 		solve_control(state, u);
 		if ((iter % 10) == 0) {
+#if defined(ROSE_IMU_DEBUG) && ROSE_IMU_DEBUG
+			/* Body-frame IMU dump for the axis/sign tilt test (see IMU_REMAP note). */
+			printk("flight_controller: iter=%d a=[%s%d.%03d %s%d.%03d %s%d.%03d] "
+			       "g=[%s%d.%03d %s%d.%03d %s%d.%03d]\n", iter,
+			       FP3(f.accel[0]), FP3(f.accel[1]), FP3(f.accel[2]),
+			       FP3(f.gyro[0]),  FP3(f.gyro[1]),  FP3(f.gyro[2]));
+#else
 			printk("flight_controller: iter=%d z_est=%s%d.%03d roll=%s%d.%03d pitch=%s%d.%03d "
 			       "h_meas=%s%d.%03d tof=%d u0=%s%d.%03d\n", iter,
 			       FP3(state[2]), FP3(state[3]), FP3(state[4]),
 			       FP3(f.height), (int)f.tof_valid, FP3(u[0]));
+#endif
 		}
 		send_control(u);
 	}
