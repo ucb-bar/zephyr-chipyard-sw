@@ -292,7 +292,10 @@ extern "C" {
 #define FMPC_TOF_WORDS      64
 #define FMPC_LOWDIM_ELEMS   21
 #ifndef FUSED_VISION_DIV
-#define FUSED_VISION_DIV    20        /* run the fused model every 20 ticks (10 Hz at 200 Hz) */
+#define FUSED_VISION_DIV    10        /* run the fused model every 10 ticks (20 Hz at 200 Hz).
+                                        * 20 Hz fits the current 1x SoC (RVV inference 27.5ms < 50ms
+                                        * budget) and threads gate 2 controlled (2/4) vs 10 Hz's 1/4 —
+                                        * finer between-gate steering shrinks the post-gate over-swing. */
 #endif
 static uint8_t   fmpc_front[FMPC_FRONT_ELEMS];
 static struct video_buffer fmpc_vbuf;
