@@ -70,13 +70,23 @@
 #endif
 /* Minimum fraction of commanded forward speed kept by turn-before-go (prevents a hover deadlock
  * when the real vision model's |yr| baseline stays high even when aligned). */
+/* Alignment gate now only lightly throttles: the co-sim confirmed the drone stays DEAD-CENTERED
+ * (drift <1 m) -- the earlier TBG_FLOOR=0.5 + narrow gate chronically halved forward speed (vy~0.42
+ * m/s) as the (benign) yaw oscillated, ending 1.48 m short of gate 2. Keep the gate for gross-
+ * misalignment safety only: high floor + wide full-engage angle. */
 #ifndef TBG_FLOOR
-#define TBG_FLOOR 0.5f
+#define TBG_FLOOR 0.35f
 #endif
-/* Heading-misalignment (rad) at which the alignment forward gate fully engages (fwd -> TBG_FLOOR).
- * 0.44 rad = 25deg (host-analyzed). Gate: fwd *= TBG_FLOOR + (1-TBG_FLOOR)*max(0,1-|misalign|/ALIGN_FULL)^2 */
 #ifndef ALIGN_FULL
-#define ALIGN_FULL 0.44f
+#define ALIGN_FULL 0.44f     /* 25deg: strong throttle on misalignment => self-centering; full speed only when aligned */
+#endif
+/* Cruise scale + cap on the model's forward command so effective vx reaches ~1.2-1.5 m/s (the
+ * no-gate run sustained ~1.5 flyably). Centering is handled by the alignment gate above. */
+#ifndef CRUISE_SCALE
+#define CRUISE_SCALE 1.5f
+#endif
+#ifndef VX_MAX
+#define VX_MAX 1.6f
 #endif
 /* Clamp on the body-relative yaw-angle offset err[5] (rad) so a large transient policy yr can't
  * saturate the rotors and steal z/attitude headroom. */
@@ -472,8 +482,9 @@ static void solve_nav(int iter, const float *state, float steer, float collision
 	 * yaw RATE needs no absolute-yaw reference (drift-immune). Usable now that (a) the plant applies
 	 * the drag yaw torque to the BASE and (b) the yawfix params weight/mix yaw-rate correctly. */
 	float yr_cmd = (iter > SETTLE_ITERS) ? g_yr : 0.0f;
-	float vx_cmd = (iter > SETTLE_ITERS) ? g_fwd : 0.0f;
+	float vx_cmd = (iter > SETTLE_ITERS) ? g_fwd * CRUISE_SCALE : 0.0f;  /* cruise scale -> ~1.2-1.5 m/s */
 	if (vx_cmd < 0.0f) vx_cmd = 0.0f;
+	if (vx_cmd > VX_MAX) vx_cmd = VX_MAX;                                /* cap so it stays flyable */
 	/* ALIGNMENT forward gate (Thread A): slow forward while the HEADING is mis-aligned with the goal
 	 * gate (|g_misalign| large), so off-line-spawn drift can't accumulate during the yaw correction;
 	 * restores full speed on alignment (g_misalign -> 0). Driven by the served desired_vel bearing
