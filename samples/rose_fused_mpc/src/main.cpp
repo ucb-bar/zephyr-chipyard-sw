@@ -63,6 +63,21 @@
 #ifndef YAW_CMD_GAIN
 #define YAW_CMD_GAIN 0.5f
 #endif
+/* Turn-before-go forward gating: fwd *= max(0, 1 - |yr|/YR_MAX)^2. YR_MAX = the policy yr scale
+ * (rad/s) at which forward speed is fully cut (host-tuned winner: 0.8). */
+#ifndef YR_MAX
+#define YR_MAX 0.8f
+#endif
+/* Minimum fraction of commanded forward speed kept by turn-before-go (prevents a hover deadlock
+ * when the real vision model's |yr| baseline stays high even when aligned). */
+#ifndef TBG_FLOOR
+#define TBG_FLOOR 0.5f
+#endif
+/* Heading-misalignment (rad) at which the alignment forward gate fully engages (fwd -> TBG_FLOOR).
+ * 0.44 rad = 25deg (host-analyzed). Gate: fwd *= TBG_FLOOR + (1-TBG_FLOOR)*max(0,1-|misalign|/ALIGN_FULL)^2 */
+#ifndef ALIGN_FULL
+#define ALIGN_FULL 0.44f
+#endif
 /* Clamp on the body-relative yaw-angle offset err[5] (rad) so a large transient policy yr can't
  * saturate the rotors and steal z/attitude headroom. */
 #ifndef YAW_ERR_MAX
@@ -276,6 +291,9 @@ static float     fmpc_lowf[FMPC_LOWDIM_ELEMS];
 static _Float16  fmpc_low16[FMPC_LOWDIM_ELEMS];
 static _Float16  fmpc_out[MODEL_OUTPUT_SIZE];
 static float     g_fwd = 0.0f, g_yr = 0.0f;   /* ZOH'd fused-model velocity command */
+static float     g_misalign = 0.0f;           /* ZOH'd body-frame bearing to the goal gate (rad),
+                                               * from the served desired_vel; 0 when heading at gate.
+                                               * Drives the ALIGNMENT forward gate (Thread A). */
 static bool      g_vision_valid = false;
 static const struct device *fmpc_cam = DEVICE_DT_GET(DT_ALIAS(fpv));
 
@@ -302,6 +320,10 @@ static bool fmpc_read_lowdim(void)
 	rose_request(rose, FMPC_CMD_LOWDIM, 0U);
 	if (rose_recv_reqrsp(rose, FMPC_LOWDIM_CH, raw, FMPC_LOWDIM_ELEMS) < FMPC_LOWDIM_ELEMS) return false;
 	for (int i = 0; i < FMPC_LOWDIM_ELEMS; i++) memcpy(&fmpc_lowf[i], &raw[i], sizeof(float));
+	/* desired_vel occupies lowdim[12..14] (body-frame goal guidance). Body-frame bearing to the
+	 * goal gate = atan2(dv_y, dv_x): 0 when the drone heads straight at the gate. This is the proper
+	 * ALIGNMENT signal (goes to 0 on alignment) for the forward gate — unlike the noisy model |yr|. */
+	g_misalign = atan2f(fmpc_lowf[13], fmpc_lowf[12]);
 	return true;
 }
 /* Overwrite the lowdim quat slot [5..8]=[w,x,y,z] with the on-SoC EKF's OWN quaternion, from the
@@ -449,11 +471,21 @@ static void solve_nav(int iter, const float *state, float steer, float collision
 	 * NEUTRALIZE the yaw-ANGLE channel (setpoint[5]=state[5] -> err[5]=0) so Q5 doesn't fight. A
 	 * yaw RATE needs no absolute-yaw reference (drift-immune). Usable now that (a) the plant applies
 	 * the drag yaw torque to the BASE and (b) the yawfix params weight/mix yaw-rate correctly. */
+	float yr_cmd = (iter > SETTLE_ITERS) ? g_yr : 0.0f;
 	float vx_cmd = (iter > SETTLE_ITERS) ? g_fwd : 0.0f;
 	if (vx_cmd < 0.0f) vx_cmd = 0.0f;
-	setpoint[6]  = vx_cmd;                                  /* forward velocity (vx) */
+	/* ALIGNMENT forward gate (Thread A): slow forward while the HEADING is mis-aligned with the goal
+	 * gate (|g_misalign| large), so off-line-spawn drift can't accumulate during the yaw correction;
+	 * restores full speed on alignment (g_misalign -> 0). Driven by the served desired_vel bearing
+	 * (a proper alignment signal that goes to 0 when aligned) -- unlike the model's noisy |yr|, which
+	 * stays high even when aligned and deadlocks the |yr|-gate. TBG_FLOOR keeps min forward progress. */
+	float align = 1.0f - fabsf(g_misalign) / ALIGN_FULL;
+	if (align < 0.0f) align = 0.0f;
+	float gate = TBG_FLOOR + (1.0f - TBG_FLOOR) * align * align;
+	vx_cmd *= gate;
+	setpoint[6]  = vx_cmd;                                  /* forward velocity (vx), turn-before-go gated */
 	setpoint[5]  = state[5];                                /* neutralize yaw-ANGLE channel (err[5]=0) */
-	setpoint[11] = (iter > SETTLE_ITERS) ? g_yr : 0.0f;     /* faithful body yaw RATE (wz) */
+	setpoint[11] = yr_cmd;                                  /* faithful body yaw RATE (wz) */
 	for (int i = 0; i < NSTATES; i++) err[i] = state[i] - setpoint[i];
 	err[0] = 0.0f; err[1] = 0.0f;                           /* x,y position free */
 	*logcmd = vx_cmd;
