@@ -16,6 +16,7 @@
 #include "controller_pid.hpp"
 
 #include <math.h>
+#include <stdint.h>
 
 /* --- gains (verbatim from the original firmware) --- */
 static const float gravity            = 9.81f;
@@ -98,6 +99,54 @@ static float forceToVoltage(float forceNewtons)
 	return duty;
 }
 
+/* --- side-ToF wall repulsion ("bumper") -------------------------------------------------------
+ * When the ROSE_BUMPER build is active, main.cpp feeds the latest side-wall distances via
+ * pid_set_walls() each control tick. compute() turns any wall closer than WALL_REPULSE_MM into a
+ * bounded velocity command AWAY from it, ADDED to the horizontal-velocity setpoint -- so the
+ * existing vel->tilt cascade produces a lean away from the wall. Authority is intentionally small
+ * for first flights (WALL_MAX_REP_VEL). Signs are per-axis flippable (WALL_SIGN_X/Y) so a facing
+ * that turns out mapped backwards on the bench can be corrected with a rebuild, not a rewire. */
+#ifndef WALL_REPULSE_MM
+#define WALL_REPULSE_MM   350      /* start pushing when a wall is closer than this (mm) */
+#endif
+#ifndef WALL_MIN_MM
+#define WALL_MIN_MM       90       /* full-authority distance (mm); anything closer clamps to full */
+#endif
+#ifndef WALL_MAX_REP_VEL
+#define WALL_MAX_REP_VEL  0.35f    /* max commanded repulsion velocity (m/s), per axis */
+#endif
+#ifndef WALL_SIGN_X
+#define WALL_SIGN_X       1.0f     /* flip to -1.0f if front/back push the wrong way */
+#endif
+#ifndef WALL_SIGN_Y
+#define WALL_SIGN_Y       1.0f     /* flip to -1.0f if left/right push the wrong way */
+#endif
+
+struct pid_walls { int16_t front, back, left, right; bool valid; };
+static volatile struct pid_walls g_walls = {0, 0, 0, 0, false};
+
+/* Called from main.cpp each control tick (only in ROSE_BUMPER builds). <=0 mm = no wall/no target. */
+extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
+			      int16_t left_mm, int16_t right_mm, bool valid)
+{
+	g_walls.front = front_mm;
+	g_walls.back  = back_mm;
+	g_walls.left  = left_mm;
+	g_walls.right = right_mm;
+	g_walls.valid = valid;
+}
+
+/* distance (mm) -> repulsion speed magnitude (m/s); linear ramp over [WALL_MIN_MM, WALL_REPULSE_MM] */
+static float wall_push(int16_t d_mm)
+{
+	if (d_mm <= 0 || d_mm >= WALL_REPULSE_MM) {
+		return 0.0f;   /* no valid target, or wall beyond the influence radius */
+	}
+	float d = (d_mm < WALL_MIN_MM) ? (float)WALL_MIN_MM : (float)d_mm;
+	float frac = ((float)WALL_REPULSE_MM - d) / (float)(WALL_REPULSE_MM - WALL_MIN_MM);
+	return frac * WALL_MAX_REP_VEL;   /* 0..WALL_MAX_REP_VEL */
+}
+
 void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 				       const float setpoint[CTRL_NSTATES],
 				       float u_out[CTRL_NACTIONS], float dt)
@@ -119,9 +168,17 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	/* setpoints (original firmware regulated vel->0, height->desHeight, yaw->0; we take those
 	 * from the setpoint vector so hover reduces to the original behaviour). */
 	const float desHeight = setpoint[2];
-	const float desVel_1  = setpoint[6];
-	const float desVel_2  = setpoint[7];
+	float desVel_1        = setpoint[6];
+	float desVel_2        = setpoint[7];
 	const float yaw_tgt   = setpoint[5];
+
+	/* Wall repulsion: bias the horizontal-velocity setpoint away from any close wall. Body frame
+	 * is FLU (+x fwd, +y left): a front (+x) wall pushes -x, back (-x) pushes +x; a left (+y) wall
+	 * pushes -y, right (-y) pushes +y. Net per axis, so opposing walls partially cancel (centering). */
+	if (g_walls.valid) {
+		desVel_1 += WALL_SIGN_X * (wall_push(g_walls.back)  - wall_push(g_walls.front));
+		desVel_2 += WALL_SIGN_Y * (wall_push(g_walls.right) - wall_push(g_walls.left));
+	}
 
 	/* (1) altitude loop -> normalized vertical acceleration command */
 	const float desAcc3 = -2.0f * dampingRatio_height * natFreq_height * estVel_3
