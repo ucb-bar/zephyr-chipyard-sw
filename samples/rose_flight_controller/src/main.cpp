@@ -91,7 +91,13 @@ static const struct device *tof_dev  = DEVICE_DT_GET(DT_ALIAS(tof));
 #define ADS7128_GPIO_CFG      0x07
 #define ADS7128_GPO_DRIVE_CFG 0x09
 #define ADS7128_GPO_VALUE     0x0B
-#define VL53L1X_XSHUT_CH      6      /* ADS7128 GPIO6 = VL53L1X XSHUT (riskybird v3) */
+#define VL53L1X_XSHUT_CH      6      /* ADS7128 GPIO6 = DOWN VL53L1X XSHUT (riskybird v3) */
+/* ADS7128 GPIO1-4 = XSHUT of the 4 SIDE VL53L1X. They power-on at the SAME I2C address (0x29) as
+ * the down ToF and still carry their protective film, so if left enabled they contend on 0x29 and
+ * dominate it with a 0mm / ~87 Mcps crosstalk return (the down sensor's real reads only occasionally
+ * win the bus). The flight controller uses ONLY the down ToF, so hold the sides in reset. See
+ * samples/riskybird/sensor_bringup for the full multi-sensor readdressing scheme (down -> 0x30). */
+static const uint8_t VL53L1X_SIDE_CH[4] = { 1, 2, 3, 4 };
 
 static int ads7128_rd(const struct device *bus, uint8_t reg, uint8_t *v)
 {
@@ -131,6 +137,15 @@ static int board_sensor_init(void)
 		printk("board_sensor_init: I2C bus not ready — ToF stays unpowered\n");
 		return 0;   /* non-fatal: the app still runs on the IMU */
 	}
+	/* First, hold the 4 side ToFs in reset (XSHUT low) so they release the shared 0x29 address and
+	 * only the down ToF answers there. Do this BEFORE powering the down sensor. */
+	for (int i = 0; i < 4; i++) {
+		uint8_t ch = VL53L1X_SIDE_CH[i];
+		ads7128_set_bit(bus, ADS7128_PIN_CFG, ch);        /* GPIO mode */
+		ads7128_set_bit(bus, ADS7128_GPIO_CFG, ch);       /* output */
+		ads7128_set_bit(bus, ADS7128_GPO_DRIVE_CFG, ch);  /* push-pull */
+		ads7128_clr_bit(bus, ADS7128_GPO_VALUE, ch);      /* XSHUT LOW = reset (side ToF off) */
+	}
 	int rc = ads7128_set_bit(bus, ADS7128_PIN_CFG, VL53L1X_XSHUT_CH)        /* GPIO mode */
 	       | ads7128_set_bit(bus, ADS7128_GPIO_CFG, VL53L1X_XSHUT_CH)       /* output */
 	       | ads7128_set_bit(bus, ADS7128_GPO_DRIVE_CFG, VL53L1X_XSHUT_CH); /* push-pull */
@@ -148,6 +163,45 @@ static int board_sensor_init(void)
 SYS_INIT(board_sensor_init, POST_KERNEL, 80);   /* before CONFIG_SENSOR_INIT_PRIORITY (90) */
 #endif /* st_vl53l1x present */
 
+/* ---- Emergency cutoff watchdog --------------------------------------------------------------
+ * A hard, controller-independent backstop (on top of the MOTOR_MAX_DUTY cap and the actuation
+ * timeout): latch motors OFF if the vehicle state exceeds safe limits -- excess tilt, body rate,
+ * or velocity -- or a key sensor drops out. Once latched, g_estop stays set until reset, and
+ * send_control() forces every motor to 0. Thresholds are build-overridable. */
+#include <math.h>
+#ifndef SAFE_MAX_TILT_RAD
+#define SAFE_MAX_TILT_RAD   1.0f     /* ~57 deg: past any recoverable bench perturbation */
+#endif
+#ifndef SAFE_MAX_RATE_RADPS
+#define SAFE_MAX_RATE_RADPS 10.0f    /* ~573 deg/s: a violent tumble */
+#endif
+#ifndef SAFE_MAX_VEL_MPS
+#define SAFE_MAX_VEL_MPS    2.5f     /* runaway translational velocity */
+#endif
+#ifndef SAFE_MAX_IMU_MISS
+#define SAFE_MAX_IMU_MISS   10       /* consecutive IMU read failures => sensor lost */
+#endif
+static volatile bool g_estop;        /* latched emergency stop (cleared only by reset) */
+
+/* Returns a short reason if any safety limit is exceeded (state = 12-DoF body state, gyro = body
+ * rates rad/s), else NULL. Attitude from the estimate; rate straight from the gyro (no filter lag);
+ * velocity from the estimate. */
+static const char *safety_violation(const float *state, const float *gyro)
+{
+	if (fabsf(state[3]) > SAFE_MAX_TILT_RAD || fabsf(state[4]) > SAFE_MAX_TILT_RAD) {
+		return "tilt";
+	}
+	if (fabsf(gyro[0]) > SAFE_MAX_RATE_RADPS || fabsf(gyro[1]) > SAFE_MAX_RATE_RADPS ||
+	    fabsf(gyro[2]) > SAFE_MAX_RATE_RADPS) {
+		return "rate";
+	}
+	if (fabsf(state[6]) > SAFE_MAX_VEL_MPS || fabsf(state[7]) > SAFE_MAX_VEL_MPS ||
+	    fabsf(state[8]) > SAFE_MAX_VEL_MPS) {
+		return "velocity";
+	}
+	return NULL;
+}
+
 /* ---- Actuator output: RoSE bridge (co-sim) vs PWM motors (real) ---- */
 #define HAVE_ROSE DT_HAS_COMPAT_STATUS_OKAY(ucbbar_roseadapter)
 #if HAVE_ROSE
@@ -156,11 +210,14 @@ SYS_INIT(board_sensor_init, POST_KERNEL, 80);   /* before CONFIG_SENSOR_INIT_PRI
 static const struct device *rose = DEVICE_DT_GET_ONE(ucbbar_roseadapter);
 static void send_control(const float *u)
 {
+	/* Emergency cutoff: send minimum thrust (u = -0.583 -> 0 duty) instead of the command. */
+	static const float off[NACTIONS] = { -0.583f, -0.583f, -0.583f, -0.583f };
+	const float *cmd = g_estop ? off : u;
 	rose_tx(rose, ROSE_CMD_CONTROL);
 	rose_tx(rose, NACTIONS * sizeof(float));
 	for (int i = 0; i < NACTIONS; i++) {
 		uint32_t w;
-		memcpy(&w, &u[i], sizeof(float));
+		memcpy(&w, &cmd[i], sizeof(float));
 		rose_tx(rose, w);
 	}
 }
@@ -185,6 +242,13 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
 #endif
 static void send_control(const float *u)
 {
+	/* Emergency cutoff: once latched, force every motor to 0 and ignore the command entirely. */
+	if (g_estop) {
+		for (int i = 0; i < NACTIONS; i++) {
+			pwm_set_pulse_dt(&motors[i], 0);
+		}
+		return;
+	}
 #if ROSE_ACTUATE_TIMEOUT_MS > 0
 	/* Bench safety: cut all motors ROSE_ACTUATE_TIMEOUT_MS after boot. The
 	 * controller/estimator keep running (still logging) — only the actuator stops. */
@@ -596,6 +660,16 @@ int main(void)
 		printk("flight_controller: vl53l1x_reinit rc=%d (%s)\n", rc,
 		       rc == 0 ? "down-ToF ranging" : "ToF init failed -- altitude unaided");
 	}
+#if defined(ROSE_TOF_CAL_MM) && ROSE_TOF_CAL_MM > 0
+	/* One-shot ToF calibration: place a target at ROSE_TOF_CAL_MM (mm) in a dark, low-reflection
+	 * setup BEFORE reset. Runs offset + crosstalk cal (the latter also enables xtalk compensation).
+	 * Results persist until power cycle. Build with -DROSE_TOF_CAL_MM=<distance> to use. */
+	{
+		int rc = vl53l1x_calibrate(tof_dev, ROSE_TOF_CAL_MM, ROSE_TOF_CAL_MM);
+		printk("flight_controller: vl53l1x_calibrate(%d mm) rc=%d (%s)\n",
+		       (int)ROSE_TOF_CAL_MM, rc, rc == 0 ? "offset+xtalk done" : "cal FAILED");
+	}
+#endif
 #endif
 
 #if TOF_THREADED
@@ -634,11 +708,21 @@ int main(void)
 	 * loop runs ~15 Hz (dt ~67 ms), not the 200 Hz the design assumes; feeding the fixed 5 ms made
 	 * the estimator integrate ~13x too slow, so real tilts barely registered. Measure dt each iter. */
 	int64_t t_prev = k_uptime_get();
+	int imu_miss = 0;
 	for (int iter = 0; iter < CTRL_ITERS; iter++) {
 		if (!read_sensor_frame(&f)) {
 			printk("flight_controller: IMU fetch error\n");
+			if (++imu_miss >= SAFE_MAX_IMU_MISS && !g_estop) {
+				g_estop = true;
+				printk("flight_controller: EMERGENCY CUTOFF -- IMU lost (%d misses); "
+				       "motors OFF (reset to clear)\n", imu_miss);
+			}
+			if (g_estop) {
+				send_control(u);   /* g_estop forces motors to 0 (u not read) */
+			}
 			continue;
 		}
+		imu_miss = 0;
 		int64_t t_now = k_uptime_get();
 		float dt = (float)(t_now - t_prev) * 1e-3f;   /* real loop period (s) */
 		if (dt <= 0.0f || dt > 0.5f) dt = CTRL_DT;     /* first-iter / stall guard */
@@ -647,6 +731,16 @@ int main(void)
 		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, dt);
 		est.get_state(state);
 		PF_ACC(pf_est, _pe);
+		/* Emergency watchdog: latch a kill if attitude/rate/velocity exceed safe limits. Checked
+		 * every iteration before actuation; send_control() enforces the cut. */
+		if (!g_estop) {
+			const char *why = safety_violation(state, f.gyro);
+			if (why != NULL) {
+				g_estop = true;
+				printk("flight_controller: EMERGENCY CUTOFF -- %s limit exceeded; "
+				       "motors OFF (reset to clear)\n", why);
+			}
+		}
 		uint32_t _pc = PF_NOW();
 		solve_control(state, u, dt);
 		PF_ACC(pf_ctrl, _pc);
