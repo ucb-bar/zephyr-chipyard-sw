@@ -23,9 +23,16 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <string.h>
+#include <math.h>
 
 #include "admm.hpp"
-#include "problem_data/quadrotor_50hz_params_constrained.hpp"
+/* YAW-MIXING-CORRECTED model: the committed Bdyn yaw rows used signs (+,-,-,+) but the PHYSICAL
+ * plant's propeller-drag yaw follows CRAZYFLIE spin (m1:+,m2:-,m3:+,m4:-)=(+,-,+,-); rotors m3,m4
+ * were yaw-sign-flipped in the model, so the MPC's yaw command produced the wrong/near-zero net
+ * yaw on the real plant (root cause of the on-SoC yaw failure). This regen flips Bdyn cols 2,3 on
+ * the yaw rows to match the plant and recomputes the cache (host-validated: weave tracks 99%,
+ * altitude held). Q[yaw-rate]=150. Drive yaw body-relative: err[5] = -yaw_rate * YAW_CMD_GAIN. */
+#include "problem_data/quadrotor_yawfix_params.hpp"
 #include "glob_opts.hpp"
 
 #include "estimator.hpp"
@@ -43,6 +50,23 @@
 #endif
 #ifndef TARGET_Z
 #define TARGET_Z     1.0f
+#endif
+/* One-time takeoff-heading calibration for the gyro-only Mahony yaw. The co-sim spawns the drone
+ * at a nonzero yaw (seed 1000 ~= 1.727 rad); without seeding, est-yaw=0 disagrees with the true
+ * heading, so the MPC (which tracks est-yaw) sees no yaw error and never steers. Set to the spawn
+ * yaw. NOT continuous GT -- a single init seed, then the gyro carries it closed-loop. */
+#ifndef START_YAW
+#define START_YAW    0.0f
+#endif
+/* Body-relative yaw command gain: yaw-angle offset commanded per unit of policy yaw-rate.
+ * err[5] = -yaw_rate * YAW_CMD_GAIN, re-zeroed each tick (bounded, drift-immune). */
+#ifndef YAW_CMD_GAIN
+#define YAW_CMD_GAIN 0.5f
+#endif
+/* Clamp on the body-relative yaw-angle offset err[5] (rad) so a large transient policy yr can't
+ * saturate the rotors and steal z/attitude headroom. */
+#ifndef YAW_ERR_MAX
+#define YAW_ERR_MAX  0.30f
 #endif
 #ifndef CTRL_ITERS
 #define CTRL_ITERS   6000
@@ -221,6 +245,81 @@ static TinySettings  settings;
 static TinySolver    solver;
 static IStateEstimator &est = active_estimator();
 
+/* ---- Fused-vision nav (ROSE_FUSED_NAV=1): the Stage-1 fused model drives the VELOCITY setpoint
+ * while the on-SoC EKF + TinyMPC (this controller) close the loop -> motor thrusts. The model runs
+ * at a low rate (every FUSED_VISION_DIV control ticks, ZOH between); its inputs are the same
+ * pre-quantized front int8 / tof_cross int8 / lowdim f32 Stage-1 served, EXCEPT the guest OVERWRITES
+ * the lowdim quat with its OWN EKF quaternion so the vision runs on the on-SoC attitude estimate. */
+#ifndef ROSE_FUSED_NAV
+#define ROSE_FUSED_NAV 0
+#endif
+#if ROSE_FUSED_NAV
+#include <zephyr/drivers/video.h>
+extern "C" {
+#include "model.h"
+}
+#define FMPC_CMD_TOF_CROSS  0x41u
+#define FMPC_CMD_LOWDIM     0x42u
+#define FMPC_TOF_CROSS_CH   1
+#define FMPC_LOWDIM_CH      2
+#define FMPC_FRONT_ELEMS    5400
+#define FMPC_TOF_ELEMS      256
+#define FMPC_TOF_WORDS      64
+#define FMPC_LOWDIM_ELEMS   21
+#ifndef FUSED_VISION_DIV
+#define FUSED_VISION_DIV    20        /* run the fused model every 20 ticks (10 Hz at 200 Hz) */
+#endif
+static uint8_t   fmpc_front[FMPC_FRONT_ELEMS];
+static struct video_buffer fmpc_vbuf;
+static int8_t    fmpc_tof[FMPC_TOF_ELEMS];
+static float     fmpc_lowf[FMPC_LOWDIM_ELEMS];
+static _Float16  fmpc_low16[FMPC_LOWDIM_ELEMS];
+static _Float16  fmpc_out[MODEL_OUTPUT_SIZE];
+static float     g_fwd = 0.0f, g_yr = 0.0f;   /* ZOH'd fused-model velocity command */
+static bool      g_vision_valid = false;
+static const struct device *fmpc_cam = DEVICE_DT_GET(DT_ALIAS(fpv));
+
+static bool fmpc_capture_front(void)
+{
+	struct video_buffer *out = NULL;
+	fmpc_vbuf.buffer = fmpc_front; fmpc_vbuf.size = sizeof(fmpc_front);
+	fmpc_vbuf.type = VIDEO_BUF_TYPE_OUTPUT;
+	if (video_enqueue(fmpc_cam, &fmpc_vbuf) != 0) return false;
+	if (video_dequeue(fmpc_cam, &out, K_FOREVER) != 0 || out == NULL) return false;
+	return true;
+}
+static bool fmpc_read_tof(void)
+{
+	uint32_t raw[FMPC_TOF_WORDS];
+	rose_request(rose, FMPC_CMD_TOF_CROSS, 0U);
+	if (rose_recv_reqrsp(rose, FMPC_TOF_CROSS_CH, raw, FMPC_TOF_WORDS) < FMPC_TOF_WORDS) return false;
+	memcpy(fmpc_tof, raw, FMPC_TOF_ELEMS);
+	return true;
+}
+static bool fmpc_read_lowdim(void)
+{
+	uint32_t raw[FMPC_LOWDIM_ELEMS];
+	rose_request(rose, FMPC_CMD_LOWDIM, 0U);
+	if (rose_recv_reqrsp(rose, FMPC_LOWDIM_CH, raw, FMPC_LOWDIM_ELEMS) < FMPC_LOWDIM_ELEMS) return false;
+	for (int i = 0; i < FMPC_LOWDIM_ELEMS; i++) memcpy(&fmpc_lowf[i], &raw[i], sizeof(float));
+	return true;
+}
+/* Overwrite the lowdim quat slot [5..8]=[w,x,y,z] with the on-SoC EKF's OWN quaternion, from the
+ * state's Rodrigues params r=q_xyz/q_w  ->  q=[1,r1,r2,r3]/|[1,r1,r2,r3]|. Then fp32->fp16 + run. */
+static void fmpc_run_model(const float *state)
+{
+	float r1 = state[3], r2 = state[4], r3 = state[5];
+	float n = sqrtf(1.0f + r1*r1 + r2*r2 + r3*r3);
+	fmpc_lowf[5] = 1.0f / n; fmpc_lowf[6] = r1 / n; fmpc_lowf[7] = r2 / n; fmpc_lowf[8] = r3 / n;
+	for (int i = 0; i < FMPC_LOWDIM_ELEMS; i++) fmpc_low16[i] = (_Float16)fmpc_lowf[i];
+	run_model_fused_full((const model_fused_full_input0_t *)fmpc_front, fmpc_tof, fmpc_low16,
+			     fmpc_out, NULL);
+	g_yr  = (float)fmpc_out[0];
+	g_fwd = (float)fmpc_out[1];
+	g_vision_valid = true;
+}
+#endif /* ROSE_FUSED_NAV */
+
 static void mpc_init(void)
 {
 	solver.cache = &cache; solver.work = &work; solver.settings = &settings;
@@ -343,7 +442,22 @@ static void solve_nav(int iter, const float *state, float steer, float collision
 	float setpoint[NSTATES] = {0.0f, 0.0f, g_target_z, 0,0,0, 0,0,0, 0,0,0};
 	float err[NSTATES];
 	(void)steer; (void)collision;
-#if ROSE_DRONET_NAV
+#if ROSE_FUSED_NAV
+	/* Fused-vision velocity nav with the FAITHFUL body yaw-RATE command (the intended interface;
+	 * matches Stage-1's Lee velocity tracker which flew 4/4). The policy emits body-frame
+	 * (yaw_rate, fwd): drive setpoint[11]=yaw_rate directly (smooth rate tracking, no bang-bang) and
+	 * NEUTRALIZE the yaw-ANGLE channel (setpoint[5]=state[5] -> err[5]=0) so Q5 doesn't fight. A
+	 * yaw RATE needs no absolute-yaw reference (drift-immune). Usable now that (a) the plant applies
+	 * the drag yaw torque to the BASE and (b) the yawfix params weight/mix yaw-rate correctly. */
+	float vx_cmd = (iter > SETTLE_ITERS) ? g_fwd : 0.0f;
+	if (vx_cmd < 0.0f) vx_cmd = 0.0f;
+	setpoint[6]  = vx_cmd;                                  /* forward velocity (vx) */
+	setpoint[5]  = state[5];                                /* neutralize yaw-ANGLE channel (err[5]=0) */
+	setpoint[11] = (iter > SETTLE_ITERS) ? g_yr : 0.0f;     /* faithful body yaw RATE (wz) */
+	for (int i = 0; i < NSTATES; i++) err[i] = state[i] - setpoint[i];
+	err[0] = 0.0f; err[1] = 0.0f;                           /* x,y position free */
+	*logcmd = vx_cmd;
+#elif ROSE_DRONET_NAV
 	/* DroNet vision nav: collision -> forward speed, steer -> yaw. Hover through settle. */
 	float vx_cmd = (1.0f - collision) * DRONET_CRUISE_VX;
 	if (vx_cmd < 0.0f) vx_cmd = 0.0f;
@@ -390,7 +504,11 @@ static void solve_nav(int iter, const float *state, float steer, float collision
 
 static const char *nav_tag(void)
 {
+#if ROSE_FUSED_NAV
+	return "fused";
+#else
 	return ROSE_DRONET_NAV ? "dronet" : (NAV_MODE == 1 ? "vel" : "wp");
+#endif
 }
 
 /* ============================ timer-driven control (co-sim-agnostic) ============================ */
@@ -546,10 +664,12 @@ int main(void)
 	}
 #endif
 	est.init(0.0f, 0.0f, init_z);
+	est.set_init_yaw(START_YAW);   /* one-time takeoff-heading calibration (gyro-only yaw has no ref) */
 	g_target_z = init_z;   /* HOVER holds the spawn altitude (z-error≈0), not a step it over-reacts to */
-	printk("nav_controller: EKF init z=%d.%03d m, hover_target=%d.%03d m (measured down-tof)\n",
+	printk("nav_controller: EKF init z=%d.%03d m, hover_target=%d.%03d m (measured down-tof), "
+	       "yaw_seed=%d mrad\n",
 	       (int)init_z, ((int)(init_z * 1000)) % 1000,
-	       (int)g_target_z, ((int)(g_target_z * 1000)) % 1000);
+	       (int)g_target_z, ((int)(g_target_z * 1000)) % 1000, (int)(START_YAW * 1000));
 
 #if ROSE_DRONET_NAV
 	const struct device *cam = DEVICE_DT_GET(DRONET_CAM_NODE);
@@ -563,6 +683,14 @@ int main(void)
 #endif
 	printk("nav_controller: estimator=%s + TinyMPC ready, walls=%d, threaded=%d, mode=%s\n",
 	       est.name(), g_have_walls, ROSE_THREADED, nav_tag());
+#if ROSE_FUSED_NAV
+	if (!device_is_ready(fmpc_cam)) {
+		printk("nav_controller: FAIL fused camera not ready\n");
+		return -1;
+	}
+	printk("nav_controller: FUSED vision ENABLED (model=%s in=%d out=%d, every %d ticks)\n",
+	       MODEL_NAME, MODEL_INPUT_SIZE, MODEL_OUTPUT_SIZE, FUSED_VISION_DIV);
+#endif
 
 #if ROSE_THREADED
 #if ROSE_DRONET_NAV
@@ -601,6 +729,15 @@ int main(void)
 		run_estimator(&f, state);
 #endif
 
+#if ROSE_FUSED_NAV
+		/* Low-rate inline fused-model run (ZOH between): capture front + tof_cross + lowdim from
+		 * the (frozen) sensor frame, insert the EKF quat, run the model -> (yaw_rate, fwd). */
+		if ((iter % FUSED_VISION_DIV) == 0) {
+			if (fmpc_capture_front() && fmpc_read_tof() && fmpc_read_lowdim()) {
+				fmpc_run_model(state);
+			}
+		}
+#endif
 		float steer = 0.0f, collision = 0.5f;
 #if ROSE_DRONET_NAV
 		if (cam && (iter % VISION_DIV) == 0) {
@@ -622,6 +759,10 @@ int main(void)
 			       (int)state[6], (int)(state[6]*1000)%1000,
 			       (int)logcmd, (int)(logcmd*1000)%1000,
 			       (int)(g_max_send_gap / 10));
+#if ROSE_FUSED_NAV
+			printk("  fused: yr_m=%d fwd_m=%d valid=%d\n",
+			       (int)(g_yr*1000), (int)(g_fwd*1000), (int)g_vision_valid);
+#endif
 		}
 		send_control(u);
 	}

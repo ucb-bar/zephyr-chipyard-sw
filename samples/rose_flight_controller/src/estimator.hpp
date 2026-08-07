@@ -26,6 +26,11 @@ struct IStateEstimator {
 	/* Initialize at a known takeoff pose (level, at rest). */
 	virtual void init(float x0, float y0, float z0) = 0;
 
+	/* One-time heading calibration to the known takeoff yaw (rad). Default no-op; estimators
+	 * with a Mahony attitude seed their quaternion so est-yaw matches the true spawn heading
+	 * (the gyro-only filter otherwise assumes yaw=0). Call ONCE right after init(). */
+	virtual void set_init_yaw(float yaw_rad) { (void)yaw_rad; }
+
 	/* One estimator step. The IMU + optical flow are sampled every call (fast); the ToF
 	 * height is LOW-RATE (~20-40 ms) so it is only fused when a fresh sample is available.
 	 *   accel:      body-frame specific force (m/s^2)   [ax, ay, az]

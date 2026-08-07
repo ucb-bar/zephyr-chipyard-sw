@@ -139,6 +139,7 @@ struct Kf3 {
 class EkfEstimator : public IStateEstimator {
 public:
 	void init(float x0, float y0, float z0) override;
+	void set_init_yaw(float yaw_rad) override { att.set_yaw(yaw_rad); }
 	void update(const float accel[3], const float gyro[3], const float flow[2],
 		    bool flow_valid, float height, bool tof_valid, float dt) override;
 	void fuse_walls(float d_front, float d_back, float d_left, float d_right,

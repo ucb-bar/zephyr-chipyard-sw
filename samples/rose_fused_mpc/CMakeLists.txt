@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.20.0)
 # Threaded build: splice the cooperative-transport + fine-tick overlay before Zephyr config.
+set(_rfm_conf "")
 if(ROSE_THREADED)
-  set(EXTRA_CONF_FILE ${CMAKE_CURRENT_LIST_DIR}/threaded.conf)
+  list(APPEND _rfm_conf ${CMAKE_CURRENT_LIST_DIR}/threaded.conf)
+endif()
+if(ROSE_FUSED_NAV)
+  list(APPEND _rfm_conf ${CMAKE_CURRENT_LIST_DIR}/rvv_zfh.conf)
+endif()
+if(_rfm_conf)
+  set(EXTRA_CONF_FILE ${_rfm_conf})
 endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(rose_nav_controller)
+project(rose_fused_mpc)
 
 # Reuse the flight controller's estimator (incl. the wall-fusion EKF) + TinyMPC.
 set(FC ${CMAKE_CURRENT_SOURCE_DIR}/../rose_flight_controller)
@@ -55,11 +62,43 @@ endif()
 if(DEFINED TARGET_Z)
   target_compile_definitions(app PRIVATE TARGET_Z=${TARGET_Z})
 endif()
+if(DEFINED START_YAW)
+  target_compile_definitions(app PRIVATE START_YAW=${START_YAW})
+endif()
+if(DEFINED YAW_CMD_GAIN)
+  target_compile_definitions(app PRIVATE YAW_CMD_GAIN=${YAW_CMD_GAIN})
+endif()
+if(DEFINED YAW_ERR_MAX)
+  target_compile_definitions(app PRIVATE YAW_ERR_MAX=${YAW_ERR_MAX})
+endif()
 
 # Threaded producer/consumer build (-DROSE_THREADED=1): io/est/ctrl/vision/keepalive threads.
 set(ROSE_THREADED 0 CACHE STRING "1=threaded producer/consumer controller, 0=single loop")
 if(ROSE_THREADED)
   target_compile_definitions(app PRIVATE ROSE_THREADED=1)
+endif()
+
+# Fused-vision nav (-DROSE_FUSED_NAV=1): compile the generated fused_full model C (rvv_f16 gen)
+# into the controller; the model drives the TinyMPC VELOCITY setpoint (see src/main.cpp). Needs
+# -DMODEL_DIR=<.../rvv_f16> and -DMB_POOL_INC=<modelblaster_pool>. V+Zfh+Zvfh come from rvv_zfh.conf.
+set(ROSE_FUSED_NAV 0 CACHE STRING "1=fused-vision model drives the TinyMPC velocity setpoint")
+if(ROSE_FUSED_NAV)
+  if(NOT DEFINED MODEL_DIR)
+    message(FATAL_ERROR "ROSE_FUSED_NAV=1 needs -DMODEL_DIR=<generated rvv_f16 fused_full C dir>")
+  endif()
+  get_filename_component(MODEL_DIR "${MODEL_DIR}" ABSOLUTE)
+  target_sources(app PRIVATE
+    ${MODEL_DIR}/model.c ${MODEL_DIR}/kernels.c ${MODEL_DIR}/weights.c ${MODEL_DIR}/buffers.c)
+  target_include_directories(app PRIVATE ${MODEL_DIR})
+  if(DEFINED MB_POOL_INC)
+    target_include_directories(app PRIVATE ${MB_POOL_INC})
+  endif()
+  target_compile_definitions(app PRIVATE ROSE_FUSED_NAV=1)
+  if(DEFINED FUSED_VISION_DIV)
+    target_compile_definitions(app PRIVATE FUSED_VISION_DIV=${FUSED_VISION_DIV})
+  endif()
+  # 25 MB of fused_full weights overflow the gp-relative window — disable linker relaxation.
+  zephyr_link_libraries(-Wl,--no-relax)
 endif()
 
 # DroNet vision navigation (-DROSE_DRONET_NAV=1). Compiles the generated quantized DroNet C
