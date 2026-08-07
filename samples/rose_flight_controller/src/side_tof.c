@@ -101,17 +101,60 @@ K_THREAD_STACK_DEFINE(g_side_stack, 4096);
 static struct k_thread g_side_thread;
 static bool g_running[N_SIDE];
 
+/* Wall distance for one sensor = AVERAGE of the valid zones over the top WALL_CLEAR_ROWS rows of
+ * the grid. The live-heatmap survey showed these rows are the least occluded on all four sensors
+ * (higher rows are blocked by the PCB / motor ports), and that an "invalid" zone almost always
+ * means out-of-range -- i.e. no wall there -- so invalid zones are simply excluded from the mean.
+ * Returns the mean distance (mm) of the valid clear-row zones, or -1 if none are valid (no wall). */
+#ifndef WALL_CLEAR_ROWS
+#define WALL_CLEAR_ROWS 2
+#endif
 static int16_t read_one(int i)
 {
 	if (!g_running[i] || sensor_sample_fetch(s_dev[i]) != 0) {
 		return -1;
 	}
-	struct sensor_value d;
-	if (sensor_channel_get(s_dev[i], SENSOR_CHAN_DISTANCE, &d) != 0) {
+	struct vl53l5cx_grid g;
+	if (vl53l5cx_get_grid(s_dev[i], &g) != 0) {
 		return -1;
 	}
-	return (d.val1 > 0 && d.val1 < 4000) ? (int16_t)d.val1 : -1;   /* center-zone mm */
+	int side = (g.resolution == 64) ? 8 : 4;   /* 8x8 or 4x4 */
+	int n = WALL_CLEAR_ROWS * side;             /* leading zones = top WALL_CLEAR_ROWS rows */
+	if (n > g.resolution) {
+		n = g.resolution;
+	}
+	int32_t sum = 0;
+	int cnt = 0;
+	for (int z = 0; z < n; z++) {
+		if (g.target_status[z] == 5 && g.distance_mm[z] > 0) {   /* 5 = valid; else out-of-range */
+			sum += g.distance_mm[z];
+			cnt++;
+		}
+	}
+	return (cnt > 0) ? (int16_t)(sum / cnt) : -1;
 }
+
+#if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
+#include <stdio.h>
+/* Stream the full flattened grid for one sensor (uses the last read_one() fetch). One line per
+ * sensor: "GRID <name>: v0 v1 ... vN" row-major, distance_mm where target_status==5 (valid) else -1.
+ * For occlusion mapping via the live heatmap; enabled only in validation builds (-DROSE_BUMPER_GRID=1). */
+static void dump_grid(int i)
+{
+	struct vl53l5cx_grid g;
+	if (!g_running[i] || vl53l5cx_get_grid(s_dev[i], &g) != 0) {
+		return;
+	}
+	int n = (g.resolution <= 64) ? g.resolution : 64;
+	char buf[480];
+	int off = snprintf(buf, sizeof(buf), "GRID %s:", s_name[i]);
+	for (int z = 0; z < n && off < (int)sizeof(buf) - 8; z++) {
+		int16_t v = (g.target_status[z] == 5) ? g.distance_mm[z] : -1;   /* 5 = valid */
+		off += snprintf(buf + off, sizeof(buf) - off, " %d", v);
+	}
+	printk("%s\n", buf);
+}
+#endif
 
 static void side_thread_fn(void *a, void *b, void *c)
 {
@@ -124,6 +167,13 @@ static void side_thread_fn(void *a, void *b, void *c)
 		g_walls.left_mm = lf;  g_walls.right_mm = rt;
 		g_walls.seq++;
 		k_mutex_unlock(&g_walls_mtx);
+#if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
+		for (int i = 0; i < N_SIDE; i++) {
+			dump_grid(i);
+		}
+		/* the derived wall distances the controller will actually use (rows0-1 valid average) */
+		printk("WALL: front=%d back=%d left=%d right=%d\n", fr, bk, lf, rt);
+#endif
 		k_msleep(30);   /* ~30 Hz aggregate; sensors range at ~15 Hz (8x8) */
 	}
 }
