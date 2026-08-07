@@ -107,13 +107,35 @@ int flightlog_init(void)
 		return rc;
 	}
 	g_area_size = (uint32_t)g_fa->fa_size;
+#if defined(ROSE_FLIGHTLOG_ERASE) && ROSE_FLIGHTLOG_ERASE
+	/* Explicit fresh start: wipe the partition. Build with -DROSE_FLIGHTLOG_ERASE=1 once to clear. */
 	rc = flash_area_erase(g_fa, 0, g_area_size);
 	if (rc) {
 		printk("flightlog: erase failed (%d)\n", rc);
 		return rc;
 	}
 	g_write_off = 0;
-	g_full = false;
+	printk("flightlog: erased (fresh session)\n");
+#else
+	/* APPEND mode (default): resume after the existing log so it SURVIVES resets/power-glitches --
+	 * scan for the first erased (0xFF) record and continue there. Prevents a reboot from wiping the
+	 * previous flight. Clear explicitly with -DROSE_FLIGHTLOG_ERASE=1 when you want a clean slate. */
+	g_write_off = g_area_size;   /* default: full, if we don't find a gap */
+	struct flight_rec probe;
+	for (uint32_t off = 0; off + REC_SIZE <= g_area_size; off += REC_SIZE) {
+		if (flash_area_read(g_fa, off, &probe, REC_SIZE) != 0) {
+			g_write_off = off;
+			break;
+		}
+		if (probe.t_ms == 0xFFFFFFFFu) {   /* first unwritten slot -> append here */
+			g_write_off = off;
+			break;
+		}
+	}
+	printk("flightlog: append mode, resuming at offset %u (%u recs already stored)\n",
+	       g_write_off, g_write_off / REC_SIZE);
+#endif
+	g_full = (g_write_off + REC_SIZE > g_area_size);
 	g_dropped = 0;
 	g_flush_req = false;
 	g_run = true;
