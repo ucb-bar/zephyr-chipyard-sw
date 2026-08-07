@@ -899,8 +899,9 @@ int main(void)
 		 * send_control() gates motors on g_armed the entire time. */
 		{
 			static bool     announced;
-			static int64_t  arm_since;   /* ms since arm conditions held (0 = not yet) */
-			if (!g_armed && !g_estop) {
+			static int64_t  arm_since;    /* ms since arm conditions held (0 = not yet) */
+			static bool     flight_done;  /* one-shot: latch after a completed flight, no auto re-arm */
+			if (!g_armed && !g_estop && !flight_done) {
 				bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
 					      fabsf(state[4]) < ARM_MAX_TILT_RAD;
 				bool ground = f.tof_valid && state[2] < ARM_MAX_HEIGHT_M;
@@ -955,8 +956,10 @@ int main(void)
 				float zsp = autoflight_setpoint_z(tf);
 				if (zsp < 0.0f || tf >= FLIGHT_MAX_MS) {
 					g_armed = false;
+					flight_done = true;   /* one-shot: don't auto re-arm (reset to fly again) */
 					g_setpoint[2] = 0.0f;
-					printk("AUTOFLIGHT: flight complete (%d ms) -- motors OFF\n", (int)tf);
+					printk("AUTOFLIGHT: flight complete (%d ms) -- motors OFF (reset to fly again)\n",
+					       (int)tf);
 				} else {
 					g_setpoint[2] = zsp;
 				}
