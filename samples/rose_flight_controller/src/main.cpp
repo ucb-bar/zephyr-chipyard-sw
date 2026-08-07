@@ -178,6 +178,9 @@ SYS_INIT(board_sensor_init, POST_KERNEL, 80);   /* before CONFIG_SENSOR_INIT_PRI
 #ifndef SAFE_MAX_VEL_MPS
 #define SAFE_MAX_VEL_MPS    2.5f     /* runaway translational velocity */
 #endif
+#ifndef SAFE_MAX_HEIGHT_M
+#define SAFE_MAX_HEIGHT_M   2.0f     /* altitude ceiling: cut before hitting the ceiling */
+#endif
 #ifndef SAFE_MAX_IMU_MISS
 #define SAFE_MAX_IMU_MISS   10       /* consecutive IMU read failures => sensor lost */
 #endif
@@ -198,6 +201,9 @@ static const char *safety_violation(const float *state, const float *gyro)
 	if (fabsf(state[6]) > SAFE_MAX_VEL_MPS || fabsf(state[7]) > SAFE_MAX_VEL_MPS ||
 	    fabsf(state[8]) > SAFE_MAX_VEL_MPS) {
 		return "velocity";
+	}
+	if (state[2] > SAFE_MAX_HEIGHT_M) {   /* z = altitude (up); one-sided ceiling guard */
+		return "height";
 	}
 	return NULL;
 }
