@@ -997,7 +997,11 @@ int main(void)
 			pf_est = pf_ctrl = pf_send = pf_iters = 0;
 		}
 #endif
+#if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
+		if (0) {   /* grid-validation build: suppress periodic telemetry so GRID lines own the console */
+#else
 		if ((iter % 10) == 0) {
+#endif
 #if defined(ROSE_IMU_DEBUG) && ROSE_IMU_DEBUG
 			/* Body-frame IMU dump for the axis/sign tilt test (see IMU_REMAP note). */
 			printk("flight_controller: iter=%d a=[%s%d.%03d %s%d.%03d %s%d.%03d] "
