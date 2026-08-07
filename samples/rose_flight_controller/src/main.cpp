@@ -245,8 +245,8 @@ static const bool    g_armed = true;
 #define T_DESCEND_MS        1500    /* ramp setpoint HOVER_Z_M -> 0 */
 #endif
 #ifndef LAND_PUSH_M
-#define LAND_PUSH_M        -0.10f   /* after the descend ramp, hold this below-ground setpoint so the
-				     * altitude loop keeps gently descending until real touchdown */
+#define LAND_PUSH_M        -0.20f   /* floor of the continuous below-ground descent ramp: the setpoint
+				     * keeps easing down past 0 to here so the loop descends to touchdown */
 #endif
 #ifndef LAND_Z_THRESH_M
 #define LAND_Z_THRESH_M     0.05f   /* considered landed (cut motors) when actual height < this */
@@ -450,10 +450,12 @@ static float autoflight_setpoint_z(int64_t t_ms)
 		return HOVER_Z_M;
 	}
 	t_ms -= T_HOVER_MS;
-	if (t_ms < T_DESCEND_MS) {
-		return HOVER_Z_M * (1.0f - (float)t_ms / (float)T_DESCEND_MS);
-	}
-	return LAND_PUSH_M;   /* landing: hold a below-ground setpoint so it keeps descending to touchdown */
+	/* Descent + landing as ONE continuous downward ramp: from HOVER_Z_M, reaching 0 at T_DESCEND_MS
+	 * and then continuing GRADUALLY below ground at the same rate, so the loop keeps easing down to a
+	 * real touchdown; clamp at the LAND_PUSH_M floor. (Motor cut is height-based, in the loop.) */
+	float rate = HOVER_Z_M / (float)T_DESCEND_MS;   /* reach 0 at T_DESCEND, keep going negative */
+	float sp = HOVER_Z_M - rate * (float)t_ms;
+	return (sp < LAND_PUSH_M) ? LAND_PUSH_M : sp;
 }
 #endif
 
