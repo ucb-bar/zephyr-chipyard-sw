@@ -187,6 +187,54 @@ SYS_INIT(board_sensor_init, POST_KERNEL, 80);   /* before CONFIG_SENSOR_INIT_PRI
 #endif
 static volatile bool g_estop;        /* latched emergency stop (cleared only by reset) */
 
+/* Arm gate: motors actuate only when armed. Non-autoflight builds are always armed (normal bench
+ * behavior); autoflight starts DISARMED and arms via the on-ground/level check (see below). */
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+static volatile bool g_armed;         /* set true by the arming check; false before/after flight */
+static int64_t       g_flight_start_ms;
+#else
+static const bool    g_armed = true;
+#endif
+
+/* ---- Autonomous short-hop flight (build -DROSE_AUTOFLIGHT=1) ---------------------------------
+ * After reset: settle ARM_SETTLE_MS, then arm ONLY if level + on the ground + still. Once armed,
+ * fly a fixed altitude profile (ramp-up -> hover -> ramp-down) with a hard FLIGHT_MAX_MS cap, then
+ * disarm. There is NO x/y position control on this board (no optical flow) -> expect horizontal
+ * drift, so keep the hop short + low. The emergency watchdog stays live throughout, and motors run
+ * at FAITHFUL duty (needed to actually hover) clamped to AUTOFLIGHT_MAX_DUTY as a safety ceiling. */
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+#ifndef ARM_SETTLE_MS
+#define ARM_SETTLE_MS       3000    /* settle + step-back window before the arming check */
+#endif
+#ifndef ARM_MAX_TILT_RAD
+#define ARM_MAX_TILT_RAD    0.10f   /* must be level (~5.7 deg) to arm */
+#endif
+#ifndef ARM_MAX_HEIGHT_M
+#define ARM_MAX_HEIGHT_M    0.020f  /* must be on the ground (<20 mm) to arm */
+#endif
+#ifndef ARM_MAX_RATE_RADPS
+#define ARM_MAX_RATE_RADPS  0.30f   /* must be still to arm */
+#endif
+#ifndef HOVER_Z_M
+#define HOVER_Z_M           0.30f   /* hover altitude target */
+#endif
+#ifndef T_CLIMB_MS
+#define T_CLIMB_MS          1500    /* ramp setpoint 0 -> HOVER_Z_M */
+#endif
+#ifndef T_HOVER_MS
+#define T_HOVER_MS          2500    /* hold */
+#endif
+#ifndef T_DESCEND_MS
+#define T_DESCEND_MS        1500    /* ramp setpoint HOVER_Z_M -> 0 */
+#endif
+#ifndef FLIGHT_MAX_MS
+#define FLIGHT_MAX_MS       10000   /* hard cap regardless of the profile */
+#endif
+#ifndef AUTOFLIGHT_MAX_DUTY
+#define AUTOFLIGHT_MAX_DUTY 0.45f   /* per-motor duty ceiling in flight (hover~0.15; margin above) */
+#endif
+#endif /* ROSE_AUTOFLIGHT */
+
 /* Returns a short reason if any safety limit is exceeded (state = 12-DoF body state, gyro = body
  * rates rad/s), else NULL. Attitude from the estimate; rate straight from the gyro (no filter lag);
  * velocity from the estimate. */
@@ -249,8 +297,8 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
 #endif
 static void send_control(const float *u)
 {
-	/* Emergency cutoff: once latched, force every motor to 0 and ignore the command entirely. */
-	if (g_estop) {
+	/* Emergency cutoff OR disarmed: force every motor to 0 and ignore the command entirely. */
+	if (g_estop || !g_armed) {
 		for (int i = 0; i < NACTIONS; i++) {
 			pwm_set_pulse_dt(&motors[i], 0);
 		}
@@ -273,12 +321,18 @@ static void send_control(const float *u)
 	}
 #endif
 	for (int i = 0; i < NACTIONS; i++) {
-		/* normalized thrust u in ~[-0.583, 0.417] -> [0,1] duty */
+		/* normalized thrust u in ~[-0.583, 0.417] -> [0,1] the controller's physical duty command */
 		float duty = u[i] + 0.583f;
 		if (duty < 0.0f) duty = 0.0f;
 		if (duty > 1.0f) duty = 1.0f;
-		duty *= MOTOR_MAX_DUTY;                            /* scale [0,1] -> [0, cap] */
-		if (duty > MOTOR_MAX_DUTY) duty = MOTOR_MAX_DUTY;  /* absolute backstop */
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+		/* Flight: apply the command FAITHFULLY (so hover ~15% is actually reached) but CLAMP the
+		 * max as a safety ceiling. Do NOT scale -- scaling would push hover below flyable thrust. */
+		if (duty > AUTOFLIGHT_MAX_DUTY) duty = AUTOFLIGHT_MAX_DUTY;
+#else
+		duty *= MOTOR_MAX_DUTY;                            /* bench: scale [0,1] -> [0, cap] */
+		if (duty > MOTOR_MAX_DUTY) duty = MOTOR_MAX_DUTY;  /* (stays sub-hover; can't fly) */
+#endif
 		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * duty));
 	}
 }
@@ -340,7 +394,29 @@ static IController &ctrl = active_controller();
 #define ROSE_CTRL_DIV 1        /* control runs every Nth estimator tick (1 = same rate) */
 #endif
 
-static const float g_setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
+/* Hover setpoint. Non-const so autoflight can drive g_setpoint[2] (altitude) along its profile;
+ * on non-autoflight builds it stays at TARGET_Z. */
+static float g_setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
+
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+/* Desired altitude vs time-since-arm (ms): ramp up -> hold -> ramp down. Returns <0 when the
+ * profile is complete (caller then disarms). */
+static float autoflight_setpoint_z(int64_t t_ms)
+{
+	if (t_ms < T_CLIMB_MS) {
+		return HOVER_Z_M * ((float)t_ms / (float)T_CLIMB_MS);
+	}
+	t_ms -= T_CLIMB_MS;
+	if (t_ms < T_HOVER_MS) {
+		return HOVER_Z_M;
+	}
+	t_ms -= T_HOVER_MS;
+	if (t_ms < T_DESCEND_MS) {
+		return HOVER_Z_M * (1.0f - (float)t_ms / (float)T_DESCEND_MS);
+	}
+	return -1.0f;   /* profile done */
+}
+#endif
 
 struct sensor_frame {
 	float accel[3], gyro[3], flow[2], height;
@@ -769,6 +845,55 @@ int main(void)
 #endif
 			}
 		}
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+		/* Arming + flight state machine. Disarmed until the settle window elapses AND the vehicle
+		 * is level + on the ground + still; then fly the altitude profile until it completes or the
+		 * hard cap, then disarm. send_control() gates motors on g_armed the entire time. */
+		{
+			static bool arm_checked;
+			static int  last_cd = -1;
+			if (!g_armed && !arm_checked && !g_estop) {
+				if (t_now < ARM_SETTLE_MS) {
+					int cd = (int)((ARM_SETTLE_MS - t_now) / 1000) + 1;
+					if (cd != last_cd) {
+						last_cd = cd;
+						printk("AUTOFLIGHT: arming in %d... (place level on ground, step back)\n",
+						       cd);
+					}
+				} else {
+					arm_checked = true;
+					bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
+						      fabsf(state[4]) < ARM_MAX_TILT_RAD;
+					bool ground = f.tof_valid && state[2] < ARM_MAX_HEIGHT_M;
+					bool still  = fabsf(f.gyro[0]) < ARM_MAX_RATE_RADPS &&
+						      fabsf(f.gyro[1]) < ARM_MAX_RATE_RADPS &&
+						      fabsf(f.gyro[2]) < ARM_MAX_RATE_RADPS;
+					if (level && ground && still) {
+						g_armed = true;
+						g_flight_start_ms = t_now;
+						printk("AUTOFLIGHT: ARMED -- taking off (hover %d mm, cap %d ms)\n",
+						       (int)(HOVER_Z_M * 1000.0f), (int)FLIGHT_MAX_MS);
+					} else {
+						printk("AUTOFLIGHT: NOT ARMED (level=%d ground=%d still=%d; "
+						       "roll=%s%d.%03d pitch=%s%d.%03d z=%s%d.%03d) -- motors stay OFF\n",
+						       level, ground, still,
+						       FP3(state[3]), FP3(state[4]), FP3(state[2]));
+					}
+				}
+			}
+			if (g_armed) {
+				int64_t tf = t_now - g_flight_start_ms;
+				float zsp = autoflight_setpoint_z(tf);
+				if (zsp < 0.0f || tf >= FLIGHT_MAX_MS) {
+					g_armed = false;
+					g_setpoint[2] = 0.0f;
+					printk("AUTOFLIGHT: flight complete (%d ms) -- motors OFF\n", (int)tf);
+				} else {
+					g_setpoint[2] = zsp;
+				}
+			}
+		}
+#endif
 		uint32_t _pc = PF_NOW();
 		solve_control(state, u, dt);
 		PF_ACC(pf_ctrl, _pc);
