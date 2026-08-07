@@ -197,14 +197,22 @@ static const bool    g_armed = true;
 #endif
 
 /* ---- Autonomous short-hop flight (build -DROSE_AUTOFLIGHT=1) ---------------------------------
- * After reset: settle ARM_SETTLE_MS, then arm ONLY if level + on the ground + still. Once armed,
- * fly a fixed altitude profile (ramp-up -> hover -> ramp-down) with a hard FLIGHT_MAX_MS cap, then
- * disarm. There is NO x/y position control on this board (no optical flow) -> expect horizontal
- * drift, so keep the hop short + low. The emergency watchdog stays live throughout, and motors run
- * at FAITHFUL duty (needed to actually hover) clamped to AUTOFLIGHT_MAX_DUTY as a safety ceiling. */
+ * On boot: a motor "chirp" (see motors_boot_chirp) alerts that the board reset. Arming then
+ * requires a deliberate LIFT-AND-PLACE gesture (pick up > LIFT_ARM_THRESHOLD_M, set down level +
+ * on-ground + still for PLACE_CONFIRM_MS) so a glitch reboot on the bench can't auto-take-off.
+ * Once armed, fly a fixed altitude profile (ramp-up -> hover -> ramp-down) with a hard FLIGHT_MAX_MS
+ * cap, then disarm. There is NO x/y position control on this board (no optical flow) -> expect
+ * horizontal drift, so keep the hop short + low. The emergency watchdog stays live throughout, and
+ * motors run at FAITHFUL duty (needed to hover) clamped to AUTOFLIGHT_MAX_DUTY as a safety ceiling. */
 #if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
-#ifndef ARM_SETTLE_MS
-#define ARM_SETTLE_MS       3000    /* settle + step-back window before the arming check */
+/* Arm gate = lift-and-place gesture: the drone must be PICKED UP (down-ToF > LIFT_ARM_THRESHOLD_M)
+ * and then SET DOWN level + on-ground + still, held for PLACE_CONFIRM_MS, before it arms. A glitch
+ * reboot on a stationary bench never sees the lift -> never auto-arms (a boot chirp still alerts).*/
+#ifndef LIFT_ARM_THRESHOLD_M
+#define LIFT_ARM_THRESHOLD_M 0.15f  /* must be lifted above this (m) to enable arming */
+#endif
+#ifndef PLACE_CONFIRM_MS
+#define PLACE_CONFIRM_MS     1500   /* level+ground+still must hold this long after placing */
 #endif
 #ifndef ARM_MAX_TILT_RAD
 #define ARM_MAX_TILT_RAD    0.10f   /* must be level (~5.7 deg) to arm */
@@ -277,6 +285,7 @@ static void send_control(const float *u)
 	}
 }
 static void motors_startup_pulse(void) { /* no motors on the RoSE target */ }
+static void motors_boot_chirp(void) { /* no motors on the RoSE target */ }
 #else /* real target: drive 4 PWM motors (thrust ~ duty). Actuator parity is future work. */
 #include <zephyr/drivers/pwm.h>
 #define MOTORS_NODE DT_ALIAS(motors)
@@ -352,9 +361,23 @@ static void motors_startup_pulse(void)
 	k_msleep(400);   /* settle gap so the pulse is distinct from the first tilt motion */
 #endif
 }
+/* Boot chirp: sequentially spin motors 1-2-3-4 at 10% duty for 0.25 s each. A deliberate, low
+ * (sub-hover) alert so the operator KNOWS the board just reset -- important because a glitch reboot
+ * (BU-009) is otherwise silent, and combined with the lift-and-place arm gate it makes "the board
+ * rebooted" obvious. Runs once at boot, before arming; drives PWM directly (motors still disarmed). */
+static void motors_boot_chirp(void)
+{
+	for (int i = 0; i < NACTIONS; i++) {
+		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * 0.10f));
+		k_msleep(250);
+		pwm_set_pulse_dt(&motors[i], 0);
+		k_msleep(100);
+	}
+}
 #else
 static void send_control(const float *u) { (void)u; /* no actuator bound */ }
 static void motors_startup_pulse(void) { /* no motors bound */ }
+static void motors_boot_chirp(void) { /* no motors bound */ }
 #endif
 #endif
 
@@ -747,6 +770,9 @@ int main(void)
 #endif
 
 	motors_startup_pulse();   /* optional boot "go" signal (ROSE_START_PULSE_MS); no-op if unset */
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	motors_boot_chirp();      /* reset alert: sequential 1-2-3-4 motor spin at 10% (see lift-and-place gate) */
+#endif
 
 #if DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
 	/* The st,vl53l1x driver defers the full ST boot (DataInit/StaticInit); nothing runs it unless
@@ -846,39 +872,41 @@ int main(void)
 			}
 		}
 #if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
-		/* Arming + flight state machine. Disarmed until the settle window elapses AND the vehicle
-		 * is level + on the ground + still; then fly the altitude profile until it completes or the
-		 * hard cap, then disarm. send_control() gates motors on g_armed the entire time. */
+		/* Arming = LIFT-AND-PLACE gesture (glitch-reboot-safe): must be picked up past
+		 * LIFT_ARM_THRESHOLD_M, then set down level + on-ground + still held for PLACE_CONFIRM_MS.
+		 * Then fly the altitude profile until it completes or the hard cap, then disarm.
+		 * send_control() gates motors on g_armed the entire time. */
 		{
-			static bool arm_checked;
-			static int  last_cd = -1;
-			if (!g_armed && !arm_checked && !g_estop) {
-				if (t_now < ARM_SETTLE_MS) {
-					int cd = (int)((ARM_SETTLE_MS - t_now) / 1000) + 1;
-					if (cd != last_cd) {
-						last_cd = cd;
-						printk("AUTOFLIGHT: arming in %d... (place level on ground, step back)\n",
-						       cd);
-					}
-				} else {
-					arm_checked = true;
-					bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
-						      fabsf(state[4]) < ARM_MAX_TILT_RAD;
-					bool ground = f.tof_valid && state[2] < ARM_MAX_HEIGHT_M;
-					bool still  = fabsf(f.gyro[0]) < ARM_MAX_RATE_RADPS &&
-						      fabsf(f.gyro[1]) < ARM_MAX_RATE_RADPS &&
-						      fabsf(f.gyro[2]) < ARM_MAX_RATE_RADPS;
-					if (level && ground && still) {
+			static bool     lifted;
+			static bool     announced;
+			static int64_t  place_since;   /* ms since placed+level+still (0 = not yet) */
+			if (!g_armed && !g_estop) {
+				if (!announced) {
+					announced = true;
+					printk("AUTOFLIGHT: lift-and-place to arm -- pick up (>%d mm), set level on "
+					       "ground, hold still\n", (int)(LIFT_ARM_THRESHOLD_M * 1000.0f));
+				}
+				if (f.tof_valid && f.height > LIFT_ARM_THRESHOLD_M && !lifted) {
+					lifted = true;
+					printk("AUTOFLIGHT: lift detected -- now set level on the ground and hold still\n");
+				}
+				bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
+					      fabsf(state[4]) < ARM_MAX_TILT_RAD;
+				bool ground = f.tof_valid && state[2] < ARM_MAX_HEIGHT_M;
+				bool still  = fabsf(f.gyro[0]) < ARM_MAX_RATE_RADPS &&
+					      fabsf(f.gyro[1]) < ARM_MAX_RATE_RADPS &&
+					      fabsf(f.gyro[2]) < ARM_MAX_RATE_RADPS;
+				if (lifted && level && ground && still) {
+					if (place_since == 0) {
+						place_since = t_now;
+					} else if (t_now - place_since >= PLACE_CONFIRM_MS) {
 						g_armed = true;
 						g_flight_start_ms = t_now;
 						printk("AUTOFLIGHT: ARMED -- taking off (hover %d mm, cap %d ms)\n",
 						       (int)(HOVER_Z_M * 1000.0f), (int)FLIGHT_MAX_MS);
-					} else {
-						printk("AUTOFLIGHT: NOT ARMED (level=%d ground=%d still=%d; "
-						       "roll=%s%d.%03d pitch=%s%d.%03d z=%s%d.%03d) -- motors stay OFF\n",
-						       level, ground, still,
-						       FP3(state[3]), FP3(state[4]), FP3(state[2]));
 					}
+				} else {
+					place_since = 0;   /* condition broke -> restart the hold timer */
 				}
 			}
 			if (g_armed) {
