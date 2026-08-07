@@ -112,8 +112,8 @@ int main(void)
 		}
 		struct sensor_value d;
 		sensor_channel_get(front, SENSOR_CHAN_DISTANCE, &d);
-		int mm = d.val1 * 1000 + d.val2 / 1000;
-		printk("side_tof: FRONT center = %d mm\n", mm);
+		/* The VL53L5CX driver returns the center-zone distance in mm directly in val1. */
+		printk("side_tof: FRONT center = %d mm\n", d.val1);
 		k_msleep(100);   /* ~10 Hz print */
 	}
 	return 0;
