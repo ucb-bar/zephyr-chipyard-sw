@@ -28,6 +28,15 @@ struct MahonyAttitude {
 		kp = 0.5f;
 	}
 
+	/* One-time heading calibration: seed a LEVEL quaternion at yaw = psi (roll=pitch=0).
+	 * The Mahony filter has no absolute yaw reference (gyro-only), so on the co-sim spawn we
+	 * calibrate the initial heading to the known takeoff yaw ONCE; the gyro then carries it
+	 * forward closed-loop. Mirrors the tof-based z-init -- a one-time seed, NOT continuous GT. */
+	void set_yaw(float psi)
+	{
+		qw = cosf(0.5f * psi); qx = 0.0f; qy = 0.0f; qz = sinf(0.5f * psi);
+	}
+
 	/* Advance the quaternion with body rate + gated gravity trim. */
 	void update(const float accel[3], const float gyro[3], float dt)
 	{

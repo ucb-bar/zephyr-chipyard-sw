@@ -35,8 +35,15 @@
 #define NACTIONS  4
 
 #define CTRL_DT      0.005f
+/* Estimator init altitude + hover target. Override with -DSTART_Z=.. -DTARGET_Z=.. so the
+ * on-SoC EKF can be initialized at the co-sim spawn height (avoids a huge ToF innovation
+ * transient) and the controller can hold the warehouse cruise altitude (~2.0 m). */
+#ifndef START_Z
 #define START_Z      0.9f
+#endif
+#ifndef TARGET_Z
 #define TARGET_Z     1.0f
+#endif
 #ifndef CTRL_ITERS
 #define CTRL_ITERS   6000
 #endif
@@ -151,6 +158,10 @@ static const struct device *tof_r = DEVICE_DT_GET(DT_ALIAS(tof_right));
 static const struct device *tof_b = DEVICE_DT_GET(DT_ALIAS(tof_back));
 static const struct device *tof_l = DEVICE_DT_GET(DT_ALIAS(tof_left));
 static bool g_have_walls;
+/* Altitude-hold setpoint (m). Defaults to TARGET_Z but is set to the measured spawn altitude at
+ * startup (see main) so a hover holds where it starts — z-error≈0 → u≈hover — instead of being
+ * commanded a step it over-reacts to. */
+static float g_target_z = TARGET_Z;
 
 /* Actuator-command staleness instrumentation: max mtime gap between consecutive send_control()
  * calls. In the single loop an inline vision inference blocks the loop, so the gap spikes to the
@@ -170,18 +181,32 @@ static inline void track_send_gap(void)
 	g_send_n++;
 }
 
+/* GT-STATE isolating test (-DROSE_GT_STATE=1): feed TinyMPC the drone's TRUE 12-vec state
+ * from the sim (cmd 0x16) instead of the on-SoC estimator, to separate plant/controller from
+ * estimator issues (mirrors IsaacCrazyflieMPCEnv's validated GT-state->TinyMPC->hover). */
+#ifndef ROSE_GT_STATE
+#define ROSE_GT_STATE 0
+#endif
 #define HAVE_ROSE DT_HAS_COMPAT_STATUS_OKAY(ucbbar_roseadapter)
 #if HAVE_ROSE
 #include <rose/rose.h>
+#include <rose/rose_proto.h>
 #define ROSE_CMD_CONTROL 0x20u
+#define ROSE_CMD_GT_STATE 0x16u
 static const struct device *rose = DEVICE_DT_GET_ONE(ucbbar_roseadapter);
 static void send_control(const float *u)
 {
 	rose_tx(rose, ROSE_CMD_CONTROL);
 	rose_tx(rose, NACTIONS * sizeof(float));
 	for (int i = 0; i < NACTIONS; i++) {
+		/* Clamp to TinyMPC's actuator box [u_min,u_max]=[-0.583,+0.417] before actuating, so
+		 * the applied thrust never exceeds the physical motor range even if the solver's
+		 * box constraint isn't tight this iteration (n = u+0.583 in [0,1]). */
+		float uc = u[i];
+		if (uc < -0.583f) uc = -0.583f;
+		if (uc >  0.417f) uc =  0.417f;
 		uint32_t w;
-		memcpy(&w, &u[i], sizeof(float));
+		memcpy(&w, &uc, sizeof(float));
 		rose_tx(rose, w);
 	}
 	track_send_gap();
@@ -315,7 +340,7 @@ static void run_estimator(const struct nav_frame *f, float *state)
 static void solve_nav(int iter, const float *state, float steer, float collision,
 		      float *u, float *logcmd)
 {
-	float setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
+	float setpoint[NSTATES] = {0.0f, 0.0f, g_target_z, 0,0,0, 0,0,0, 0,0,0};
 	float err[NSTATES];
 	(void)steer; (void)collision;
 #if ROSE_DRONET_NAV
@@ -503,7 +528,28 @@ int main(void)
 		       device_is_ready(tof_b) && device_is_ready(tof_l);
 	enable_vector_operations();
 	mpc_init();
-	est.init(0.0f, 0.0f, START_Z);
+	/* Initialize the EKF altitude to the FIRST measured down-ToF height (= the actual spawn
+	 * altitude) instead of the fixed START_Z, so there is NO large ToF innovation transient for
+	 * any co-sim seed. Force past the ToF driver's decimation so the first fetch actually ranges. */
+	float init_z = START_Z;
+#if HAVE_TOF
+	if (device_is_ready(tof_dev)) {
+		for (int k = 0; k < 12; k++) {
+			if (sensor_sample_fetch(tof_dev) == 0) {
+				struct sensor_value hv;
+				if (sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &hv) == 0) {
+					init_z = (float)sensor_value_to_double(&hv);
+				}
+				break;
+			}
+		}
+	}
+#endif
+	est.init(0.0f, 0.0f, init_z);
+	g_target_z = init_z;   /* HOVER holds the spawn altitude (z-error≈0), not a step it over-reacts to */
+	printk("nav_controller: EKF init z=%d.%03d m, hover_target=%d.%03d m (measured down-tof)\n",
+	       (int)init_z, ((int)(init_z * 1000)) % 1000,
+	       (int)g_target_z, ((int)(g_target_z * 1000)) % 1000);
 
 #if ROSE_DRONET_NAV
 	const struct device *cam = DEVICE_DT_GET(DRONET_CAM_NODE);
@@ -536,12 +582,24 @@ int main(void)
 	/* ---- single loop (A/B baseline) ---- */
 	float state[NSTATES], u[NACTIONS];
 	for (int iter = 0; iter < CTRL_ITERS; iter++) {
+#if ROSE_GT_STATE
+		/* GT-STATE test: TinyMPC on the sim's TRUE 12-vec state (bypass the estimator). */
+		{
+			uint32_t sb[NSTATES];
+			rose_request(rose, ROSE_CMD_GT_STATE, 0u);
+			int got = rose_recv_reqrsp(rose, 1, sb, NSTATES);
+			for (int i = 0; i < NSTATES && i < got; i++) {
+				memcpy(&state[i], &sb[i], sizeof(float));
+			}
+		}
+#else
 		struct nav_frame f;
 		if (!read_nav_frame(&f)) {
 			printk("nav_controller: IMU fetch error\n");
 			continue;
 		}
 		run_estimator(&f, state);
+#endif
 
 		float steer = 0.0f, collision = 0.5f;
 #if ROSE_DRONET_NAV
