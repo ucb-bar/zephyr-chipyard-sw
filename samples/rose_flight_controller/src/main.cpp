@@ -33,6 +33,12 @@
 #include "estimator.hpp"
 #include "controller.hpp"
 #include "flightlog.h"
+#include "side_tof.h"           /* side-ToF wall "bumper" (ROSE_BUMPER); no-op if disabled */
+
+/* Repulsion bridge into the PID controller (defined in controller_pid.cpp). Feeding walls only has
+ * an effect when the PID controller is active + built with ROSE_BUMPER; harmless otherwise. */
+extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
+			      int16_t left_mm, int16_t right_mm, bool valid);
 
 #define NSTATES   12
 #define NACTIONS  4
@@ -796,6 +802,17 @@ int main(void)
 #endif
 #endif
 
+#if defined(ROSE_BUMPER) && ROSE_BUMPER
+	/* Bring up the 4 side VL53L5CX wall sensors (readdress 0x31-0x34 via ADS7128, then read on a
+	 * background thread). Runs AFTER the down-ToF reinit so the ADS7128 GPIO6 rail is already set and
+	 * we only touch GPIO1-4. Adds ~12 s to boot (4x firmware upload). The control loop reads the
+	 * cached snapshot non-blocking via side_tof_get(). */
+	{
+		int n = side_tof_init();
+		printk("flight_controller: side-ToF bumper: %d/4 sensors up\n", n);
+	}
+#endif
+
 #if TOF_THREADED
 	/* Start the down-ToF fetcher AFTER vl53l1x_reinit so it never fetches an uninitialized device.
 	 * Priority below the main control loop (higher number) -- it mostly blocks on I2C anyway, and
@@ -922,6 +939,20 @@ int main(void)
 			}
 		}
 #endif
+#if defined(ROSE_BUMPER) && ROSE_BUMPER
+		/* Feed the latest cached wall snapshot into the controller's repulsion term. Non-blocking:
+		 * side_tof_get() just copies a mutex-protected struct the background thread updates. Only
+		 * apply while armed/flying -- on the ground a lean command would fight the arm gesture. */
+		{
+			struct side_walls w;
+			side_tof_get(&w);
+			bool apply = (w.seq != 0);
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+			apply = apply && g_armed;
+#endif
+			pid_set_walls(w.front_mm, w.back_mm, w.left_mm, w.right_mm, apply);
+		}
+#endif
 		uint32_t _pc = PF_NOW();
 		solve_control(state, u, dt);
 		PF_ACC(pf_ctrl, _pc);
@@ -981,6 +1012,16 @@ int main(void)
 			       iter, (int)(dt * 1000.0f + 0.5f),
 			       FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
 			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]));
+#endif
+#if defined(ROSE_BUMPER) && ROSE_BUMPER
+			/* Wall distances (mm; -1 = no target/no wall) so bring-up + facing can be verified on
+			 * the ground (hand-wave each side) before flight. Repulsion itself is armed-gated above. */
+			{
+				struct side_walls w;
+				side_tof_get(&w);
+				printk("  walls[seq=%u]: front=%d back=%d left=%d right=%d\n",
+				       w.seq, w.front_mm, w.back_mm, w.left_mm, w.right_mm);
+			}
 #endif
 		}
 		/* send_control() is issued (and timed) above, before this telemetry print. */

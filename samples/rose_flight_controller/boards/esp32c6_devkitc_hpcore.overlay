@@ -84,6 +84,35 @@
 		reg = <0x29>;
 		status = "okay";
 	};
+
+	/* 4 side-facing VL53L5CX wall sensors (bumper). All default to 0x29; side_tof.c enables each
+	 * via ADS7128 GPIO1-4 and readdresses to 0x31-0x34 at runtime, so the DT reg is the FINAL
+	 * address. Map: 0x31=GPIO1=J9=back, 0x32=GPIO2=J2=front, 0x33=GPIO3=J11=right, 0x34=GPIO4=J10=left. */
+	side_back: vl53l5cx@31 {
+		compatible = "st,vl53l5cx";
+		reg = <0x31>;
+	};
+	side_front: vl53l5cx@32 {
+		compatible = "st,vl53l5cx";
+		reg = <0x32>;
+	};
+	side_right: vl53l5cx@33 {
+		compatible = "st,vl53l5cx";
+		reg = <0x33>;
+	};
+	side_left: vl53l5cx@34 {
+		compatible = "st,vl53l5cx";
+		reg = <0x34>;
+	};
+};
+
+/ {
+	aliases {
+		side-back = &side_back;
+		side-front = &side_front;
+		side-right = &side_right;
+		side-left = &side_left;
+	};
 };
 
 &ledc0 {

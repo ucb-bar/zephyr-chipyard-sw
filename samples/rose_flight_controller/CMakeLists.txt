@@ -44,6 +44,9 @@ set(ROSE_ACTUATE_TIMEOUT_MS 0 CACHE STRING "stop motor actuation N ms after boot
 # Control-loop iteration count. Default 5000 suits the RoSE co-sim; on real HW the loop runs
 # ~1 kHz, so raise this for a longer bench run (e.g. 120000 ~= 2 min).
 set(CTRL_ITERS 5000 CACHE STRING "control-loop iteration count")
+# Side-ToF wall "bumper": 1 = bring up the 4 VL53L5CX + apply bounded wall-repulsion lean.
+# Adds ~12 s to boot (4x firmware upload). 0 = skip entirely (side_tof.c compiled but idle).
+set(ROSE_BUMPER 0 CACHE STRING "1=enable side-ToF wall bumper, 0=disabled")
 
 target_sources(app PRIVATE
   src/main.cpp
@@ -54,12 +57,14 @@ target_sources(app PRIVATE
   src/controller_pid.cpp
   src/controller_factory.cpp
   src/flightlog.c
+  src/side_tof.c
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_USE_PID=${ROSE_USE_PID}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
-  ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS})
+  ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
+  ROSE_BUMPER=${ROSE_BUMPER})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include
