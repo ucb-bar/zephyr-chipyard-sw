@@ -122,6 +122,18 @@ static float forceToVoltage(float forceNewtons)
 #define WALL_SIGN_Y       1.0f     /* flip to -1.0f if left/right push the wrong way */
 #endif
 
+/* Attitude trim (rad) added to the desired roll/pitch, to cancel the deterministic hover drift that
+ * the controller CANNOT observe: with no optical flow there is no horizontal-velocity feedback, so a
+ * small attitude/thrust bias makes the drone hover tilted and drift at a fixed rate. +ROLL_TRIM_RAD
+ * banks right (-y) to cancel a LEFT (+y) drift; +PITCH_TRIM_RAD noses forward (+x). Flip the sign if
+ * the drift grows. Tune per airframe via -DROLL_TRIM_RAD=<rad>. */
+#ifndef ROLL_TRIM_RAD
+#define ROLL_TRIM_RAD 0.0f
+#endif
+#ifndef PITCH_TRIM_RAD
+#define PITCH_TRIM_RAD 0.0f
+#endif
+
 struct pid_walls { int16_t front, back, left, right; bool valid; };
 static volatile struct pid_walls g_walls = {0, 0, 0, 0, false};
 
@@ -192,9 +204,9 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	const float desRoll  = -desAcc2 / gravity;
 	const float desPitch =  desAcc1 / gravity;
 
-	/* (3) attitude loop -> desired body rates */
-	const float roll_tgt  = desRoll;
-	const float pitch_tgt = desPitch;
+	/* (3) attitude loop -> desired body rates (+ static trim to cancel unobservable hover drift) */
+	const float roll_tgt  = desRoll  + ROLL_TRIM_RAD;
+	const float pitch_tgt = desPitch + PITCH_TRIM_RAD;
 	const float rollRate_tgt  = (-1.0f / tau_roll)  * (estRoll  - roll_tgt);
 	const float pitchRate_tgt = (-1.0f / tau_pitch) * (estPitch - pitch_tgt);
 	const float yawRate_tgt   = (-1.0f / tau_yaw)   * (estYaw   - yaw_tgt);
