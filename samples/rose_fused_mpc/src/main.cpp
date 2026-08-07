@@ -709,10 +709,15 @@ int main(void)
 		}
 	}
 #endif
-	est.init(0.0f, 0.0f, init_z);
+	est.init(0.0f, 0.0f, init_z);   /* EKF starts at the MEASURED spawn (no ToF innovation transient) */
 	est.set_init_yaw(START_YAW);   /* one-time takeoff-heading calibration (gyro-only yaw has no ref) */
-	g_target_z = init_z;   /* HOVER holds the spawn altitude (z-error≈0), not a step it over-reacts to */
-	printk("nav_controller: EKF init z=%d.%03d m, hover_target=%d.%03d m (measured down-tof), "
+	/* Hold the GATE-CENTERLINE / trained altitude (TARGET_Z, the FUSED_GATES centre z=2.0), NOT the
+	 * spawn height. The warehouse PLAY reset spawns ~2.5 m (pose_range +0.5 default offset), 0.5 m
+	 * ABOVE the gates -> the front camera sees each gate low in-frame (off-distribution vs the
+	 * expert/Stage-1 which flew altitude-hold to 2.0). Descending to 2.0 puts the gates centered in
+	 * frame (in-distribution) and threads them at the centerline. (Stage-1's TARGET_H=2.0 pattern.) */
+	g_target_z = TARGET_Z;
+	printk("nav_controller: EKF init z=%d.%03d m, hover_target=%d.%03d m (target=gate centerline), "
 	       "yaw_seed=%d mrad\n",
 	       (int)init_z, ((int)(init_z * 1000)) % 1000,
 	       (int)g_target_z, ((int)(g_target_z * 1000)) % 1000, (int)(START_YAW * 1000));
