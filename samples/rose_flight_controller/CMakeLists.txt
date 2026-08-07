@@ -53,6 +53,7 @@ target_sources(app PRIVATE
   src/controller_tinympc.cpp
   src/controller_pid.cpp
   src/controller_factory.cpp
+  src/flightlog.c
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}

@@ -32,6 +32,7 @@
 
 #include "estimator.hpp"
 #include "controller.hpp"
+#include "flightlog.h"
 
 #define NSTATES   12
 #define NACTIONS  4
@@ -647,12 +648,27 @@ static void ctrl_block(void *a, void *b, void *c)
 
 int main(void)
 {
+#if defined(ROSE_FLIGHTLOG_DUMP) && ROSE_FLIGHTLOG_DUMP
+	/* Dump-only build: read the stored flight log back over USB as CSV, then idle. Runs before any
+	 * sensor/actuator setup so it works even with the drone off the bench. */
+	k_msleep(500);   /* let USB CDC enumerate before we print */
+	printk("flight_controller: FLIGHTLOG DUMP MODE\n");
+	flightlog_dump();
+	return 0;
+#endif
 	if (!device_is_ready(accel_dev) || !device_is_ready(gyro_dev)) {
 		printk("flight_controller: FAIL (IMU not ready)\n");
 		return -1;
 	}
 	ctrl.init();
 	est.init(0.0f, 0.0f, START_Z);
+
+#if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
+	flightlog_init();   /* erase 'storage' partition + ready to append (see flightlog.h) */
+#ifndef ROSE_FLIGHTLOG_DIV
+#define ROSE_FLIGHTLOG_DIV 20   /* log every Nth control tick (~50 Hz at a 1 kHz loop) */
+#endif
+#endif
 
 	motors_startup_pulse();   /* optional boot "go" signal (ROSE_START_PULSE_MS); no-op if unset */
 
@@ -722,6 +738,9 @@ int main(void)
 				g_estop = true;
 				printk("flight_controller: EMERGENCY CUTOFF -- IMU lost (%d misses); "
 				       "motors OFF (reset to clear)\n", imu_miss);
+#if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
+				flightlog_flush();   /* persist the log at flight-end (estop) */
+#endif
 			}
 			if (g_estop) {
 				send_control(u);   /* g_estop forces motors to 0 (u not read) */
@@ -745,6 +764,9 @@ int main(void)
 				g_estop = true;
 				printk("flight_controller: EMERGENCY CUTOFF -- %s limit exceeded; "
 				       "motors OFF (reset to clear)\n", why);
+#if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
+				flightlog_flush();   /* persist the log at flight-end (estop) */
+#endif
 			}
 		}
 		uint32_t _pc = PF_NOW();
@@ -753,6 +775,26 @@ int main(void)
 		uint32_t _ps = PF_NOW();
 		send_control(u);
 		PF_ACC(pf_send, _ps);
+#if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
+		if (!g_estop && (iter % ROSE_FLIGHTLOG_DIV) == 0) {
+			struct flight_rec rec;
+			rec.t_ms       = (uint32_t)k_uptime_get();
+			rec.roll_mrad  = (int16_t)(state[3] * 1000.0f);
+			rec.pitch_mrad = (int16_t)(state[4] * 1000.0f);
+			rec.yaw_mrad   = (int16_t)(state[5] * 1000.0f);
+			rec.z_mm       = (int16_t)(state[2] * 1000.0f);
+			rec.vz_mmps    = (int16_t)(state[8] * 1000.0f);
+			for (int i = 0; i < NACTIONS; i++) {
+				float d = u[i] + 0.583f;   /* controller-commanded duty [0,1] (pre-cap) */
+				if (d < 0.0f) { d = 0.0f; } else if (d > 1.0f) { d = 1.0f; }
+				rec.duty[i] = (uint8_t)(d * 200.0f);   /* 0.5% units */
+			}
+			rec.flags = (uint8_t)((g_estop ? FLIGHT_FLAG_ESTOP : 0) |
+					      (f.tof_valid ? FLIGHT_FLAG_TOF_VALID : 0));
+			rec._pad = 0;
+			flightlog_write(&rec);
+		}
+#endif
 #if defined(ROSE_PROFILE) && ROSE_PROFILE
 		if (++pf_iters >= 30) {
 			/* read_sensor_frame was already timed into pf_imu_fetch/get/tof (read total = their
@@ -790,6 +832,10 @@ int main(void)
 		}
 		/* send_control() is issued (and timed) above, before this telemetry print. */
 	}
+#if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
+	flightlog_flush();
+	printk("flight_controller: flight log flushed to flash (dump with -DROSE_FLIGHTLOG_DUMP=1)\n");
+#endif
 	printk("flight_controller: control loop done (%d iters)\n", CTRL_ITERS);
 	return 0;
 #endif
