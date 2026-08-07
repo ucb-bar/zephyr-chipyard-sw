@@ -244,6 +244,13 @@ static const bool    g_armed = true;
 #ifndef T_DESCEND_MS
 #define T_DESCEND_MS        1500    /* ramp setpoint HOVER_Z_M -> 0 */
 #endif
+#ifndef LAND_PUSH_M
+#define LAND_PUSH_M        -0.10f   /* after the descend ramp, hold this below-ground setpoint so the
+				     * altitude loop keeps gently descending until real touchdown */
+#endif
+#ifndef LAND_Z_THRESH_M
+#define LAND_Z_THRESH_M     0.05f   /* considered landed (cut motors) when actual height < this */
+#endif
 #ifndef FLIGHT_MAX_MS
 #define FLIGHT_MAX_MS       10000   /* hard cap regardless of the profile */
 #endif
@@ -446,7 +453,7 @@ static float autoflight_setpoint_z(int64_t t_ms)
 	if (t_ms < T_DESCEND_MS) {
 		return HOVER_Z_M * (1.0f - (float)t_ms / (float)T_DESCEND_MS);
 	}
-	return -1.0f;   /* profile done */
+	return LAND_PUSH_M;   /* landing: hold a below-ground setpoint so it keeps descending to touchdown */
 }
 #endif
 
@@ -954,12 +961,16 @@ int main(void)
 			if (g_armed) {
 				int64_t tf = t_now - g_flight_start_ms;
 				float zsp = autoflight_setpoint_z(tf);
-				if (zsp < 0.0f || tf >= FLIGHT_MAX_MS) {
+				/* Landing phase = past the descend ramp (setpoint now LAND_PUSH_M). Cut motors on
+				 * ACTUAL touchdown (height-based), not a fixed time, so it never disarms mid-air. */
+				bool in_landing = tf >= (int64_t)(T_CLIMB_MS + T_HOVER_MS + T_DESCEND_MS);
+				bool landed = in_landing && f.tof_valid && state[2] < LAND_Z_THRESH_M;
+				if (landed || tf >= FLIGHT_MAX_MS) {
 					g_armed = false;
 					flight_done = true;   /* one-shot: don't auto re-arm (reset to fly again) */
 					g_setpoint[2] = 0.0f;
-					printk("AUTOFLIGHT: flight complete (%d ms) -- motors OFF (reset to fly again)\n",
-					       (int)tf);
+					printk("AUTOFLIGHT: %s (%d ms, z=%dmm) -- motors OFF (reset to fly again)\n",
+					       landed ? "landed" : "flight cap", (int)tf, (int)(state[2] * 1000.0f));
 				} else {
 					g_setpoint[2] = zsp;
 				}
