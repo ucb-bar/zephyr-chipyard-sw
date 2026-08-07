@@ -67,6 +67,22 @@ static void ads_set_sides(uint8_t mask)
 	v |= (uint8_t)(mask & ((1U << 1) | (1U << 2) | (1U << 3) | (1U << 4)));
 	ads_wr(ADS7128_GPO_VALUE, v);
 }
+/* Power the down VL53L1X (GPIO6/XSHUT) on/off, leaving the side bits untouched. It shares 0x29 with
+ * the side sensors, so it MUST be held in reset while the sides are readdressed through 0x29 -- else
+ * the readdress writes hit the VL53L1X too and corrupt it (stuck at 0 mm). */
+static void ads_set_down(bool on)
+{
+	uint8_t v;
+	if (ads_rd(ADS7128_GPO_VALUE, &v) != 0) {
+		return;
+	}
+	if (on) {
+		v |= (1U << DOWN_XSHUT_CH);
+	} else {
+		v &= ~(1U << DOWN_XSHUT_CH);
+	}
+	ads_wr(ADS7128_GPO_VALUE, v);
+}
 static inline uint8_t bit(uint8_t ch) { return (uint8_t)(1U << ch); }
 
 /* ---- VL53L5CX raw readdress (ULD sequence), used before driver init ---- */
@@ -193,7 +209,13 @@ int side_tof_init(void)
 	for (int i = 0; i < N_SIDE; i++) {
 		ads_gpio_output(s_ch[i]);
 	}
-	ads_set_sides(0);      /* all side sensors off (down/GPIO6 preserved) */
+	ads_gpio_output(DOWN_XSHUT_CH);
+	/* Hold the down VL53L1X in reset for the ENTIRE side readdress phase: it defaults to 0x29, the
+	 * same address the sides pass through while being reprogrammed, so if it's live the readdress
+	 * writes corrupt it. Brought back up (alone at 0x29) once the sides are at 0x31-0x34; the caller
+	 * then re-inits it via vl53l1x_reinit(). This is why side_tof_init() must run BEFORE that. */
+	ads_set_down(false);
+	ads_set_sides(0);      /* all side sensors off too */
 	k_msleep(20);
 
 	/* Readdress each sensor one at a time (persistence-aware: skip if already at target). */
@@ -215,6 +237,9 @@ int side_tof_init(void)
 
 	/* Enable all four together (LPn retains address) so they coexist for reading. */
 	ads_set_sides(bit(1) | bit(2) | bit(3) | bit(4));
+	/* Sides are now at 0x31-0x34 -> safe to re-power the down VL53L1X (alone at 0x29). The caller
+	 * runs vl53l1x_reinit() right after side_tof_init() to boot it. */
+	ads_set_down(true);
 	k_msleep(50);
 
 	for (int i = 0; i < N_SIDE; i++) {

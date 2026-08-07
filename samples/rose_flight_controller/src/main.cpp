@@ -220,6 +220,9 @@ static const bool    g_armed = true;
 #ifndef PLACE_CONFIRM_MS
 #define PLACE_CONFIRM_MS     1500   /* level+ground+still must hold this long after placing */
 #endif
+#ifndef ARM_SETTLE_MS
+#define ARM_SETTLE_MS        3000   /* ROSE_ARM_NO_GESTURE: level+ground+still hold time to auto-arm */
+#endif
 #ifndef ARM_MAX_TILT_RAD
 #define ARM_MAX_TILT_RAD    0.10f   /* must be level (~5.7 deg) to arm */
 #endif
@@ -780,11 +783,23 @@ int main(void)
 	motors_boot_chirp();      /* reset alert: sequential 1-2-3-4 motor spin at 10% (see lift-and-place gate) */
 #endif
 
+#if defined(ROSE_BUMPER) && ROSE_BUMPER
+	/* Bring up the 4 side VL53L5CX wall sensors (readdress 0x31-0x34 via ADS7128, then read on a
+	 * background thread). MUST run BEFORE vl53l1x_reinit: the sides default to 0x29 (same as the down
+	 * VL53L1X) and pass through it while being reprogrammed, so side_tof_init() holds the down sensor
+	 * in reset for the whole readdress, then re-powers it (alone at 0x29) -- and we init it just
+	 * below. Adds ~12 s to boot (4x firmware upload). Control loop reads the cache non-blocking. */
+	{
+		int n = side_tof_init();
+		printk("flight_controller: side-ToF bumper: %d/4 sensors up\n", n);
+	}
+#endif
+
 #if DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
 	/* The st,vl53l1x driver defers the full ST boot (DataInit/StaticInit); nothing runs it unless
-	 * the app asks. Trigger it once here (XSHUT rail already raised by board_sensor_init) so the
-	 * down-ToF actually ranges -- without this every sample_fetch hits an uninitialized device and
-	 * floods "Failed to write". No-op on RoSE (virtual ToF is a different compat). */
+	 * the app asks. Trigger it once here (XSHUT rail raised by board_sensor_init, or re-raised by
+	 * side_tof_init after the side readdress) so the down-ToF actually ranges -- without this every
+	 * sample_fetch hits an uninitialized device and floods "Failed to write". No-op on RoSE. */
 	{
 		int rc = vl53l1x_reinit(tof_dev);
 		printk("flight_controller: vl53l1x_reinit rc=%d (%s)\n", rc,
@@ -800,17 +815,6 @@ int main(void)
 		       (int)ROSE_TOF_CAL_MM, rc, rc == 0 ? "offset+xtalk done" : "cal FAILED");
 	}
 #endif
-#endif
-
-#if defined(ROSE_BUMPER) && ROSE_BUMPER
-	/* Bring up the 4 side VL53L5CX wall sensors (readdress 0x31-0x34 via ADS7128, then read on a
-	 * background thread). Runs AFTER the down-ToF reinit so the ADS7128 GPIO6 rail is already set and
-	 * we only touch GPIO1-4. Adds ~12 s to boot (4x firmware upload). The control loop reads the
-	 * cached snapshot non-blocking via side_tof_get(). */
-	{
-		int n = side_tof_init();
-		printk("flight_controller: side-ToF bumper: %d/4 sensors up\n", n);
-	}
 #endif
 
 #if TOF_THREADED
@@ -894,10 +898,33 @@ int main(void)
 		 * Then fly the altitude profile until it completes or the hard cap, then disarm.
 		 * send_control() gates motors on g_armed the entire time. */
 		{
-			static bool     lifted;
 			static bool     announced;
-			static int64_t  place_since;   /* ms since placed+level+still (0 = not yet) */
+			static int64_t  arm_since;   /* ms since arm conditions held (0 = not yet) */
 			if (!g_armed && !g_estop) {
+				bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
+					      fabsf(state[4]) < ARM_MAX_TILT_RAD;
+				bool ground = f.tof_valid && state[2] < ARM_MAX_HEIGHT_M;
+				bool still  = fabsf(f.gyro[0]) < ARM_MAX_RATE_RADPS &&
+					      fabsf(f.gyro[1]) < ARM_MAX_RATE_RADPS &&
+					      fabsf(f.gyro[2]) < ARM_MAX_RATE_RADPS;
+#if defined(ROSE_ARM_NO_GESTURE) && ROSE_ARM_NO_GESTURE
+				/* Simple autoflight: NO gesture. Auto-arm once the drone has been level + still
+				 * continuously for ARM_SETTLE_MS. Deliberately does NOT require the down-ToF "on-
+				 * ground" check (near-field ToF validity when sitting flush is unreliable, and it was
+				 * the likely arm blocker) -- just place it down and let it settle. Easy for bench
+				 * iteration; NOT glitch-reboot safe -- drop ROSE_ARM_NO_GESTURE for real ops. */
+				(void)ground;
+				if (!announced) {
+					announced = true;
+					printk("AUTOFLIGHT(no-gesture): place down level + still; auto-arm in %d ms\n",
+					       (int)ARM_SETTLE_MS);
+				}
+				bool ready = level && still;
+				int64_t hold_ms = ARM_SETTLE_MS;
+#else
+				/* Arming = LIFT-AND-PLACE gesture (glitch-reboot-safe): pick up past
+				 * LIFT_ARM_THRESHOLD_M, then set down level + on-ground + still for PLACE_CONFIRM_MS. */
+				static bool lifted;
 				if (!announced) {
 					announced = true;
 					printk("AUTOFLIGHT: lift-and-place to arm -- pick up (>%d mm), set level on "
@@ -907,23 +934,20 @@ int main(void)
 					lifted = true;
 					printk("AUTOFLIGHT: lift detected -- now set level on the ground and hold still\n");
 				}
-				bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
-					      fabsf(state[4]) < ARM_MAX_TILT_RAD;
-				bool ground = f.tof_valid && state[2] < ARM_MAX_HEIGHT_M;
-				bool still  = fabsf(f.gyro[0]) < ARM_MAX_RATE_RADPS &&
-					      fabsf(f.gyro[1]) < ARM_MAX_RATE_RADPS &&
-					      fabsf(f.gyro[2]) < ARM_MAX_RATE_RADPS;
-				if (lifted && level && ground && still) {
-					if (place_since == 0) {
-						place_since = t_now;
-					} else if (t_now - place_since >= PLACE_CONFIRM_MS) {
+				bool ready = lifted && level && ground && still;
+				int64_t hold_ms = PLACE_CONFIRM_MS;
+#endif
+				if (ready) {
+					if (arm_since == 0) {
+						arm_since = t_now;
+					} else if (t_now - arm_since >= hold_ms) {
 						g_armed = true;
 						g_flight_start_ms = t_now;
 						printk("AUTOFLIGHT: ARMED -- taking off (hover %d mm, cap %d ms)\n",
 						       (int)(HOVER_Z_M * 1000.0f), (int)FLIGHT_MAX_MS);
 					}
 				} else {
-					place_since = 0;   /* condition broke -> restart the hold timer */
+					arm_since = 0;   /* condition broke -> restart the hold timer */
 				}
 			}
 			if (g_armed) {
@@ -1012,9 +1036,10 @@ int main(void)
 			/* Attitude + ALL 4 motor commands, so the restoring differential is visible: a
 			 * pitch tilt should split the fore/aft motor pair, a roll tilt the left/right pair. */
 			printk("flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d "
-			       "z=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]\n",
+			       "z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]\n",
 			       iter, (int)(dt * 1000.0f + 0.5f),
 			       FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
+			       (int)f.tof_valid, FP3(f.height),
 			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]));
 #endif
 #if defined(ROSE_BUMPER) && ROSE_BUMPER
