@@ -13,6 +13,7 @@
 [submodule "zephyr_ws/zephyr"]
 	path = zephyr_ws/zephyr
 	url = https://github.com/ucb-bar/zephyr.git
+	branch = rose-2-dev
 [submodule "tools/pyuartsi"]
 	path = tools/pyuartsi
 	url = https://github.com/ucb-bar/pyuartsi.git

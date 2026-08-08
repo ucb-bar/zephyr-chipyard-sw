@@ -1,0 +1,15 @@
+# Bootstrap downloads / generated toolchain (see README "Standalone Installation").
+# conda (scripts/install_conda.sh)
+/tools/miniforge3/
+/tools/Miniforge3-Linux-x86_64.sh
+# Zephyr SDK (scripts/install_toolchain_sdk.sh)
+/tools-manual/
+# west workspace deps fetched by `west update` (the zephyr kernel is a submodule, kept)
+/zephyr_ws/.west/
+/zephyr_ws/bootloader/
+/zephyr_ws/modules/
+/zephyr_ws/tools/
+# logs / build output
+.install_submodules.log
+.install_conda.log
+/build/

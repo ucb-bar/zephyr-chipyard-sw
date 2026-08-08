@@ -1,0 +1,16 @@
+sample:
+  description: BMI088 sensor test application
+  name: bmi088 test
+common:
+  tags: sensor
+  integration_platforms:
+    - native_sim
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "BMI088.*test"
+tests:
+  sample.basic.bmi088_test:
+    tags: sensor
+

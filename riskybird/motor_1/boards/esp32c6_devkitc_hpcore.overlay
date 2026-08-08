@@ -1,0 +1,47 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Overlay for 1 motor PWM on ESP32C6 (custom PCB).
+ * Motor connected to GPIO21 via LEDC channel 0.
+ * 20 kHz PWM typical for DC motor speed control.
+ */
+
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+/ {
+	aliases {
+		pwm-0 = &ledc0;
+		pwm-motor = &pwm_motor0;
+	};
+
+	pwmleds {
+		compatible = "pwm-leds";
+
+		pwm_motor0: pwm_motor_gpio21 {
+			label = "PWM Motor";
+			pwms = <&ledc0 0 20000 PWM_POLARITY_NORMAL>;
+		};
+	};
+};
+
+&pinctrl {
+	ledc0_default: ledc0_default {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO21>;
+			output-enable;
+		};
+	};
+};
+
+&ledc0 {
+	pinctrl-0 = <&ledc0_default>;
+	pinctrl-names = "default";
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel0@0 {
+		reg = <0x0>;
+		timer = <0>;
+	};
+};
