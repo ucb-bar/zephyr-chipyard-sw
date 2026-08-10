@@ -497,11 +497,29 @@ static void solve_nav(int iter, const float *state, float steer, float collision
 	if (align < 0.0f) align = 0.0f;
 	float gate = TBG_FLOOR + (1.0f - TBG_FLOOR) * align * align;
 	vx_cmd *= gate;
-	setpoint[6]  = vx_cmd;                                  /* forward velocity (vx), turn-before-go gated */
+	/* REFERENCE-FRAME FIX: the EKF emits state[6],[7] as WORLD-frame velocity (optical flow rotated
+	 * body->world, "ground-truth convention"), but the fused policy's fwd is a BODY-forward speed and
+	 * the TinyMPC model is hover-linearized at yaw=0 (its x-axis == the nose). Writing fwd into the
+	 * world-vx slot made the drone yaw its NOSE while still translating the OLD world direction --
+	 * confirmed in the trace: body-lateral sideslip grows to ~1 m/s as the nose turns off the motion.
+	 * Command-rotation alone would be WRONG (a yaw-0 K would roll to chase world-y instead of pitching
+	 * along the nose); the correct fix is to DEROTATE the velocity feedback into the body-heading frame
+	 * so K's body assumption holds. Then err[6]=body-forward-vel - fwd and err[7]=body-lateral-vel->0:
+	 * the MPC turns the velocity vector to follow the nose (coordinated turn), matching Stage-1's Lee
+	 * tracker (which rotated fwd by yaw) and the host prototype (which flies in the body frame). */
+	float rr1 = state[3], rr2 = state[4], rr3 = state[5];   /* Rodrigues attitude r = q_xyz/q_w */
+	float qni = 1.0f / sqrtf(1.0f + rr1*rr1 + rr2*rr2 + rr3*rr3);
+	float qw = qni, qx = rr1*qni, qy = rr2*qni, qz = rr3*qni;
+	float yaw = atan2f(2.0f*(qw*qz + qx*qy), 1.0f - 2.0f*(qy*qy + qz*qz));
+	float cy = cosf(yaw), sy = sinf(yaw);
+	float vfwd =  cy*state[6] + sy*state[7];               /* world vel projected onto the nose */
+	float vlat = -sy*state[6] + cy*state[7];               /* body-lateral velocity (sideslip) */
 	setpoint[5]  = state[5];                                /* neutralize yaw-ANGLE channel (err[5]=0) */
 	setpoint[11] = yr_cmd;                                  /* faithful body yaw RATE (wz) */
 	for (int i = 0; i < NSTATES; i++) err[i] = state[i] - setpoint[i];
 	err[0] = 0.0f; err[1] = 0.0f;                           /* x,y position free */
+	err[6] = vfwd - vx_cmd;                                 /* body-forward velocity tracks fwd cmd */
+	err[7] = vlat;                                          /* drive body-lateral sideslip to 0 */
 	*logcmd = vx_cmd;
 #elif ROSE_DRONET_NAV
 	/* DroNet vision nav: collision -> forward speed, steer -> yaw. Hover through settle. */
