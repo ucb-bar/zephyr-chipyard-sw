@@ -1,0 +1,8 @@
+sample:
+  name: RiskyBird Actuator Bring-up
+  description: Sequentially spin each of the 4 brushed motors briefly at low PWM.
+tests:
+  sample.riskybird.actuator_bringup:
+    platforms:
+      - esp32c6_devkitc
+    tags: pwm motor actuator
