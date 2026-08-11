@@ -10,6 +10,7 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/device.h>
 #include <rose/rose.h>
 #include <rose/rose_proto.h>
@@ -53,6 +54,7 @@ int main(void)
 
 	if (!device_is_ready(rose)) {
 		printk("ROSE selftest: FAIL (device not ready)\n");
+		sys_reboot(SYS_REBOOT_COLD);
 		return 1;
 	}
 
@@ -64,5 +66,8 @@ int main(void)
 	       reqrsp_ok ? "PASS" : "FAIL",
 	       (dma_ok && reqrsp_ok) ? "PASS" : "FAIL");
 
+	/* Halt the FireSim sim so `firesim runworkload` completes cleanly (Zephyr
+	 * would otherwise idle in WFI and the run would hit the wall-clock timeout). */
+	sys_reboot(SYS_REBOOT_COLD);
 	return (dma_ok && reqrsp_ok) ? 0 : 1;
 }
