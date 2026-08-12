@@ -51,6 +51,25 @@
 			output-enable;
 		};
 	};
+
+	/* PMW3901 optical-flow SPI (ROSE_FLOW): SCLK GPIO6, MOSI GPIO7, MISO GPIO18; software CS on
+	 * GPIO19 (driven by flow.c). CSEL_GPIO10 is a dummy hardware CS (unused). Does NOT conflict
+	 * with I2C0 (GPIO14/15). */
+	spim2_flow: spim2_flow {
+		group1 {
+			pinmux = <SPIM2_MISO_GPIO18>, <SPIM2_SCLK_GPIO6>, <SPIM2_CSEL_GPIO10>;
+		};
+		group2 {
+			pinmux = <SPIM2_MOSI_GPIO7>;
+			output-low;
+		};
+	};
+};
+
+&spi2 {
+	status = "okay";
+	pinctrl-0 = <&spim2_flow>;
+	pinctrl-names = "default";
 };
 
 &i2c0 {
@@ -75,13 +94,15 @@
 		status = "okay";
 	};
 
-	/* VL53L1X down-ToF @0x29 (power-on address; the 4x VL53L5CX that would collide at 0x29 are
-	 * not populated, so no readdress needed). Powered via the ADS7128 GPIO6 XSHUT by the
-	 * board_sensor_init() SYS_INIT hook (main.cpp) before this driver inits. hal_st is now
-	 * vendored (west workspace), so CONFIG_VL53L1X builds. */
-	vl53l1x: vl53l1x@29 {
+	/* VL53L1X down-ToF. Powers on at 0x29 (like all VL53Lx), but main.cpp's vl53l1x_readdress_down()
+	 * moves it to 0x30 at boot so it never shares 0x29 with the 4 side VL53L5CX as they power up +
+	 * readdress to 0x31-0x34 (else the down gets clobbered -> stuck 0mm). reg MUST match
+	 * VL53L1X_DOWN_ADDR. Powered via the ADS7128 GPIO6 XSHUT by the board_sensor_init() SYS_INIT hook
+	 * (main.cpp) before this driver inits; the deferred ST init runs in main via vl53l1x_reinit().
+	 * hal_st is vendored (west workspace), so CONFIG_VL53L1X builds. */
+	vl53l1x: vl53l1x@30 {
 		compatible = "st,vl53l1x";
-		reg = <0x29>;
+		reg = <0x30>;
 		status = "okay";
 	};
 

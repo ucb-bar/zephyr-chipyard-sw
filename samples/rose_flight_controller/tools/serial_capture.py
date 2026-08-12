@@ -13,6 +13,21 @@ Usage:
 """
 import sys, time, serial
 
+
+def open_noreset(port):
+    """Open WITHOUT asserting DTR/RTS. On the ESP32-C6's native USB-Serial/JTAG those lines map to
+    BOOT/EN, so pyserial's default open (DTR/RTS asserted) RESETS the chip into ROM download mode --
+    the port then goes silent because the app isn't running. Deassert them before opening."""
+    s = serial.Serial()
+    s.port = port
+    s.baudrate = 115200
+    s.timeout = 0.3
+    s.dtr = False
+    s.rts = False
+    s.open()
+    return s
+
+
 DUR  = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
 PORT = sys.argv[2] if len(sys.argv) > 2 else "/dev/ttyACM0"
 OUT  = sys.argv[3] if len(sys.argv) > 3 else None
@@ -24,7 +39,7 @@ s = None
 while time.time() - t0 < DUR:
     try:
         if s is None:
-            s = serial.Serial(PORT, 115200, timeout=0.3)
+            s = open_noreset(PORT)
         d = s.read(256)
     except Exception:
         s = None
