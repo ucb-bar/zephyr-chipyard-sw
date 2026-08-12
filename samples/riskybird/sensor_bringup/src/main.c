@@ -297,6 +297,13 @@ int main(void)
     }
     printf("I2C device ready: %s\n\n", i2c_dev->name);
 
+    /* Raw bus scan up-front (before any ADS7128 GPIO config) so the IMU/ADS7128 show even if the
+     * ToF-power path is flaky. Expected online: 0x17 ADS7128, 0x18/0x19 BMI088 accel,
+     * 0x68/0x69 BMI088 gyro (0x29 down-ToF depends on XSHUT state). */
+    printf("--- I2C Scan #0 (raw, at boot) ---\n");
+    i2c_scan(i2c_dev);
+    printf("\n");
+
     /* Configure ADS7128 GPIO1, GPIO2, GPIO3, GPIO4, and GPIO6 as outputs */
     printf("Configuring ADS7128 GPIO1, GPIO2, GPIO3, GPIO4, and GPIO6 as outputs...\n");
     for (int gpio = 1; gpio <= 4; gpio++) {

@@ -14,6 +14,20 @@
  * This overlay reconfigures SPI2 pinmux to match the PMW3901 wiring.
  */
 
+/* Route console to the ESP32-C6 built-in USB Serial/JTAG so the chip-ID result prints on the
+ * riskybird USB-C port (/dev/ttyACM*). Without this the hpcore board sends console to UART0
+ * physical pins, which are not broken out -- the PMW3901 test output would go nowhere. */
+/ {
+	chosen {
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
+
 /* Disable I2C0 to avoid pin conflict with GPIO6/GPIO7 (board default I2C0). */
 &i2c0 {
 	status = "disabled";
