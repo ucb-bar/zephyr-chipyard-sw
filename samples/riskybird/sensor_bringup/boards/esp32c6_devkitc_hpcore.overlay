@@ -11,6 +11,15 @@
 	aliases {
 		tof0 = &vl53l1x;
 	};
+	/* Route console to USB Serial/JTAG so the I2C scan prints on /dev/ttyACM*. */
+	chosen {
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+	};
+};
+
+&usb_serial {
+	status = "okay";
 };
 
 &pinctrl {

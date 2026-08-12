@@ -301,17 +301,19 @@ int pmw3901_read_motion_burst(const struct device *dev, motionBurst_t *motion)
     };
 
     cs_assert(dev);
-    k_msleep(1);
+    busy_wait_us(50);
 
-    /* Send address */
+    /* Send burst-read address */
     spi_write_dt(&config->spi, &tx_bufs);
-    k_msleep(1);
+    busy_wait_us(100);   /* t_SRAD: wait for motion-burst data ready (datasheet ~35 us) before read.
+                          * Was k_msleep(1) x3 (~6 ms/read, 167 Hz cap) -- busy_wait_us gives ~4 kHz
+                          * and a precise, jitter-free dt for the flow velocity integration. */
 
     /* Read motion burst data */
     spi_read_dt(&config->spi, &rx_bufs);
 
     cs_deassert(dev);
-    k_msleep(1);
+    busy_wait_us(50);
 
     memcpy(motion, rx_buffer, sizeof(motionBurst_t));
 
