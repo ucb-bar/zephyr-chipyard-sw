@@ -29,18 +29,24 @@ CAPTURE_S = 15
 # motor index -> corner (see main.cpp): 0=front-right 1=rear-right (RIGHT pair);
 #                                       2=rear-left  3=front-left (LEFT pair)
 def capture():
-    s = serial.Serial(PORT, 115200, timeout=0.3)
-    # reset the ESP32-C6 via the CDC control lines so the one-shot dump prints while we listen
-    s.setDTR(False); s.setRTS(True); time.sleep(0.15)
-    s.setRTS(False); time.sleep(0.05)
+    # Open the port DEASSERTED: on the ESP32-C6 native USB-Serial/JTAG, DTR/RTS map to BOOT/EN, so a
+    # default open (or a DTR/RTS "reset" pulse) wedges the chip into ROM download mode and it goes
+    # silent. The dump build prints the whole log once at boot, so POWER-CYCLE the board (unplug/
+    # replug USB) or tap RESET (SW1) to trigger it while this listens -- never reset via DTR/RTS.
+    print("Listening -- power-cycle the board (unplug/replug USB) or tap RESET to trigger the dump.")
+    s = None
     end = time.time() + CAPTURE_S
     buf = b""; lines = []
     while time.time() < end:
         try:
+            if s is None:
+                s = serial.Serial()
+                s.port = PORT; s.baudrate = 115200; s.timeout = 0.3
+                s.dtr = False; s.rts = False
+                s.open()
             d = s.read(1024)
         except Exception:
-            try: s = serial.Serial(PORT, 115200, timeout=0.3)
-            except Exception: time.sleep(0.2)
+            s = None; time.sleep(0.2)
             continue
         if d:
             buf += d

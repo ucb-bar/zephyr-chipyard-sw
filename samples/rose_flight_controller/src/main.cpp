@@ -34,6 +34,7 @@
 #include "controller.hpp"
 #include "flightlog.h"
 #include "side_tof.h"           /* side-ToF wall "bumper" (ROSE_BUMPER); no-op if disabled */
+#include "flow.h"               /* PMW3901 optical flow (ROSE_FLOW); no-op if disabled */
 
 /* Repulsion bridge into the PID controller (defined in controller_pid.cpp). Feeding walls only has
  * an effect when the PID controller is active + built with ROSE_BUMPER; harmless otherwise. */
@@ -168,6 +169,40 @@ static int board_sensor_init(void)
 	return 0;
 }
 SYS_INIT(board_sensor_init, POST_KERNEL, 80);   /* before CONFIG_SENSOR_INIT_PRIORITY (90) */
+
+/* Move the down VL53L1X off the shared 0x29 power-on address to 0x30, so once the sides are at
+ * 0x31-0x34 NOTHING remains at 0x29. On fully-populated boards the down otherwise shares 0x29 with the
+ * sides as they power up + pass through it during readdress, and gets intermittently clobbered (stuck
+ * 0mm / crosstalk return). The VL53L1X address is volatile -- a power cycle (XSHUT low->high) resets it
+ * to 0x29 -- so board_sensor_init()/side_tof_init() always leave it freshly at 0x29, and we move it
+ * here ONCE, right before vl53l1x_reinit(). Mechanism (ST UM2356 / samples/riskybird/sensor_bringup):
+ * write the new 7-bit address to 16-bit register 0x0001 (VL53L1_I2C_SLAVE__DEVICE_ADDRESS) at the
+ * sensor's current address. VL53L1X_DOWN_ADDR MUST equal the vl53l1x@30 DT node reg so the driver then
+ * talks to it there. */
+#define VL53L1X_DOWN_ADDR  0x30
+static int vl53l1x_readdress_down(void)
+{
+	const struct device *bus = DEVICE_DT_GET(DT_BUS(DT_INST(0, st_vl53l1x)));
+	uint8_t reg01[2] = { 0x00, 0x01 };   /* 16-bit reg 0x0001, MSB first */
+	uint8_t probe;
+
+	if (!device_is_ready(bus)) {
+		return -ENODEV;
+	}
+	/* Idempotent: if it already answers at the target (warm reset that kept the rail up), done. */
+	if (i2c_write_read(bus, VL53L1X_DOWN_ADDR, reg01, sizeof(reg01), &probe, 1) == 0) {
+		return 0;
+	}
+	uint8_t tx[3] = { 0x00, 0x01, VL53L1X_DOWN_ADDR };
+	int rc = i2c_write(bus, tx, sizeof(tx), 0x29);
+	k_msleep(10);
+	if (rc == 0 && i2c_write_read(bus, VL53L1X_DOWN_ADDR, reg01, sizeof(reg01), &probe, 1) == 0) {
+		printk("board_sensor_init: down-ToF readdressed 0x29 -> 0x%02x\n", VL53L1X_DOWN_ADDR);
+		return 0;
+	}
+	printk("board_sensor_init: down-ToF readdress -> 0x%02x FAILED (rc=%d)\n", VL53L1X_DOWN_ADDR, rc);
+	return -EIO;
+}
 #endif /* st_vl53l1x present */
 
 /* ---- Emergency cutoff watchdog --------------------------------------------------------------
@@ -514,6 +549,7 @@ struct sensor_frame {
 static uint32_t pf_imu_fetch, pf_imu_get, pf_tof;   /* accumulated cycles in the current window */
 static uint32_t pf_tof_n;                           /* # of real ToF fetches in the window */
 static uint32_t pf_est, pf_ctrl, pf_send, pf_iters; /* per-phase cycles + iteration count */
+static uint32_t pf_flow;                            /* optical-flow read (control-loop side) */
 #define PF_NOW()          k_cycle_get_32()
 #define PF_ACC(dst, t0)   do { (dst) += k_cycle_get_32() - (t0); } while (0)
 #else
@@ -557,6 +593,34 @@ static void tof_thread_fn(void *a, void *b, void *c)
 #else
 #define TOF_THREADED 0
 #endif
+
+/* ---- optical-flow attitude compensation (ROSE_FLOW) --------------------------------------------
+ * The PMW3901 measures the ground's ANGULAR velocity across its FOV, which mixes translation with
+ * body rotation; the down-ToF gives a SLANT range, not vertical height. Both are attitude effects:
+ *   - gyro comp: subtract rotation-induced flow (body pitch rate -> fwd/ax, roll rate -> left/ay) so
+ *                only translational flow remains. Exact once FLOW_RAD_PER_COUNT is calibrated (then
+ *                flow + gyro share rad/s units); before that it still cancels the SIGN, so an
+ *                IN-PLACE rotation test (raw flow swings, compensated ~flat) verifies the signs.
+ *   - tilt comp: true vertical height h = d_tof * cos(roll) * cos(pitch).
+ * Attitude is the PREVIOUS estimator tick (cached after est.get_state); read_sensor_frame runs
+ * before est.update, so it's one loop old (~2-3 ms) -- negligible. Flip a *_SIGN if the in-place
+ * test grows that axis instead of cancelling it. */
+#ifndef FLOW_GYRO_COMP
+#define FLOW_GYRO_COMP 1
+#endif
+#ifndef FLOW_TILT_COMP
+#define FLOW_TILT_COMP 1
+#endif
+/* Signs verified two ways: bench regression of raw flow vs gyro (pitch slope <0, roll slope >0)
+ * AND the Crazyflie flow model, which is (v/h - omega_pitch) for X but (v/h + omega_roll) for Y --
+ * i.e. OPPOSITE gyro signs on the two axes, matching the bench result. */
+#ifndef FLOW_GYRO_PITCH_SIGN
+#define FLOW_GYRO_PITCH_SIGN (-1.0f)   /* ax(fwd)  -= -gyro[1]: v/h = flow + pitch rate */
+#endif
+#ifndef FLOW_GYRO_ROLL_SIGN
+#define FLOW_GYRO_ROLL_SIGN  (+1.0f)   /* ay(left) -=  gyro[0]: v/h = flow - roll rate */
+#endif
+static float g_att_roll, g_att_pitch;   /* last estimator attitude (rad), for flow gyro/tilt comp */
 
 static bool read_sensor_frame(struct sensor_frame *f)
 {
@@ -635,6 +699,36 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	}
 #endif /* TOF_THREADED */
 #endif /* HAVE_TOF */
+#if defined(ROSE_FLOW) && ROSE_FLOW
+	/* Real optical flow (PMW3901): body velocity (m/s) = body angular flow (rad/s) * height (m).
+	 * Needs a valid ToF height; SQUAL + staleness gating is inside flow_get(). Overrides the flow=0
+	 * default so the estimator gets TRUE horizontal velocity instead of a forced-zero one. */
+	{
+		uint32_t _pfl = PF_NOW();
+		float ax, ay; int sq; bool fv;
+		flow_get(&ax, &ay, &sq, &fv);
+		PF_ACC(pf_flow, _pfl);
+		if (fv && f->tof_valid && f->height > 0.02f) {
+			/* Gyro-compensate: strip rotation-induced flow so only translation remains. Body
+			 * rates (rad/s) share units with the angular flow. */
+#if FLOW_GYRO_COMP
+			ax -= FLOW_GYRO_PITCH_SIGN * f->gyro[1];   /* pitch rate -> forward flow */
+			ay -= FLOW_GYRO_ROLL_SIGN  * f->gyro[0];   /* roll rate  -> left flow */
+#endif
+			/* Tilt-correct the ToF slant range to true vertical height. */
+			float h = f->height;
+#if FLOW_TILT_COMP
+			h *= cosf(g_att_roll) * cosf(g_att_pitch);
+#endif
+			f->flow[0] = ax * h;   /* body-frame horizontal velocity (m/s) */
+			f->flow[1] = ay * h;
+			f->flow_valid = true;
+		} else {
+			f->flow[0] = f->flow[1] = 0.0f;
+			f->flow_valid = false;   /* predict-only; do NOT force velocity to zero */
+		}
+	}
+#endif
 	return true;
 }
 
@@ -810,6 +904,9 @@ int main(void)
 	 * side_tof_init after the side readdress) so the down-ToF actually ranges -- without this every
 	 * sample_fetch hits an uninitialized device and floods "Failed to write". No-op on RoSE. */
 	{
+		/* First move the down sensor off the shared 0x29 -> 0x30 (see vl53l1x_readdress_down); then
+		 * run the deferred ST init at its new DT address (vl53l1x@30). */
+		vl53l1x_readdress_down();
 		int rc = vl53l1x_reinit(tof_dev);
 		printk("flight_controller: vl53l1x_reinit rc=%d (%s)\n", rc,
 		       rc == 0 ? "down-ToF ranging" : "ToF init failed -- altitude unaided");
@@ -824,6 +921,17 @@ int main(void)
 		       (int)ROSE_TOF_CAL_MM, rc, rc == 0 ? "offset+xtalk done" : "cal FAILED");
 	}
 #endif
+#endif
+
+#if defined(ROSE_FLOW) && ROSE_FLOW
+	/* Bring up the PMW3901 optical-flow sensor (SPI2) + start its background reader thread. Flow is
+	 * read non-blocking (like the ToFs) and feeds the estimator's horizontal-velocity update -> real
+	 * position/velocity sensing instead of the ROLL_TRIM dead-reckoning workaround. */
+	{
+		int rc = flow_init();
+		printk("flight_controller: optical flow %s\n",
+		       rc == 0 ? "up" : "NOT detected (flow disabled)");
+	}
 #endif
 
 #if TOF_THREADED
@@ -887,6 +995,7 @@ int main(void)
 		uint32_t _pe = PF_NOW();
 		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, dt);
 		est.get_state(state);
+		g_att_roll = state[3]; g_att_pitch = state[4];   /* cache for next frame's flow gyro/tilt comp */
 		PF_ACC(pf_est, _pe);
 		/* Emergency watchdog: latch a kill if attitude/rate/velocity exceed safe limits. Checked
 		 * every iteration before actuation; send_control() enforces the cut. */
@@ -1023,18 +1132,20 @@ int main(void)
 		if (++pf_iters >= 30) {
 			/* read_sensor_frame was already timed into pf_imu_fetch/get/tof (read total = their
 			 * sum). Print avg microseconds per phase over the window, then reset. */
-			uint32_t rd = pf_imu_fetch + pf_imu_get + pf_tof;
-			printk("PROFILE/%u: read=%uus [imu_fetch=%uus imu_get=%uus tof=%uus x%u] "
+			uint32_t rd = pf_imu_fetch + pf_imu_get + pf_tof + pf_flow;
+			printk("PROFILE/%u: loop=%uus read=%uus [imu_fetch=%uus imu_get=%uus tof=%uus x%u flow=%uus] "
 			       "est=%uus ctrl=%uus send=%uus\n", pf_iters,
+			       k_cyc_to_us_floor32((rd + pf_est + pf_ctrl + pf_send) / pf_iters),
 			       k_cyc_to_us_floor32(rd / pf_iters),
 			       k_cyc_to_us_floor32(pf_imu_fetch / pf_iters),
 			       k_cyc_to_us_floor32(pf_imu_get / pf_iters),
 			       pf_tof_n ? k_cyc_to_us_floor32(pf_tof / pf_tof_n) : 0u, pf_tof_n,
+			       k_cyc_to_us_floor32(pf_flow / pf_iters),
 			       k_cyc_to_us_floor32(pf_est / pf_iters),
 			       k_cyc_to_us_floor32(pf_ctrl / pf_iters),
 			       k_cyc_to_us_floor32(pf_send / pf_iters));
 			pf_imu_fetch = pf_imu_get = pf_tof = pf_tof_n = 0;
-			pf_est = pf_ctrl = pf_send = pf_iters = 0;
+			pf_est = pf_ctrl = pf_send = pf_flow = pf_iters = 0;
 		}
 #endif
 #if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
@@ -1066,6 +1177,22 @@ int main(void)
 				side_tof_get(&w);
 				printk("  walls[seq=%u]: front=%d back=%d left=%d right=%d\n",
 				       w.seq, w.front_mm, w.back_mm, w.left_mm, w.right_mm);
+			}
+#endif
+#if defined(ROSE_FLOW) && ROSE_FLOW
+			/* Flow-derived body velocity (m/s) + estimator vx/vy, so bench validation shows the
+			 * flow feeding through to the estimated velocity. squal/ok = raw sample quality/gate. */
+			{
+				float ax, ay; int sq; bool fv;
+				flow_get(&ax, &ay, &sq, &fv);   /* ax/ay = RAW angular flow (rad/s), pre-comp */
+				/* aRaw = raw angular flow; gyro = body roll/pitch rate (what gyro-comp subtracts);
+				 * v = final compensated body velocity (m/s); est = estimator velocity. In-place
+				 * rotation: aRaw and gyro swing together, v should stay ~flat if the comp signs fit. */
+				printk("  flow: aRaw=[%s%d.%03d %s%d.%03d] gyro=[%s%d.%03d %s%d.%03d] "
+				       "v=[%s%d.%03d %s%d.%03d] sq=%d %s | est v=[%s%d.%03d %s%d.%03d]\n",
+				       FP3(ax), FP3(ay), FP3(f.gyro[0]), FP3(f.gyro[1]),
+				       FP3(f.flow[0]), FP3(f.flow[1]), sq, fv ? "ok" : "--",
+				       FP3(state[6]), FP3(state[7]));
 			}
 #endif
 		}

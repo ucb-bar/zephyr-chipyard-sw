@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# flow_record.py calibration captures (local bench data, not source)
+recordings/
