@@ -310,6 +310,26 @@ static float     g_misalign = 0.0f;           /* ZOH'd body-frame bearing to the
 static bool      g_vision_valid = false;
 static const struct device *fmpc_cam = DEVICE_DT_GET(DT_ALIAS(fpv));
 
+#ifdef FMPC_CAM_REQRSP
+/* Camera over the REQRSP path (bypass the ch0 DMA). The FPGA RoSEDMA delivers only the FIRST
+ * frame then freezes (proven via the guest->sync VDIAG echo: cam hash constant while tof/lowdim
+ * update and the sync serves fresh frames), so route cam_front (0x11) as a reqrsp on ch1 in the
+ * env yaml and read it word-by-word like tof — the reqrsp path is the delivery-fixed, validated
+ * one. 5400 int8 = 1350 words. */
+#define FMPC_CMD_CAM_REQ  0x11u
+#define FMPC_CAM_CH       1
+#define FMPC_FRONT_WORDS  (FMPC_FRONT_ELEMS / 4)   /* 5400/4 = 1350 */
+static bool fmpc_capture_front(void)
+{
+	static uint32_t raw[FMPC_FRONT_WORDS];
+	rose_request(rose, FMPC_CMD_CAM_REQ, 0U);
+	if (rose_recv_reqrsp(rose, FMPC_CAM_CH, raw, FMPC_FRONT_WORDS) < (int)FMPC_FRONT_WORDS) {
+		return false;
+	}
+	memcpy(fmpc_front, raw, FMPC_FRONT_ELEMS);
+	return true;
+}
+#else
 static bool fmpc_capture_front(void)
 {
 	struct video_buffer *out = NULL;
@@ -319,6 +339,7 @@ static bool fmpc_capture_front(void)
 	if (video_dequeue(fmpc_cam, &out, K_FOREVER) != 0 || out == NULL) return false;
 	return true;
 }
+#endif
 static bool fmpc_read_tof(void)
 {
 	uint32_t raw[FMPC_TOF_WORDS];
@@ -352,6 +373,28 @@ static void fmpc_run_model(const float *state)
 	g_yr  = (float)fmpc_out[0];
 	g_fwd = (float)fmpc_out[1];
 	g_vision_valid = true;
+#ifdef FMPC_VISION_DBG
+	/* Compute-vs-content discriminator, delivered over the WORKING guest->sync data channel
+	 * (guest console printk is NOT captured on FPGA; a CRC-in-printk also stalls the loop).
+	 * Order-sensitive FNV-1a hash of the exact model INPUTS + raw fp16 OUTPUT bits, sent as an
+	 * unknown cmd 0x21 the sync logs+drops. inputs match spike + out differs => Saturn HW fp16
+	 * compute; inputs differ => bridge/RTL content corruption. */
+	{
+		uint32_t hc = 2166136261u, ht = 2166136261u, hl = 2166136261u;
+		const uint8_t *pc = (const uint8_t *)fmpc_front;
+		for (int i = 0; i < FMPC_FRONT_ELEMS; i++) { hc ^= pc[i]; hc *= 16777619u; }
+		const uint8_t *pt = (const uint8_t *)fmpc_tof;
+		for (int i = 0; i < FMPC_TOF_ELEMS; i++) { ht ^= pt[i]; ht *= 16777619u; }
+		const uint8_t *pl = (const uint8_t *)fmpc_low16;
+		for (unsigned i = 0; i < sizeof(fmpc_low16); i++) { hl ^= pl[i]; hl *= 16777619u; }
+		uint32_t o0 = 0, o1 = 0;
+		memcpy(&o0, &fmpc_out[0], 2); memcpy(&o1, &fmpc_out[1], 2);
+		rose_tx(rose, 0x21u);
+		rose_tx(rose, 5u * 4u);
+		rose_tx(rose, hc); rose_tx(rose, ht); rose_tx(rose, hl);
+		rose_tx(rose, o0); rose_tx(rose, o1);
+	}
+#endif
 }
 #endif /* ROSE_FUSED_NAV */
 
