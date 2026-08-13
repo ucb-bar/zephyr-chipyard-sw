@@ -316,18 +316,29 @@ static const struct device *fmpc_cam = DEVICE_DT_GET(DT_ALIAS(fpv));
  * update and the sync serves fresh frames), so route cam_front (0x11) as a reqrsp on ch1 in the
  * env yaml and read it word-by-word like tof — the reqrsp path is the delivery-fixed, validated
  * one. 5400 int8 = 1350 words. */
+#include <rose/rose.h>   /* rose_rx for the manual framed read + echo */
 #define FMPC_CMD_CAM_REQ  0x11u
 #define FMPC_CAM_CH       1
 #define FMPC_FRONT_WORDS  (FMPC_FRONT_ELEMS / 4)   /* 5400/4 = 1350 */
 static bool fmpc_capture_front(void)
 {
-	static uint32_t raw[FMPC_FRONT_WORDS];
+	/* Manual framed read [header][num_bytes][data...] so we can ECHO the header+num_bytes
+	 * the guest actually sees for the camera (cmd 0x22 -> sync [CAMDIAG]) — a misread
+	 * num_bytes (shared-ch1 misalignment) is what stalls the 1350-word read. Cap the data
+	 * loop so a bad num_bytes can't block forever. */
+	uint32_t header = 0, num_bytes = 0;
 	rose_request(rose, FMPC_CMD_CAM_REQ, 0U);
-	if (rose_recv_reqrsp(rose, FMPC_CAM_CH, raw, FMPC_FRONT_WORDS) < (int)FMPC_FRONT_WORDS) {
-		return false;
+	if (rose_rx(rose, FMPC_CAM_CH, &header) != 0) return false;
+	if (rose_rx(rose, FMPC_CAM_CH, &num_bytes) != 0) return false;
+	rose_tx(rose, 0x22u); rose_tx(rose, 8u); rose_tx(rose, header); rose_tx(rose, num_bytes);
+	size_t nwords = num_bytes / 4;
+	if (nwords > 4096) nwords = 4096;   /* safety: never spin forever on a bad length */
+	for (size_t i = 0; i < nwords; i++) {
+		uint32_t w;
+		if (rose_rx(rose, FMPC_CAM_CH, &w) != 0) return false;
+		if (i < FMPC_FRONT_WORDS) ((uint32_t *)fmpc_front)[i] = w;
 	}
-	memcpy(fmpc_front, raw, FMPC_FRONT_ELEMS);
-	return true;
+	return (nwords >= FMPC_FRONT_WORDS);
 }
 #else
 static bool fmpc_capture_front(void)
