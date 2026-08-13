@@ -24,6 +24,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <string.h>
 #include <math.h>
+#include <zephyr/sys/sys_io.h>   /* sys_read32 for FMPC_VISION_DBG DMADIAG (RoSEDMA counter probe) */
 
 #include "admm.hpp"
 /* YAW-MIXING-CORRECTED model: the committed Bdyn yaw rows used signs (+,-,-,+) but the PHYSICAL
@@ -322,23 +323,29 @@ static const struct device *fmpc_cam = DEVICE_DT_GET(DT_ALIAS(fpv));
 #define FMPC_FRONT_WORDS  (FMPC_FRONT_ELEMS / 4)   /* 5400/4 = 1350 */
 static bool fmpc_capture_front(void)
 {
-	/* Manual framed read [header][num_bytes][data...] so we can ECHO the header+num_bytes
-	 * the guest actually sees for the camera (cmd 0x22 -> sync [CAMDIAG]) — a misread
-	 * num_bytes (shared-ch1 misalignment) is what stalls the 1350-word read. Cap the data
-	 * loop so a bad num_bytes can't block forever. */
-	uint32_t header = 0, num_bytes = 0;
+	/* CHUNKED read: one 0x11 request; the sync (ROSE_CAM_CHUNK) serves the 5400-byte frame as
+	 * 27 small row-packets [header][num_bytes][data]. A single 1350-word reqrsp read stalls on
+	 * FPGA (large-read/HW-timing), but small per-row reads (like the 64-word ToF, proven to work)
+	 * do not. Read framed rows until the whole frame is assembled. */
 	rose_request(rose, FMPC_CMD_CAM_REQ, 0U);
-	if (rose_rx(rose, FMPC_CAM_CH, &header) != 0) return false;
-	if (rose_rx(rose, FMPC_CAM_CH, &num_bytes) != 0) return false;
-	rose_tx(rose, 0x22u); rose_tx(rose, 8u); rose_tx(rose, header); rose_tx(rose, num_bytes);
-	size_t nwords = num_bytes / 4;
-	if (nwords > 4096) nwords = 4096;   /* safety: never spin forever on a bad length */
-	for (size_t i = 0; i < nwords; i++) {
-		uint32_t w;
-		if (rose_rx(rose, FMPC_CAM_CH, &w) != 0) return false;
-		if (i < FMPC_FRONT_WORDS) ((uint32_t *)fmpc_front)[i] = w;
+	size_t total = 0;
+	int rows = 0;
+	while (total < FMPC_FRONT_WORDS && rows < 256) {
+		uint32_t header = 0, num_bytes = 0;
+		if (rose_rx(rose, FMPC_CAM_CH, &header) != 0) return false;
+		if (rose_rx(rose, FMPC_CAM_CH, &num_bytes) != 0) return false;
+		if (rows == 0) { rose_tx(rose, 0x22u); rose_tx(rose, 8u); rose_tx(rose, header); rose_tx(rose, num_bytes); }
+		size_t nw = num_bytes / 4;
+		if (nw > 4096) nw = 4096;   /* safety */
+		for (size_t i = 0; i < nw; i++) {
+			uint32_t w;
+			if (rose_rx(rose, FMPC_CAM_CH, &w) != 0) return false;
+			if (total < FMPC_FRONT_WORDS) ((uint32_t *)fmpc_front)[total] = w;
+			total++;
+		}
+		rows++;
 	}
-	return (nwords >= FMPC_FRONT_WORDS);
+	return (total >= FMPC_FRONT_WORDS);
 }
 #else
 static bool fmpc_capture_front(void)
@@ -348,6 +355,16 @@ static bool fmpc_capture_front(void)
 	fmpc_vbuf.type = VIDEO_BUF_TYPE_OUTPUT;
 	if (video_enqueue(fmpc_cam, &fmpc_vbuf) != 0) return false;
 	if (video_dequeue(fmpc_cam, &out, K_FOREVER) != 0 || out == NULL) return false;
+#ifdef FMPC_VISION_DBG
+	/* DMADIAG (cmd 0x24): echo the RoSEDMA curr_counter (reg 0x2018) + STATUS (0x2000, bit3=DMA_BUFFER)
+	 * after each frame, to see WHY the camera freezes — does the counter advance/wrap per frame, and
+	 * what is the true frame size (5400 vs 5408-with-header)? Direct register reads, no driver change. */
+	{
+		uint32_t cc = sys_read32((mem_addr_t)0x2018u);
+		uint32_t st = sys_read32((mem_addr_t)0x2000u);
+		rose_tx(rose, 0x24u); rose_tx(rose, 8u); rose_tx(rose, cc); rose_tx(rose, st);
+	}
+#endif
 	return true;
 }
 #endif
