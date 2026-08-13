@@ -62,10 +62,10 @@ def parse(lines):
         if not l[:1].isdigit():
             continue
         p = l.split(",")
-        if len(p) < 11:
+        if len(p) < 15:
             continue
         try:
-            rows.append([int(x) for x in p[:11]])
+            rows.append([int(x) for x in p[:15]])
         except ValueError:
             pass
     return rows

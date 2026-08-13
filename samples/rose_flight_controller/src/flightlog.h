@@ -25,6 +25,10 @@ struct __attribute__((packed)) flight_rec {
 	int16_t  yaw_mrad;
 	int16_t  z_mm;        /* altitude estimate, mm */
 	int16_t  vz_mmps;     /* vertical velocity, mm/s */
+	int16_t  vx_mmps;     /* est horizontal velocity x=fwd, mm/s -- flow/drift diagnosis */
+	int16_t  vy_mmps;     /* est horizontal velocity y=left, mm/s */
+	int16_t  fvx_mmps;    /* raw flow-derived body velocity x=fwd, mm/s (the estimator's flow input) */
+	int16_t  fvy_mmps;    /* raw flow-derived body velocity y=left, mm/s */
 	uint8_t  duty[4];     /* per-motor commanded duty, 0-200 (=0.5% units) */
 	uint8_t  flags;       /* bit0=estop, bit1=tof_valid */
 	uint8_t  _pad;

@@ -60,9 +60,24 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
 #define START_Z      0.9f     /* gentle takeoff from near the setpoint */
 #define TARGET_Z     1.0f
 /* Iteration count. Default 5000 suits the RoSE co-sim (~max_sim_time). On real HW the loop now
- * runs ~1 kHz, so 5000 iters is only ~7 s -- override (-DCTRL_ITERS=...) for a longer bench run. */
+ * runs ~1 kHz, so 5000 iters is only ~7 s -- override (-DCTRL_ITERS=...) for a longer bench run.
+ * CTRL_ITERS=0 -> run FOREVER (no cap): the control/telemetry loop never exits, so a tethered
+ * debug session (e.g. state_viz) keeps receiving data instead of the link "dropping" when the
+ * iteration cap is hit. Flight builds keep a finite cap so the loop ends + flushes the log. */
 #ifndef CTRL_ITERS
 #define CTRL_ITERS   5000
+#endif
+#if CTRL_ITERS <= 0
+#define CTRL_RUN_FOREVER 1
+#else
+#define CTRL_RUN_FOREVER 0
+#endif
+/* In-loop console telemetry (it=/flow:/walls). ON for tethered bring-up (state_viz). MUST be OFF for
+ * untethered flight: printk goes to the USB-Serial/JTAG console, which BLOCKS on a full TX buffer when
+ * no host is draining it -- measured 30-60 ms stalls, ~22% of a flight, freezing the control loop and
+ * corrupting the estimator dt. Untethered we rely on the (non-blocking, background-thread) flightlog. */
+#ifndef ROSE_TELEM
+#define ROSE_TELEM 1
 #endif
 
 /* Sign-correct fixed-point print of a float as "[-]int.frac(3)" without needing %f (portable to
@@ -226,6 +241,13 @@ static int vl53l1x_readdress_down(void)
 #ifndef SAFE_MAX_IMU_MISS
 #define SAFE_MAX_IMU_MISS   10       /* consecutive IMU read failures => sensor lost */
 #endif
+#ifndef SAFE_DEBOUNCE_ITERS
+#define SAFE_DEBOUNCE_ITERS 15       /* a limit must be exceeded this many CONSECUTIVE control iters
+                                      * (~13 ms @ 1 kHz) before latching estop. Rejects single-sample
+                                      * transients -- a motor-vibration gyro spike at spin-up, a
+                                      * between-sample velocity blip -- while still catching a genuine
+                                      * runaway (which persists for 100s of ms) essentially instantly. */
+#endif
 static volatile bool g_estop;        /* latched emergency stop (cleared only by reset) */
 
 /* Arm gate: motors actuate only when armed. Non-autoflight builds are always armed (normal bench
@@ -380,21 +402,42 @@ static void send_control(const float *u)
 		return;
 	}
 #endif
+	/* Controller's normalized thrust (u in ~[-0.583, 0.417]) -> physical per-motor duty [0,1]. */
+	float duty[NACTIONS];
 	for (int i = 0; i < NACTIONS; i++) {
-		/* normalized thrust u in ~[-0.583, 0.417] -> [0,1] the controller's physical duty command */
-		float duty = u[i] + 0.583f;
-		if (duty < 0.0f) duty = 0.0f;
-		if (duty > 1.0f) duty = 1.0f;
-#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
-		/* Flight: apply the command FAITHFULLY (so hover ~15% is actually reached) but CLAMP the
-		 * max as a safety ceiling. Do NOT scale -- scaling would push hover below flyable thrust. */
-		if (duty > AUTOFLIGHT_MAX_DUTY) duty = AUTOFLIGHT_MAX_DUTY;
-#else
-		duty *= MOTOR_MAX_DUTY;                            /* bench: scale [0,1] -> [0, cap] */
-		if (duty > MOTOR_MAX_DUTY) duty = MOTOR_MAX_DUTY;  /* (stays sub-hover; can't fly) */
-#endif
-		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * duty));
+		duty[i] = u[i] + 0.583f;
+		if (duty[i] < 0.0f) duty[i] = 0.0f;
+		if (duty[i] > 1.0f) duty[i] = 1.0f;
 	}
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	/* ATTITUDE-PRIORITY ANTI-SATURATION. The collective (altitude) thrust and the roll/pitch/yaw
+	 * differentials share the same motor range. If the peak motor would exceed the safety ceiling,
+	 * subtract the excess from ALL FOUR: this lowers the COLLECTIVE thrust while preserving the
+	 * differential, so attitude authority always survives -- sacrifice a little altitude, never
+	 * attitude. (Per-motor clamping instead flattens the differential once the altitude loop maxes
+	 * out -> no control -> tip.) This is THE fix for the "bad down-ToF maxes the altitude loop ->
+	 * all four pin -> tip/tumble" failure: the drone now climbs LEVEL and recoverable instead. */
+	float peak = 0.0f;
+	for (int i = 0; i < NACTIONS; i++) {
+		if (duty[i] > peak) peak = duty[i];
+	}
+	if (peak > AUTOFLIGHT_MAX_DUTY) {
+		float cut = peak - AUTOFLIGHT_MAX_DUTY;
+		for (int i = 0; i < NACTIONS; i++) {
+			duty[i] -= cut;   /* collective cut; a low motor may go < 0 -> floored just below */
+		}
+	}
+	for (int i = 0; i < NACTIONS; i++) {
+		if (duty[i] < 0.0f) duty[i] = 0.0f;
+		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * duty[i]));
+	}
+#else
+	for (int i = 0; i < NACTIONS; i++) {
+		float d = duty[i] * MOTOR_MAX_DUTY;                /* bench: scale [0,1] -> [0, cap] */
+		if (d > MOTOR_MAX_DUTY) d = MOTOR_MAX_DUTY;
+		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * d));
+	}
+#endif
 }
 /* Optional boot "go" signal: pulse all motors at the safety cap for ROSE_START_PULSE_MS, then
  * stop. Used by the handheld IMU tilt test so the operator knows when the stream has started.
@@ -425,10 +468,27 @@ static void motors_boot_chirp(void)
 		k_msleep(100);
 	}
 }
+/* Ready-to-arm chirp: DISTINCT from the boot chirp (all 4 motors pulse together, twice) so the two
+ * are unmistakable -- boot = "board reset" (1-2-3-4 sweep), ready = "sensors up, arm now" (double
+ * all-together blip). Fires once the arming gate goes live; drives PWM directly (still disarmed). */
+static void motors_ready_chirp(void)
+{
+	for (int k = 0; k < 2; k++) {
+		for (int i = 0; i < NACTIONS; i++) {
+			pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * 0.10f));
+		}
+		k_msleep(150);
+		for (int i = 0; i < NACTIONS; i++) {
+			pwm_set_pulse_dt(&motors[i], 0);
+		}
+		k_msleep(120);
+	}
+}
 #else
 static void send_control(const float *u) { (void)u; /* no actuator bound */ }
 static void motors_startup_pulse(void) { /* no motors bound */ }
 static void motors_boot_chirp(void) { /* no motors bound */ }
+static void motors_ready_chirp(void) { /* no motors bound */ }
 #endif
 #endif
 
@@ -620,7 +680,30 @@ static void tof_thread_fn(void *a, void *b, void *c)
 #ifndef FLOW_GYRO_ROLL_SIGN
 #define FLOW_GYRO_ROLL_SIGN  (+1.0f)   /* ay(left) -=  gyro[0]: v/h = flow - roll rate */
 #endif
-static float g_att_roll, g_att_pitch;   /* last estimator attitude (rad), for flow gyro/tilt comp */
+/* Reject the flow sample when the body roll/pitch RATE exceeds this (rad/s). During a fast rotation
+ * the flow is rotation-dominated and the gyro compensation leaves a residual (imperfect), which leaks
+ * into the noisier y flow -> inflates vy -> the velocity loop banks harder -> a self-exciting
+ * roll<->flow oscillation that trips the velocity watchdog. Gating flow out during fast rolls breaks
+ * that loop; gentle hover corrections (well under this) keep their flow. -DFLOW_GYRO_MAX=0 disables. */
+#ifndef FLOW_GYRO_MAX
+#define FLOW_GYRO_MAX 1.2f
+#endif
+static float g_att_roll, g_att_pitch, g_att_yaw;   /* last estimator attitude, Gibbs qx/qw,qy/qw,qz/qw */
+
+/* ---- startup gyro-bias auto-calibration -----------------------------------------------------
+ * The Mahony filter has no online gyro-bias term and runs a low accel-trim gain, so a fixed gyro
+ * bias drifts attitude and roughens the rate loop. While the drone sits still at boot (we already
+ * require a level+still settle before arming), average the gyro -- which should read 0 at rest -- to
+ * estimate the bias, then subtract it from every frame. Any axis over the "still" threshold restarts
+ * the window so a bump can't poison the average. Arming is gated on the cal completing. */
+#ifndef GYRO_CAL_SECONDS
+#define GYRO_CAL_SECONDS     2.0f      /* seconds of continuous stillness to average */
+#endif
+#ifndef GYRO_CAL_STILL_RADPS
+#define GYRO_CAL_STILL_RADPS 0.30f     /* per-axis rate below which the board counts as "still" */
+#endif
+static float g_gyro_bias[3];           /* measured gyro bias (rad/s); 0 until the cal completes */
+static volatile bool g_gyro_cal_done;  /* startup bias cal finished -> OK to arm */
 
 static bool read_sensor_frame(struct sensor_frame *f)
 {
@@ -646,6 +729,34 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	}
 	IMU_REMAP(f->accel, araw);   /* sensor -> drone body frame (no-op on RoSE) */
 	IMU_REMAP(f->gyro,  graw);
+	/* Startup gyro-bias cal: average the (should-be-zero) gyro while still, then subtract it from
+	 * every frame so the whole chain (Mahony attitude, rate loop, flow gyro-comp) sees a debiased
+	 * rate. Pre-cal the bias is 0 (subtraction is a no-op); motors stay disarmed until it finishes. */
+	if (!g_gyro_cal_done) {
+		static double gsum[3]; static int gn; static int64_t gstill_since;
+		bool gstill = fabsf(f->gyro[0]) < GYRO_CAL_STILL_RADPS &&
+			      fabsf(f->gyro[1]) < GYRO_CAL_STILL_RADPS &&
+			      fabsf(f->gyro[2]) < GYRO_CAL_STILL_RADPS;
+		int64_t gnow = k_uptime_get();
+		if (!gstill) {
+			gstill_since = 0; gsum[0] = gsum[1] = gsum[2] = 0.0; gn = 0;   /* bump -> restart */
+		} else {
+			if (gstill_since == 0) { gstill_since = gnow; gsum[0] = gsum[1] = gsum[2] = 0.0; gn = 0; }
+			gsum[0] += f->gyro[0]; gsum[1] += f->gyro[1]; gsum[2] += f->gyro[2]; gn++;
+			if (gnow - gstill_since >= (int64_t)(GYRO_CAL_SECONDS * 1000.0f) && gn > 0) {
+				g_gyro_bias[0] = (float)(gsum[0] / gn);
+				g_gyro_bias[1] = (float)(gsum[1] / gn);
+				g_gyro_bias[2] = (float)(gsum[2] / gn);
+				g_gyro_cal_done = true;
+				printk("gyro-cal: bias=[%d %d %d] millirad/s (%d samples) -- ready to arm\n",
+				       (int)(g_gyro_bias[0] * 1000.0f), (int)(g_gyro_bias[1] * 1000.0f),
+				       (int)(g_gyro_bias[2] * 1000.0f), gn);
+			}
+		}
+	}
+	f->gyro[0] -= g_gyro_bias[0];
+	f->gyro[1] -= g_gyro_bias[1];
+	f->gyro[2] -= g_gyro_bias[2];
 	PF_ACC(pf_imu_get, _pf);
 	f->flow[0] = f->flow[1] = 0.0f;
 	f->flow_valid = true;
@@ -699,6 +810,10 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	}
 #endif /* TOF_THREADED */
 #endif /* HAVE_TOF */
+	/* f->height stays the RAW down-ToF slant range here. The slant->vertical tilt correction now lives
+	 * in the estimator (est.update, on its FRESH R[8]) so est_z is the true vertical height, and the
+	 * telemetry can show raw slant (tofh) vs corrected estimate (z) side by side. The optical-flow
+	 * path below tilt-corrects its OWN local copy (it needs vertical height before est.update runs). */
 #if defined(ROSE_FLOW) && ROSE_FLOW
 	/* Real optical flow (PMW3901): body velocity (m/s) = body angular flow (rad/s) * height (m).
 	 * Needs a valid ToF height; SQUAL + staleness gating is inside flow_get(). Overrides the flow=0
@@ -708,20 +823,31 @@ static bool read_sensor_frame(struct sensor_frame *f)
 		float ax, ay; int sq; bool fv;
 		flow_get(&ax, &ay, &sq, &fv);
 		PF_ACC(pf_flow, _pfl);
-		if (fv && f->tof_valid && f->height > 0.02f) {
+		/* Gate flow out during fast body rotation (flow is rotation-dominated + gyro-comp residual
+		 * leaks into vy -> self-exciting roll<->flow oscillation). FLOW_GYRO_MAX=0 disables the gate. */
+		bool rate_ok = (FLOW_GYRO_MAX <= 0.0f) ||
+			       (fabsf(f->gyro[0]) < FLOW_GYRO_MAX && fabsf(f->gyro[1]) < FLOW_GYRO_MAX);
+		if (fv && rate_ok && f->tof_valid && f->height > 0.02f) {
 			/* Gyro-compensate: strip rotation-induced flow so only translation remains. Body
 			 * rates (rad/s) share units with the angular flow. */
 #if FLOW_GYRO_COMP
 			ax -= FLOW_GYRO_PITCH_SIGN * f->gyro[1];   /* pitch rate -> forward flow */
 			ay -= FLOW_GYRO_ROLL_SIGN  * f->gyro[0];   /* roll rate  -> left flow */
 #endif
-			/* Tilt-correct the ToF slant range to true vertical height. */
-			float h = f->height;
-#if FLOW_TILT_COMP
-			h *= cosf(g_att_roll) * cosf(g_att_pitch);
-#endif
-			f->flow[0] = ax * h;   /* body-frame horizontal velocity (m/s) */
-			f->flow[1] = ay * h;
+			/* f->height is the RAW slant (the estimator tilt-corrects for altitude on its own fresh
+			 * R[8]); the flow needs VERTICAL height too, so correct a local copy on the cached attitude.
+			 * cos(tilt) = R_zz = (1 - qx^2 - qy^2 + qz^2)/(1 + qx^2 + qy^2 + qz^2) from the Gibbs state. */
+			float ga = g_att_roll, gb = g_att_pitch, gc = g_att_yaw;
+			float ct = (1.0f - ga*ga - gb*gb + gc*gc) / (1.0f + ga*ga + gb*gb + gc*gc);
+			float h = f->height * (ct > 0.0f ? ct : 0.0f);
+			/* Clamp the flow-derived velocity to a physical bound. v = angular_flow * height, so
+			 * at large ToF height flow NOISE is amplified into >10 m/s spikes (seen at h=2.5 m);
+			 * feeding those to the estimator (which then gates them as outliers -> predict-only ->
+			 * runaway) is what makes est-v blow up. The drone can't translate faster than this. */
+			const float FLOW_VEL_MAX = 3.0f;
+			float vfx = ax * h, vfy = ay * h;   /* body-frame horizontal velocity (m/s) */
+			f->flow[0] = vfx >  FLOW_VEL_MAX ?  FLOW_VEL_MAX : (vfx < -FLOW_VEL_MAX ? -FLOW_VEL_MAX : vfx);
+			f->flow[1] = vfy >  FLOW_VEL_MAX ?  FLOW_VEL_MAX : (vfy < -FLOW_VEL_MAX ? -FLOW_VEL_MAX : vfy);
 			f->flow_valid = true;
 		} else {
 			f->flow[0] = f->flow[1] = 0.0f;
@@ -785,7 +911,7 @@ static void keepalive_block(void *a, void *b, void *c)
 static void io_block(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
-	for (int iter = 0; iter < CTRL_ITERS; iter++) {
+	for (int iter = 0; CTRL_RUN_FOREVER || iter < CTRL_ITERS; iter++) {
 		struct sensor_frame f;
 		if (!read_sensor_frame(&f)) {
 			continue;
@@ -883,7 +1009,9 @@ int main(void)
 
 	motors_startup_pulse();   /* optional boot "go" signal (ROSE_START_PULSE_MS); no-op if unset */
 #if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
-	motors_boot_chirp();      /* reset alert: sequential 1-2-3-4 motor spin at 10% (see lift-and-place gate) */
+	/* Boot chirp (1-2-3-4 sweep) = "the board just reset". Fires EARLY, before the ~12 s sensor
+	 * bring-up. A DISTINCT ready chirp fires later (below), when the arming gate actually goes live. */
+	motors_boot_chirp();
 #endif
 
 #if defined(ROSE_BUMPER) && ROSE_BUMPER
@@ -964,6 +1092,11 @@ int main(void)
 #else
 	printk("flight_controller: estimator=%s + controller=%s ready (%s), single-loop\n",
 	       est.name(), ctrl.name(), HAVE_ROSE ? "RoSE co-sim" : "real target");
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	/* "Ready to arm" chirp (distinct double all-together blip): sensors are up and the arming gate is
+	 * now live -- THIS is the cue to do the lift-and-place gesture (untethered = no console). */
+	motors_ready_chirp();
+#endif
 	struct sensor_frame f;
 	float state[NSTATES], u[NACTIONS];
 	/* Use the REAL measured loop period, not the nominal CTRL_DT. On this soft-float target the
@@ -971,7 +1104,7 @@ int main(void)
 	 * the estimator integrate ~13x too slow, so real tilts barely registered. Measure dt each iter. */
 	int64_t t_prev = k_uptime_get();
 	int imu_miss = 0;
-	for (int iter = 0; iter < CTRL_ITERS; iter++) {
+	for (int iter = 0; CTRL_RUN_FOREVER || iter < CTRL_ITERS; iter++) {
 		if (!read_sensor_frame(&f)) {
 			printk("flight_controller: IMU fetch error\n");
 			if (++imu_miss >= SAFE_MAX_IMU_MISS && !g_estop) {
@@ -995,17 +1128,42 @@ int main(void)
 		uint32_t _pe = PF_NOW();
 		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, dt);
 		est.get_state(state);
-		g_att_roll = state[3]; g_att_pitch = state[4];   /* cache for next frame's flow gyro/tilt comp */
+		g_att_roll = state[3]; g_att_pitch = state[4]; g_att_yaw = state[5];   /* cache for next frame's comp */
 		PF_ACC(pf_est, _pe);
 		/* Emergency watchdog: latch a kill if attitude/rate/velocity exceed safe limits. Checked
 		 * every iteration before actuation; send_control() enforces the cut. */
-		if (!g_estop) {
+		/* FLIGHT-only watchdog: gate on g_armed. The pre-arm lift-and-place swings the board by hand
+		 * (fast enough to spike the flow-velocity / tilt / rate limits), which must NOT latch estop
+		 * before takeoff. Motors are already forced off while disarmed (send_control), so there is
+		 * nothing to guard until armed; once armed this protects the entire flight. */
+		if (g_armed && !g_estop) {
 			const char *why = safety_violation(state, f.gyro);
-			if (why != NULL) {
+			static int viol_count;   /* consecutive iters in violation (debounce transient spikes) */
+			viol_count = (why != NULL) ? (viol_count + 1) : 0;
+			if (why != NULL && viol_count >= SAFE_DEBOUNCE_ITERS) {
 				g_estop = true;
-				printk("flight_controller: EMERGENCY CUTOFF -- %s limit exceeded; "
-				       "motors OFF (reset to clear)\n", why);
+				printk("flight_controller: EMERGENCY CUTOFF -- %s limit exceeded (%d iters); "
+				       "motors OFF (reset to clear)\n", why, viol_count);
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
+				/* Final record: encode WHICH limit tripped in flags[2..4] (0=none 1=tilt 2=rate
+				 * 3=velocity 4=height; first char of `why` is unique per reason) and carry the raw
+				 * gyro x/y in the fvx/fvy columns -- the rate/gyro path isn't otherwise logged, so
+				 * this is how we tell a vibration rate-spike from a real tilt/velocity runaway. */
+				uint8_t rc = (why[0]=='t')?1 : (why[0]=='r')?2 : (why[0]=='v')?3 : (why[0]=='h')?4 : 0;
+				struct flight_rec er = {0};
+				er.t_ms     = (uint32_t)k_uptime_get();
+				er.roll_mrad  = (int16_t)(state[3] * 1000.0f);
+				er.pitch_mrad = (int16_t)(state[4] * 1000.0f);
+				er.yaw_mrad   = (int16_t)(state[5] * 1000.0f);
+				er.z_mm     = (int16_t)(state[2] * 1000.0f);
+				er.vz_mmps  = (int16_t)(state[8] * 1000.0f);
+				er.vx_mmps  = (int16_t)(state[6] * 1000.0f);
+				er.vy_mmps  = (int16_t)(state[7] * 1000.0f);
+				er.fvx_mmps = (int16_t)(f.gyro[0] * 1000.0f);   /* gyro x (rad/s * 1000), estop record only */
+				er.fvy_mmps = (int16_t)(f.gyro[1] * 1000.0f);   /* gyro y */
+				er.flags = (uint8_t)(FLIGHT_FLAG_ESTOP |
+						     (f.tof_valid ? FLIGHT_FLAG_TOF_VALID : 0) | (rc << 2));
+				flightlog_write(&er);
 				flightlog_flush();   /* persist the log at flight-end (estop) */
 #endif
 			}
@@ -1038,7 +1196,7 @@ int main(void)
 					printk("AUTOFLIGHT(no-gesture): place down level + still; auto-arm in %d ms\n",
 					       (int)ARM_SETTLE_MS);
 				}
-				bool ready = level && still;
+				bool ready = level && still && g_gyro_cal_done;   /* wait for gyro-bias cal */
 				int64_t hold_ms = ARM_SETTLE_MS;
 #else
 				/* Arming = LIFT-AND-PLACE gesture (glitch-reboot-safe): pick up past
@@ -1053,7 +1211,7 @@ int main(void)
 					lifted = true;
 					printk("AUTOFLIGHT: lift detected -- now set level on the ground and hold still\n");
 				}
-				bool ready = lifted && level && ground && still;
+				bool ready = lifted && level && ground && still && g_gyro_cal_done;   /* wait for gyro-bias cal */
 				int64_t hold_ms = PLACE_CONFIRM_MS;
 #endif
 				if (ready) {
@@ -1117,6 +1275,10 @@ int main(void)
 			rec.yaw_mrad   = (int16_t)(state[5] * 1000.0f);
 			rec.z_mm       = (int16_t)(state[2] * 1000.0f);
 			rec.vz_mmps    = (int16_t)(state[8] * 1000.0f);
+			rec.vx_mmps    = (int16_t)(state[6] * 1000.0f);   /* est horizontal velocity (flow-fed) */
+			rec.vy_mmps    = (int16_t)(state[7] * 1000.0f);
+			rec.fvx_mmps   = (int16_t)(f.flow[0] * 1000.0f);  /* raw flow input to the estimator */
+			rec.fvy_mmps   = (int16_t)(f.flow[1] * 1000.0f);
 			for (int i = 0; i < NACTIONS; i++) {
 				float d = u[i] + 0.583f;   /* controller-commanded duty [0,1] (pre-cap) */
 				if (d < 0.0f) { d = 0.0f; } else if (d > 1.0f) { d = 1.0f; }
@@ -1151,7 +1313,7 @@ int main(void)
 #if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
 		if (0) {   /* grid-validation build: suppress periodic telemetry so GRID lines own the console */
 #else
-		if ((iter % 10) == 0) {
+		if (ROSE_TELEM && (iter % 10) == 0) {   /* ROSE_TELEM=0 (flight) -> compiled out, no printk stall */
 #endif
 #if defined(ROSE_IMU_DEBUG) && ROSE_IMU_DEBUG
 			/* Body-frame IMU dump for the axis/sign tilt test (see IMU_REMAP note). */

@@ -188,7 +188,8 @@ int flightlog_dump(void)
 	}
 	uint32_t size = (uint32_t)fa->fa_size;
 	printk("FLIGHTLOG_CSV_BEGIN\n");
-	printk("t_ms,roll_mrad,pitch_mrad,yaw_mrad,z_mm,vz_mmps,duty0,duty1,duty2,duty3,flags\n");
+	printk("t_ms,roll_mrad,pitch_mrad,yaw_mrad,z_mm,vz_mmps,vx_mmps,vy_mmps,fvx_mmps,fvy_mmps,"
+	       "duty0,duty1,duty2,duty3,flags\n");
 	int n = 0;
 	struct flight_rec r;
 	for (uint32_t off = 0; off + REC_SIZE <= size; off += REC_SIZE) {
@@ -198,9 +199,9 @@ int flightlog_dump(void)
 		if (r.t_ms == 0xFFFFFFFFu) {
 			break;    /* reached erased region -> end of log */
 		}
-		printk("%u,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u\n", r.t_ms, r.roll_mrad, r.pitch_mrad,
-		       r.yaw_mrad, r.z_mm, r.vz_mmps, r.duty[0], r.duty[1], r.duty[2], r.duty[3],
-		       r.flags);
+		printk("%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u\n", r.t_ms, r.roll_mrad, r.pitch_mrad,
+		       r.yaw_mrad, r.z_mm, r.vz_mmps, r.vx_mmps, r.vy_mmps, r.fvx_mmps, r.fvy_mmps,
+		       r.duty[0], r.duty[1], r.duty[2], r.duty[3], r.flags);
 		n++;
 	}
 	printk("FLIGHTLOG_CSV_END (%d records)\n", n);

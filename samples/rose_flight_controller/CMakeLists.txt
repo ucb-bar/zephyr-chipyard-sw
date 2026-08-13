@@ -29,7 +29,7 @@ include(${TINYMPC}/external/matlib/matlib_header.cmake)
 # which currently holds the ALTITUDE loop best (its explicit vz correction beats the EKF's
 # Kalman vz for control). The EKF is the robustness target (Q/R for noise) but its vz needs
 # a direct velocity measurement to match; both use model-based delay compensation.
-set(ROSE_USE_EKF 0 CACHE STRING "1=EKF, 0=complementary filter")
+set(ROSE_USE_EKF 1 CACHE STRING "1=EKF, 0=complementary filter")
 # Controller selection (modular IController; both are compiled, factory picks):
 #   -DROSE_USE_PID=0 -> TinyMPC constrained MPC (default)
 #   -DROSE_USE_PID=1 -> hierarchical PID cascade (ported from the old riskybird FreeRTOS firmware)
@@ -47,6 +47,10 @@ set(CTRL_ITERS 5000 CACHE STRING "control-loop iteration count")
 # Side-ToF wall "bumper": 1 = bring up the 4 VL53L5CX + apply bounded wall-repulsion lean.
 # Adds ~12 s to boot (4x firmware upload). 0 = skip entirely (side_tof.c compiled but idle).
 set(ROSE_BUMPER 0 CACHE STRING "1=enable side-ToF wall bumper, 0=disabled")
+# Fast-boot variant: with ROSE_BUMPER=1, re-address the 4 sides off 0x29 (keeps the I2C bus clear for
+# the down VL53L1X) but SKIP the ~84 KB-per-sensor ULD firmware upload + ranging. No wall data, but
+# boot is ~0.5 s instead of ~12 s. Use when the FC doesn't consume walls (it currently doesn't).
+set(ROSE_BUMPER_READDRESS_ONLY 0 CACHE STRING "1=re-address sides only (fast boot, no ranging)")
 # Optical flow: 1 = bring up the PMW3901 (SPI2) + feed body-frame velocity to the estimator.
 set(ROSE_FLOW 0 CACHE STRING "1=enable PMW3901 optical flow, 0=disabled")
 
@@ -68,7 +72,8 @@ target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_USE_PID=${ROSE_USE_PID}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
-  ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW})
+  ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW}
+  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include
