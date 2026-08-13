@@ -242,6 +242,17 @@ int side_tof_init(void)
 	ads_set_down(true);
 	k_msleep(50);
 
+#if defined(ROSE_BUMPER_READDRESS_ONLY) && ROSE_BUMPER_READDRESS_ONLY
+	/* Fast-boot: the 4 sides are now parked at 0x31-0x34 (off 0x29), so the I2C bus is clear for the
+	 * down VL53L1X and there is no address collision -- but SKIP the per-sensor ULD firmware upload
+	 * (vl53l5cx_reinit, ~84 KB over I2C each, ~12 s total) and the ranging thread. The flight
+	 * controller does not consume wall data, so this keeps the bus-collision fix while cutting boot
+	 * from ~12 s to ~0.5 s. Walls report "no target" (-1); rebuild without this knob to range them. */
+	g_walls.front_mm = g_walls.back_mm = g_walls.left_mm = g_walls.right_mm = -1;
+	printk("side_tof: readdress-only (fast boot) -- sides parked at 0x31-0x34, ranging skipped\n");
+	return 0;
+#endif
+
 	for (int i = 0; i < N_SIDE; i++) {
 		int rc = vl53l5cx_reinit(s_dev[i]);
 		g_running[i] = (rc == 0);

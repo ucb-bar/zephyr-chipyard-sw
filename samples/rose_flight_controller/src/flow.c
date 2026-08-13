@@ -14,6 +14,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
 #include <errno.h>
+#include <math.h>
 
 /* --- tunables (override via -D) --- */
 #ifndef FLOW_RAD_PER_COUNT
@@ -34,6 +35,18 @@
 #endif
 #ifndef FLOW_STALE_MS
 #define FLOW_STALE_MS 50         /* flow marked invalid if no fresh sample within this window */
+#endif
+/* Per-axis low-pass on the angular flow, applied HERE in the ~100 Hz sensor thread (NOT in the 1 kHz
+ * estimator, where re-fusing the same stale sample every control tick converges right back to the raw
+ * value and defeats any per-tick gain). Time-constant based (uses the measured dt) so it's independent
+ * of the read period. The PMW3901's left (y) axis is far noisier (std ~1.3 m/s, railing to +/-3), yet a
+ * real drift survives underneath (2:1 sign-imbalanced) -- a heavy y low-pass collapses the noise while
+ * keeping that drift; x is usually cleaner so it needs only a light touch. Tune via -DFLOW_LP_TAU_{X,Y}. */
+#ifndef FLOW_LP_TAU_X
+#define FLOW_LP_TAU_X 0.0f       /* x low-pass time constant (s); 0 = off (pass raw) */
+#endif
+#ifndef FLOW_LP_TAU_Y
+#define FLOW_LP_TAU_Y 0.0f       /* y low-pass time constant (s); 0 = off */
 #endif
 
 #define CS_GPIO_PIN 19           /* software chip-select (v3: SCLK=6 MOSI=7 MISO=18 CS=19) */
@@ -74,8 +87,16 @@ static void flow_thread_fn(void *a, void *b, void *c)
 			 * drone +x (fwd) = -deltaX ; drone +y (left) = +deltaY  (validated on HW). */
 			float ax = -(float)m.deltaX * FLOW_RAD_PER_COUNT / dt;
 			float ay =  (float)m.deltaY * FLOW_RAD_PER_COUNT / dt;
+			/* Per-sample low-pass at the sensor rate. k = 1 - exp(-dt/tau): a longer tau (smaller k)
+			 * smooths harder + lags more. tau=0 -> k=1 -> pass-through (raw). Seeded on first sample. */
+			static float axf, ayf; static bool lp_seed;
+			if (!lp_seed) { axf = ax; ayf = ay; lp_seed = true; }
+			float kx = (FLOW_LP_TAU_X > 0.0f) ? (1.0f - expf(-dt / FLOW_LP_TAU_X)) : 1.0f;
+			float ky = (FLOW_LP_TAU_Y > 0.0f) ? (1.0f - expf(-dt / FLOW_LP_TAU_Y)) : 1.0f;
+			axf += kx * (ax - axf);
+			ayf += ky * (ay - ayf);
 			k_mutex_lock(&flow_mtx, K_FOREVER);
-			g_ax = ax; g_ay = ay;
+			g_ax = axf; g_ay = ayf;
 			g_squal = m.squal; g_squal_ok = (m.squal >= FLOW_MIN_SQUAL);
 			g_last_ms = k_uptime_get();
 			g_seq++;

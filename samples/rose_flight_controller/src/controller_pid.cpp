@@ -24,9 +24,55 @@ static const float gravity            = 9.81f;
 /* altitude loop */
 static const float natFreq_height     = 2.0f;
 static const float dampingRatio_height = 0.7f;
+/* Altitude INTEGRAL term (makes the height loop a PID). The gravity feed-forward goes through an
+ * uncalibrated force->duty curve, so a pure P/D loop droops (FF too low) or overshoots (FF too high),
+ * and battery sag drifts the hover point during a flight -- no single PID_MASS_KG fits. The integrator
+ * auto-cancels that steady bias (it winds up to whatever thrust hovers *now*), so we stop hand-tuning
+ * mass. Reset on the ground (no pre-takeoff windup) and hard-clamped (bounded authority -> can't wind
+ * up into a climb-away). Set KI_HEIGHT=0 to disable and fall back to the pure P/D loop. */
+#ifndef KI_HEIGHT
+#define KI_HEIGHT 1.5f            /* integral gain (m/s^2 per m*s) */
+#endif
+#ifndef ALT_INT_MAX
+#define ALT_INT_MAX 3.0f          /* anti-windup clamp: max |integral| accel contribution (m/s^2) */
+#endif
+#ifndef ALT_INT_GROUND_M
+#define ALT_INT_GROUND_M 0.05f    /* est height below this = on the ground -> hold integrator at 0 */
+#endif
+/* Horizontal velocity INTEGRAL (makes the velocity loop a PI). The proportional loop always leaves a
+ * steady-state error against a constant disturbance -- a mount/CG tilt makes the drone hover banked and
+ * drift at a fixed rate that P can't null. The I term winds up to cancel it (auto roll/pitch trim).
+ * Only worth running because the gyro-cal'd flow now reports that drift reliably. Ground-reset (no
+ * pre-takeoff windup) + clamped (bounded extra bank). KI_VEL=0 disables -> pure P velocity loop. */
+#ifndef KI_VEL
+#define KI_VEL      0.8f          /* velocity integral gain (m/s^2 per (m/s)*s) */
+#endif
+#ifndef VEL_INT_MAX
+#define VEL_INT_MAX 2.0f          /* anti-windup clamp: max |vel integral| accel (m/s^2 ~ 12 deg bank) */
+#endif
 
-/* horizontal velocity loop */
-static const float timeConst_horizVel = 0.5f;
+/* horizontal velocity loop. Gain = 1/VEL_TC: smaller VEL_TC -> stronger velocity correction (bigger
+ * tilt per m/s of velocity error). Cranked up it makes a flow sign/frame error unmistakable (a wrong
+ * sign flies away HARD instead of ambiguously drifting; a right sign holds position visibly tighter). */
+#ifndef VEL_TC
+#define VEL_TC 0.5f
+#endif
+static const float timeConst_horizVel = VEL_TC;
+/* Ceiling on the velocity-loop tilt command (rad). The loop turns velocity error into a desired
+ * bank; a noisy/large velocity spike * a hot gain can demand an absurd tilt (the gain-5 limit cycle
+ * commanded ~44 deg), which the attitude loop chases -> violent thrash. Cap it so the velocity loop
+ * can never ask for more than a sane bank; residual authority is bounded, oscillation can't build. */
+#ifndef VEL_TILT_MAX
+#define VEL_TILT_MAX 0.26f   /* ~15 deg */
+#endif
+/* Slew-rate limit on the velocity-loop tilt command (rad/s). Caps how FAST the loop can change the
+ * commanded bank, which caps the body roll/pitch RATE it induces -- and body rate is exactly what
+ * leaks through the (imperfect) flow gyro-compensation into vy, driving the roll<->flow oscillation.
+ * "Gentler corrections" in the literal rate sense: a vy spike now ramps the bank instead of snapping
+ * it, so the drone never rotates fast enough to corrupt its own flow. 0 or large = no slew limit. */
+#ifndef TILT_SLEW_RADPS
+#define TILT_SLEW_RADPS 1.0f
+#endif
 
 /* attitude (angle) loop */
 static const float tau_roll           = 0.10f;
@@ -133,6 +179,20 @@ static float forceToVoltage(float forceNewtons)
 #ifndef PITCH_TRIM_RAD
 #define PITCH_TRIM_RAD 0.0f
 #endif
+/* Horizontal velocity loop: 1 = regulate velocity -> tilt (needs a REAL velocity, i.e. optical flow);
+ * 0 = DISABLE it (desRoll=desPitch=0) -> hold LEVEL attitude + altitude only, no velocity/position
+ * hold. Pure dead-reckoning velocity is physically blind to bank translation and drifts, so closing
+ * the loop on it chases a phantom and runs the drone away. ROSE_VEL_LOOP=0 is the stable-drift
+ * baseline: it drifts horizontally but stays oriented. */
+#ifndef ROSE_VEL_LOOP
+#define ROSE_VEL_LOOP 1
+#endif
+/* Attitude-loop authority scale on the roll+pitch moments. 1.0 = original gains; <1 = gentler / more
+ * phase margin. The bare-drone gains went marginally unstable once the cage changed the mass/inertia
+ * (roll oscillation grows to a tumble), so scale them down to buy back stability. Tune -DATT_GAIN=<f>. */
+#ifndef ATT_GAIN
+#define ATT_GAIN 1.0f
+#endif
 
 struct pid_walls { int16_t front, back, left, right; bool valid; };
 static volatile struct pid_walls g_walls = {0, 0, 0, 0, false};
@@ -163,7 +223,7 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 				       const float setpoint[CTRL_NSTATES],
 				       float u_out[CTRL_NACTIONS], float dt)
 {
-	(void)dt;   /* pure P/PD cascade -- no integrator state, so no dt dependence */
+	/* dt now matters: the altitude loop carries an integral term (below). */
 
 	/* unpack state (our layout) */
 	const float estRoll   = state[3];
@@ -192,17 +252,61 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 		desVel_2 += WALL_SIGN_Y * (wall_push(g_walls.right) - wall_push(g_walls.left));
 	}
 
-	/* (1) altitude loop -> normalized vertical acceleration command */
+	/* (1) altitude loop -> normalized vertical acceleration command (P/D + integral trim) */
+	static float alt_int = 0.0f;   /* integral of altitude error -> accel (auto FF calibration) */
+	if (estHeight < ALT_INT_GROUND_M) {
+		alt_int = 0.0f;        /* on the ground: no windup before takeoff */
+	} else {
+		alt_int += KI_HEIGHT * (desHeight - estHeight) * dt;
+		if (alt_int >  ALT_INT_MAX) { alt_int =  ALT_INT_MAX; }
+		else if (alt_int < -ALT_INT_MAX) { alt_int = -ALT_INT_MAX; }
+	}
 	const float desAcc3 = -2.0f * dampingRatio_height * natFreq_height * estVel_3
-			      - natFreq_height * natFreq_height * (estHeight - desHeight);
+			      - natFreq_height * natFreq_height * (estHeight - desHeight)
+			      + alt_int;
 	const float desNormalizedAcceleration =
 		(gravity + desAcc3) / (cosf(estRoll) * cosf(estPitch));
 
-	/* (2) horizontal velocity loop -> desired accelerations -> desired tilt */
-	const float desAcc1 = -(1.0f / timeConst_horizVel) * (estVel_1 - desVel_1);
-	const float desAcc2 = -(1.0f / timeConst_horizVel) * (estVel_2 - desVel_2);
-	const float desRoll  = -desAcc2 / gravity;
-	const float desPitch =  desAcc1 / gravity;
+	/* (2) horizontal velocity loop -> desired accelerations -> desired tilt (ROSE_VEL_LOOP=0 holds
+	 * LEVEL instead: no velocity/position hold, so it can't chase a bad dead-reckoned velocity). */
+#if ROSE_VEL_LOOP
+	/* PI velocity loop: P for transients, I to cancel the constant drift P leaves as steady-state
+	 * error (auto-trims the mount/CG tilt). (1/VEL_TC)*err == the old -(1/VEL_TC)*(est-des). */
+	const float verr1 = desVel_1 - estVel_1;
+	const float verr2 = desVel_2 - estVel_2;
+	static float vel_int_1 = 0.0f, vel_int_2 = 0.0f;
+	if (estHeight < ALT_INT_GROUND_M) {
+		vel_int_1 = 0.0f; vel_int_2 = 0.0f;   /* on the ground: no windup before takeoff */
+	} else {
+		vel_int_1 += KI_VEL * verr1 * dt;
+		vel_int_2 += KI_VEL * verr2 * dt;
+		if (vel_int_1 >  VEL_INT_MAX) { vel_int_1 =  VEL_INT_MAX; } else if (vel_int_1 < -VEL_INT_MAX) { vel_int_1 = -VEL_INT_MAX; }
+		if (vel_int_2 >  VEL_INT_MAX) { vel_int_2 =  VEL_INT_MAX; } else if (vel_int_2 < -VEL_INT_MAX) { vel_int_2 = -VEL_INT_MAX; }
+	}
+	const float desAcc1 = (1.0f / timeConst_horizVel) * verr1 + vel_int_1;
+	const float desAcc2 = (1.0f / timeConst_horizVel) * verr2 + vel_int_2;
+	float desRoll  = -desAcc2 / gravity;
+	float desPitch =  desAcc1 / gravity;
+	/* Cap the commanded bank so a velocity spike can't demand a violent tilt (see VEL_TILT_MAX). */
+	if (desRoll  >  VEL_TILT_MAX) { desRoll  =  VEL_TILT_MAX; } else if (desRoll  < -VEL_TILT_MAX) { desRoll  = -VEL_TILT_MAX; }
+	if (desPitch >  VEL_TILT_MAX) { desPitch =  VEL_TILT_MAX; } else if (desPitch < -VEL_TILT_MAX) { desPitch = -VEL_TILT_MAX; }
+	/* Slew-limit the tilt command: cap its rate of change so the induced body rate stays low (keeps
+	 * rotation from corrupting the flow -> breaks the roll<->flow oscillation). See TILT_SLEW_RADPS. */
+	if (TILT_SLEW_RADPS > 0.0f) {
+		static float desRoll_prev, desPitch_prev;
+		const float dmax = TILT_SLEW_RADPS * dt;
+		if (estHeight < ALT_INT_GROUND_M) { desRoll_prev = 0.0f; desPitch_prev = 0.0f; }  /* reset on ground */
+		if (desRoll  > desRoll_prev  + dmax) { desRoll  = desRoll_prev  + dmax; }
+		else if (desRoll  < desRoll_prev  - dmax) { desRoll  = desRoll_prev  - dmax; }
+		if (desPitch > desPitch_prev + dmax) { desPitch = desPitch_prev + dmax; }
+		else if (desPitch < desPitch_prev - dmax) { desPitch = desPitch_prev - dmax; }
+		desRoll_prev = desRoll; desPitch_prev = desPitch;
+	}
+#else
+	const float desRoll  = 0.0f;
+	const float desPitch = 0.0f;
+	(void)estVel_1; (void)estVel_2; (void)desVel_1; (void)desVel_2;
+#endif
 
 	/* (3) attitude loop -> desired body rates (+ static trim to cancel unobservable hover drift) */
 	const float roll_tgt  = desRoll  + ROLL_TRIM_RAD;
@@ -219,9 +323,9 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	/* (5) mixing: [thrust, moments] -> per-motor force -> duty */
 	float u[4] = {desNormalizedAcceleration, rollRate_cmd, pitchRate_cmd, yawRate_cmd};
 	u[0] = u[0] * MASS;                 /* normalized accel -> force */
-	for (int i = 0; i < 3; i++) {
-		u[i + 1] = u[i + 1] * J[i];    /* angular accel -> moment */
-	}
+	u[1] = u[1] * J[0] * ATT_GAIN;      /* roll moment  (ATT_GAIN = attitude authority scale) */
+	u[2] = u[2] * J[1] * ATT_GAIN;      /* pitch moment */
+	u[3] = u[3] * J[2];                 /* yaw moment (unscaled) */
 
 	const float M[4][4] = {
 		{0.25f,  0.25f / l_arm, -0.25f / l_arm,  0.25f / k_drag},

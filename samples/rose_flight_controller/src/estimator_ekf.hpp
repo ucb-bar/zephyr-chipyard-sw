@@ -152,7 +152,10 @@ private:
 	float gx, gy, gz;
 	float awx, awy, awz;   /* last world-frame acceleration (for delay prediction) */
 	float dt_last;
-	float r_flow;          /* optical-flow velocity measurement variance */
+	float r_flow_x, r_flow_y;  /* per-axis optical-flow velocity variance (y noisier on the PMW3901) */
+	float flow_href;           /* height (m) at which flow-velocity variance doubles (v = flow*height) */
+	float r_zupt;          /* on-ground zero-velocity (ZUPT) measurement variance */
+	float zupt_height;     /* ToF height (m) below which "at rest on the ground" -> ZUPT */
 	float r_tof;           /* ToF height measurement variance */
 	float flow_gate;       /* chi-square gate (NIS) for flow velocity updates */
 	float tof_gate;        /* chi-square gate (NIS) for ToF position updates */
