@@ -92,8 +92,27 @@ unsigned char
  * Currently a MemoryAllocator is used but a PlatformMemoryAllocator is probably
  * a better fit
  */
-const size_t temp_allocation_pool_size = 1 * 1024 * 1024;
+#ifndef MB_ET_TEMP_MB
+#define MB_ET_TEMP_MB 1
+#endif
+const size_t temp_allocation_pool_size = (size_t)MB_ET_TEMP_MB * 1024 * 1024;
 unsigned char __attribute__((aligned(16))) temp_allocation_pool[temp_allocation_pool_size];
+
+#ifdef MB_TACIT_TRACE_DMA
+/* On FireSim the TACIT encoder can't print over HTIF (TARGET_PRINT is a spike-sim
+ * hook); it streams to DRAM via the TraceSinkDMA. We reserve a fixed .bss buffer
+ * here — its address is a stable ELF symbol the HOST driver reads back after the
+ * run (`+dump-mem=<addr>:<len>:<file>`), so the trace survives even a target
+ * crash (the DMA already landed the bytes). See samples/tacit/TACIT_TRACING.md. */
+#ifndef MB_TACIT_DMA_BUF_MB
+#define MB_TACIT_DMA_BUF_MB 32
+#endif
+#ifndef MB_TACIT_DMA_BYPASS
+#define MB_TACIT_DMA_BYPASS 0   /* set 1 if the DMA sink needs the SBUS bypass path */
+#endif
+unsigned char __attribute__((aligned(64)))
+	mb_tacit_dma_buf[(size_t)MB_TACIT_DMA_BUF_MB * 1024 * 1024];
+#endif
 
 /* void et_pal_init(void)
 {
@@ -235,6 +254,21 @@ Result<BufferCleanup> prepare_input_tensors(Method &method, MemoryAllocator &all
 			}
 		}
 
+#ifdef MB_MEMDBG
+		// EXPERIMENT (ITERS=1 zero-output culprit): input-side fence + scalar
+		// readback. If adding this fence alone makes convs correct, the failing
+		// edge is scalar-input-fill -> vector-load visibility. The printed addr
+		// vs the output addr (MB_OUTPUT_DBG) tests buffer aliasing.
+		__asm__ volatile("fence rw, rw" ::: "memory");
+		if (t.scalar_type() == ScalarType::Float && t.numel() > 0) {
+			const float* ip = t.const_data_ptr<float>();
+			volatile float v0 = ip[0], vm = ip[t.numel()/2], vl = ip[t.numel()-1];
+			printf("MB_INPUT_DBG idx=%zu addr=%p numel=%zu in[0]=%f in[mid]=%f in[last]=%f\n",
+			       (size_t)i, (const void*)ip, (size_t)t.numel(), (double)v0, (double)vm, (double)vl);
+			fflush(stdout);
+		}
+#endif
+
 		err = method.set_input(t, i);
 
 		if (err != Error::Ok)
@@ -358,7 +392,15 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 	const int _mb_iters = MB_EXEC_ITERS;
 #if defined(MB_TACIT_TRACE_MODEL)
 	LTraceEncoderType *_tacit_enc = l_trace_encoder_get(0);
+#ifdef MB_TACIT_TRACE_DMA
+	/* FireSim: point the encoder at the DMA sink, targeted at our .bss buffer. */
+	LTraceSinkDmaType *_tacit_sink = l_trace_sink_dma_get(0);
+	l_trace_sink_dma_configure_addr(_tacit_sink, (uint64_t)(uintptr_t)mb_tacit_dma_buf,
+									MB_TACIT_DMA_BYPASS);
+	l_trace_encoder_configure_target(_tacit_enc, TARGET_DMA);
+#else
 	l_trace_encoder_configure_target(_tacit_enc, TARGET_PRINT);
+#endif
 #endif
 	for (int _it = 0; _it < _mb_iters; _it++) {
 		unsigned long _mb_cyc_begin, _mb_cyc_end;
@@ -368,6 +410,18 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 		bool _tacit_on = (_it == _mb_iters - 1);
 		if (_tacit_on) l_trace_encoder_start(_tacit_enc);
 #endif
+		// Re-establish inputs before EVERY execute (via set_input, which re-copies
+		// into the method's PLANNED input buffers): the memory planner may reuse a
+		// dead input buffer as scratch/output within an execute, so a repeated
+		// execute would otherwise read stale output as input (the ITERS>1 warm
+		// iterations were reading the previous output => wrong checksums). Writing
+		// get_input()'s buffer is NOT enough — set_input is what lands in the plan.
+#ifndef MB_NO_INPUT_REINIT
+		if (_it > 0) {
+			auto &_reinit = *(new auto(::prepare_input_tensors(*method, method_allocator, input_buffers)));  // leaked
+			(void)_reinit;
+		}
+#endif
 		__asm__ volatile("rdcycle %0" : "=r"(_mb_cyc_begin));
 		status = method->execute();
 		__asm__ volatile("rdcycle %0" : "=r"(_mb_cyc_end));
@@ -375,11 +429,31 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 		if (_tacit_on) {
 			l_trace_encoder_stop(_tacit_enc);
 			for (int _i = 0; _i < 16; _i++) __asm__ volatile("nop"); /* flush */
+#ifdef MB_TACIT_TRACE_DMA
+			/* Drain the sink FIFO to DRAM, then announce the region so the host
+			 * (+dump-mem) knows exactly what to read back. Printed BEFORE any
+			 * post-execute work so it's on the console even if a later model
+			 * faults; the DMA'd bytes are already in DRAM regardless. */
+			_tacit_sink->TR_SK_DMA_FLUSH = 1;
+			while (_tacit_sink->TR_SK_DMA_FLUSH_DONE == 0) { }
+			unsigned long _tr_bytes = (unsigned long)_tacit_sink->TR_SK_DMA_COUNT;
+			printf("MB_TACIT_DMA_TRACE tag=%s addr=0x%lx bytes=%lu bufsz=%lu\n",
+				   _mb_tag, (unsigned long)(uintptr_t)mb_tacit_dma_buf, _tr_bytes,
+				   (unsigned long)sizeof(mb_tacit_dma_buf));
+			fflush(stdout);
+#endif
 		}
 #endif
 		printf("EXECUTORCH_EXECUTE_CYCLES[%s][%d]=%lu\n", _mb_tag, _it, _mb_cyc_end - _mb_cyc_begin);
 		fflush(stdout);
 	}
+	// The final execute()'s outputs are written by the Saturn vector unit (RVV
+	// stores). Make them visible to the scalar reads below (get_outputs/checksum)
+	// with a full memory fence. Without this, a single iteration (MB_EXEC_ITERS=1)
+	// reads all-zeros on FireSim; a 2nd iteration only "fixed" it by incidentally
+	// forcing the prior stores through. (This SoC has no CBO/cache-mgmt config, so
+	// rely on the RVV/scalar coherence + fence ordering.)
+	__asm__ volatile("fence rw, rw" ::: "memory");
 	size_t executor_memsize = method_allocator.used_size() - executor_membase;
 
 	ET_LOG(Info, "model_pte_loaded_size:     %lu bytes.", pte_size);
@@ -419,6 +493,16 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 	{
 		Tensor t = outputs[i].toTensor();
 		const int n = (int)t.numel();
+#ifdef MB_MEMDBG
+		// Output buffer address (compare to MB_INPUT_DBG addr for aliasing) + a
+		// scalar readback of the raw output region right here (before the checksum).
+		if (t.scalar_type() == ScalarType::Float && n > 0) {
+			const float* op = t.const_data_ptr<float>();
+			printf("MB_OUTPUT_DBG idx=%d addr=%p numel=%d out[0]=%f out[mid]=%f out[last]=%f\n",
+			       i, (const void*)op, n, (double)op[0], (double)op[n/2], (double)op[n-1]);
+			fflush(stdout);
+		}
+#endif
 		// The output might be collected and parsed so printf() is used instead
 		// of ET_LOG() here.
 		// FireSim's HTIF console costs ~millions of cycles per char, so dumping
@@ -445,8 +529,13 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 			for (int j = 0; j < n; ++j) sum += p[j];
 			printf("Output[%d] numel=%d checksum=%lld\n", i, n, sum);
 #ifdef MB_ET_SAMPLE_OUTPUT
-			for (int j = 0; j < n && j < 8; ++j)
-				printf("Output[%d][%d]: %d\n", i, j, p[j]);
+#ifndef MB_ET_SAMPLE_N
+#define MB_ET_SAMPLE_N 64
+#endif
+			{ int _sn = n < MB_ET_SAMPLE_N ? n : MB_ET_SAMPLE_N;
+			  for (int j = 0; j < _sn; ++j) printf("O[%d][%d]=%d\n", i, j, p[j]);
+			  int _st = n / 64; if (_st < 1) _st = 1;   // strided sample across the rest
+			  for (int j = _sn; j < n; j += _st) printf("O[%d][%d]=%d\n", i, j, p[j]); }
 #endif
 		}
 		else
@@ -456,8 +545,15 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 			for (int j = 0; j < n; ++j) sum += (double)p[j];
 			printf("Output[%d] numel=%d checksum=%f\n", i, n, sum);
 #ifdef MB_ET_SAMPLE_OUTPUT
-			for (int j = 0; j < n && j < 8; ++j)
-				printf("Output[%d][%d]: %f\n", i, j, p[j]);
+#ifndef MB_ET_SAMPLE_N
+#define MB_ET_SAMPLE_N 64
+#endif
+			// Dump first MB_ET_SAMPLE_N output elems + a strided sample across the
+			// rest, so a spike-vs-FireSim diff shows WHERE the kernel diverges.
+			{ int _sn = n < MB_ET_SAMPLE_N ? n : MB_ET_SAMPLE_N;
+			  for (int j = 0; j < _sn; ++j) printf("O[%d][%d]=%.6f\n", i, j, p[j]);
+			  int _st = n / 64; if (_st < 1) _st = 1;
+			  for (int j = _sn; j < n; j += _st) printf("O[%d][%d]=%.6f\n", i, j, p[j]); }
 #endif
 		}
 #endif
