@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <math.h>   // FOC workload uses sqrtf/sin/cos/fmaxf/fminf (newer toolchain: no implicit decls)
 #include <zephyr/sys/reboot.h>
 #include <zephyr/arch/cpu.h>  // Required for arch_curr_cpu()->id
 
