@@ -13,3 +13,7 @@
 .install_submodules.log
 .install_conda.log
 /build/
+
+# COCO-pretrained YOLOv8n weights; ultralytics downloads this on demand
+# (YOLO("yolov8n.pt") in modelblaster/examples/yolov8_nano).
+/yolov8n.pt
