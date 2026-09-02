@@ -19,14 +19,21 @@ manifest:
 
   projects:
     # The Zephyr RTOS fork; import its RISC-V manifest to pull the curated module set.
+    # rose-2-dev carries the bmi08x/vl53l1x ESP32-C6 I2C fixes and the VL53L1X
+    # metre conversion the flight-controller estimator depends on; the previous
+    # pin (4329bf61, 2025-11-22) predates all of it. The zephyr_ws/zephyr
+    # submodule is the tree rb actually builds -- keep the two in step.
     - name: zephyr
       repo-path: zephyr
-      revision: 4329bf61c4fe97dd11715faa138d0500694e6096
+      revision: rose-2-dev
       import: west-riscv.yml
     # RoSE co-sim bridge guest module (split out of ucb-bar/RoSE:soc/sw/zephyr-rose).
+    # Tracks rose-2-dev, not main: samples/rose_nav_controller selects ROSE_CAMERA and
+    # ROSE_VISION, which the camera/vision work added after the main-branch split. On
+    # main the nav controller fails Kconfig with "undefined symbol ROSE_CAMERA".
     - name: zephyr-rose
       repo-path: zephyr-rose
-      revision: main
+      revision: rose-2-dev
       path: modules/lib/zephyr-rose
 
   self:
