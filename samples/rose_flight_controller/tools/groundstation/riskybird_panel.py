@@ -22,6 +22,7 @@ Usage:
 Then open  http://127.0.0.1:8080  (the URL is printed on start).
 """
 import argparse
+import base64
 import csv
 import datetime
 import json
@@ -29,8 +30,10 @@ import math
 import os
 import re
 import socket
+import struct
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +54,20 @@ TAIL_RE = re.compile(
 # dead-reckoned position (present on firmware >= the 3D-view build; \b so it doesn't match vx=)
 POS_RE = re.compile(r"\bx=" + _F + r"\s+y=" + _F)
 
+# compact telemetry from the FPGA build (telem_uart.c "RBT ..." line -- fewer fields than the ESP
+# format; motors/drift/battery are absent on the FPGA path so those stay None/blank in the UI).
+RBT_RE = re.compile(
+    r"RBT\s+it=(-?\d+)\s+r=" + _F + r"\s+p=" + _F + r"\s+y=" + _F + r"\s+z=" + _F +
+    r"\s+vz=" + _F + r"\s+h=" + _F + r"\s+tv=(\d+)\s+fl=(-?\d+)"
+    r"(?:\s+cam=(\d+)\s+camm=(\d+))?"
+)
+# side-ToF walls appended to the RBT line: "wl=<front>,<back>,<left>,<right> wsq=<seq>" (mm; -1=no target)
+WALLS_RE = re.compile(r"wl=(-?\d+),(-?\d+),(-?\d+),(-?\d+)\s+wsq=(\d+)")
+# camera snapshot chunk: "IMG s=<seq> k=<chunk>/<total> w=<W> h=<H> <base64>"
+IMG_RE = re.compile(r"IMG\s+s=(\d+)\s+k=(\d+)/(\d+)\s+w=(\d+)\s+h=(\d+)\s+([A-Za-z0-9+/=]+)")
+# firmware ACK line (e.g. "ACK SNAP", "ACK PONG") -- surfaced to the dashboard.
+ACK_RE = re.compile(r"^ACK\s+(.+?)\s*$")
+
 FLAG_ARMED, FLAG_ESTOP, FLAG_ARMING, FLAG_CALDONE = 1, 2, 4, 8
 
 
@@ -68,10 +85,39 @@ def gibbs_to_quat_euler(rx, ry, rz):
     return qw, qx, qy, qz, roll, pitch, yaw
 
 
+def parse_rbt(line):
+    """Compact FPGA telemetry ('RBT it=.. r=.. p=.. y=.. z=.. vz=.. h=.. tv=.. fl=.. cam=.. camm=..').
+    Maps onto the same dict shape as the ESP format; absent fields stay None."""
+    m = RBT_RE.search(line)
+    if not m:
+        return None
+    g = m.groups()
+    d = {
+        "it": int(g[0]), "dt_ms": 0,
+        "roll": float(g[1]), "pitch": float(g[2]), "yaw": float(g[3]),
+        "z": float(g[4]), "vz": float(g[5]), "tofh": float(g[6]),
+        "tofv": int(g[7]), "flow": int(g[8]),
+        "cam": int(g[9]) if g[9] is not None else None,
+        "camm": int(g[10]) if g[10] is not None else None,
+        "u": [None, None, None, None],
+        "vx": None, "vy": None, "zsp": None, "vbat": None, "st": 0, "x": None, "y": None,
+    }
+    qw, qx, qy, qz, roll, pitch, yaw = gibbs_to_quat_euler(d["roll"], d["pitch"], d["yaw"])
+    d["qw"], d["qx"], d["qy"], d["qz"] = qw, qx, qy, qz
+    d["roll"], d["pitch"], d["yaw"] = roll, pitch, yaw
+    d["armed"] = d["estop"] = d["arming"] = False
+    d["caldone"] = bool(d["tofv"])   # no cal flag on the FPGA line; use tof-valid as a liveness proxy
+    w = WALLS_RE.search(line)         # side-ToF walls, when the bumper build appends them
+    if w:
+        d["walls"] = {"front": int(w.group(1)), "back": int(w.group(2)),
+                      "left": int(w.group(3)), "right": int(w.group(4)), "seq": int(w.group(5))}
+    return d
+
+
 def parse_line(line):
     m = CORE_RE.search(line)
     if not m:
-        return None
+        return parse_rbt(line)
     g = m.groups()
     d = {
         "it": int(g[0]), "dt_ms": int(g[1]),
@@ -149,6 +195,67 @@ class Hub:
 HUB = Hub()
 
 
+# ---- camera snapshot reassembly --------------------------------------------------------------
+def _gray_png(w, h, pix):
+    """Encode w*h 8-bit grayscale bytes as a PNG (stdlib zlib only)."""
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data +
+                struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0)   # 8-bit, colour type 0 = grayscale
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)                                     # per-scanline filter 0 (none)
+        raw += pix[y * w:(y + 1) * w]
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
+
+
+class SnapStore:
+    """Reassembles IMG chunks by seq; keeps the last completed frame as a PNG."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cur_seq = None
+        self.chunks = {}          # k -> base64 str for the in-progress frame
+        self.total = 0
+        self.w = self.h = 0
+        self.png = None           # last completed frame, PNG bytes
+        self.png_seq = 0
+        self.rx_at = 0.0
+
+    def on_chunk(self, seq, k, total, w, h, b64):
+        with self.lock:
+            if seq != self.cur_seq:
+                self.cur_seq, self.chunks, self.total = seq, {}, total
+                self.w, self.h = w, h
+            self.chunks[k] = b64
+            self.rx_at = time.monotonic()
+            if self.total and len(self.chunks) >= self.total:
+                try:
+                    data = base64.b64decode("".join(self.chunks[i] for i in range(self.total)))
+                    if len(data) >= w * h:
+                        self.png = _gray_png(w, h, data[:w * h])
+                        self.png_seq = seq
+                except Exception:
+                    pass
+                self.cur_seq, self.chunks = None, {}
+
+    def status(self):
+        with self.lock:
+            prog = None
+            if self.cur_seq is not None and self.total:
+                prog = {"have": len(self.chunks), "total": self.total}
+            return {"seq": self.png_seq, "have_png": self.png is not None,
+                    "w": self.w if self.png else 0, "h": self.h if self.png else 0,
+                    "progress": prog}
+
+    def get_png(self):
+        with self.lock:
+            return self.png, self.png_seq
+
+
+SNAP = SnapStore()
+
+
 # ---- UDP telemetry receiver ------------------------------------------------------------------
 # ---- session CSV log (timestamped, one file per run) -----------------------------------------
 LOG_FIELDS = ["host_ts", "host_iso", "it", "dt_ms", "roll", "pitch", "yaw",
@@ -195,6 +302,11 @@ def udp_rx_thread(port):
         except OSError:
             continue
         for line in data.decode("utf-8", "replace").splitlines():
+            im = IMG_RE.search(line)
+            if im:
+                seq, k, total, w, h, b64 = im.groups()
+                SNAP.on_chunk(int(seq), int(k), int(total), int(w), int(h), b64)
+                continue
             d = parse_line(line)
             if d:
                 HUB.on_packet(d, f"{src[0]}:{src[1]}")
@@ -253,6 +365,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/config":
             body = json.dumps({"drone": self.server.drone_ip, "cmd_port": self.server.cmd_port}).encode()
             self._send(200, "application/json", body)
+        elif self.path.startswith("/snapshot.png"):
+            png, seq = SNAP.get_png()
+            if png is None:
+                self._send(404, "text/plain", b"no snapshot yet")
+            else:
+                self._send(200, "image/png", png, extra={"X-Snap-Seq": str(seq)})
+        elif self.path == "/snapshot.json":
+            self._send(200, "application/json", json.dumps(SNAP.status()).encode())
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -264,7 +384,7 @@ class Handler(BaseHTTPRequestHandler):
         cmd = self.rfile.read(n).decode("utf-8", "replace").strip()
         # whitelist: only forward known commands
         head = cmd.split()[0].upper() if cmd else ""
-        if head not in ("ESTOP", "DISARM", "RESET", "HOVER_Z", "PROFILE", "PING"):
+        if head not in ("ESTOP", "DISARM", "RESET", "HOVER_Z", "PROFILE", "PING", "SNAP"):
             self._send(400, "application/json", json.dumps({"ack": "(rejected: unknown command)"}).encode())
             return
         ack = send_command(self.server.drone_ip, self.server.cmd_port, cmd)
@@ -278,7 +398,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
-                payload = json.dumps(HUB.snapshot())
+                snap = HUB.snapshot()
+                snap["snap"] = SNAP.status()   # camera snapshot availability/progress
+                payload = json.dumps(snap)
                 msg = f"data: {payload}\n\n".encode("utf-8")
                 self.wfile.write(msg)
                 self.wfile.flush()
