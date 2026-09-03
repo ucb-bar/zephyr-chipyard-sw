@@ -74,6 +74,32 @@
 #define HM_MODE_STREAMING   0x01
 #define TEST_PATTERN        0     /* 0 = live scene; 1 = sensor test pattern */
 
+/* ---- Exposure / gain (HM01B0 AE + manual regs) ---- */
+#define HM_GRP_HOLD     0x0104   /* write 1 to hold grouped params, 0 to release+apply next frame */
+#define HM_FRAME_LEN_H  0x0340   /* frame length (VTS) in lines; caps how long integration can be */
+#define HM_FRAME_LEN_L  0x0341
+#define HM_INTG_H       0x0202   /* coarse integration (exposure) in lines, high byte */
+#define HM_INTG_L       0x0203
+#define HM_ANA_GAIN     0x0205   /* [6:4] analog gain code: 0=1x,1=2x,2=4x,3=8x,4=16x */
+#define HM_DGAIN_H      0x020E   /* digital gain, 8.8: 0x0100 = 1.0x */
+#define HM_DGAIN_L      0x020F
+#define HM_AE_CTRL      0x2100   /* [0] AE enable */
+#define HM_AE_TARGET    0x2101   /* AE target mean brightness (default 0x3C=60) */
+#define HM_AE_MAX_INTG_H 0x2105
+#define HM_AE_MAX_INTG_L 0x2106
+#define HM_MAX_AGAIN    0x210B   /* AE max analog gain code */
+#define HM_MAX_DGAIN    0x210D
+
+#define DUMP_REGS       1        /* print current exposure regs */
+
+/* Manual exposure: AE off, low analog gain (clean), brightness from long integration + modest
+ * digital gain. The original AE image (analog 1x) had real contrast; cranking analog gain flattened
+ * it. So keep analog at 1x and expose longer instead. */
+#define MANUAL_EXPOSURE 1
+#define MAN_INTG        0x0230   /* integration lines (~560; near frame length VTS ~0x0232=562) */
+#define MAN_AGAIN       0x10     /* analog gain code: 0=1x, 0x10=2x (clean-ish) */
+#define MAN_DGAIN       0x0300   /* digital gain 8.8: 0x0300 = 3.0x */
+
 /* Reconstruction bounds. Buffer holds < one full 326x324 frame, so cap the capture just under it. */
 #define MAX_W       340
 #define MAX_H       324
@@ -121,6 +147,42 @@ int main(void)
 	if (hm_wr(bus, HM_TEST_PATTERN, TEST_PATTERN)) { printk("FAIL: TEST_PATTERN write\n"); return 0; }
 	if (hm_wr(bus, HM_MODE_SELECT, HM_MODE_STREAMING)) { printk("FAIL: MODE_SELECT write\n"); return 0; }
 	k_msleep(200);   /* let auto-exposure settle for a live scene */
+
+#if DUMP_REGS
+	{
+		static const uint16_t regs[] = {
+			HM_FRAME_LEN_H, HM_FRAME_LEN_L, HM_INTG_H, HM_INTG_L, HM_ANA_GAIN, HM_DGAIN_H, HM_DGAIN_L,
+			HM_AE_CTRL, HM_AE_TARGET, 0x2102, HM_AE_MAX_INTG_H, HM_AE_MAX_INTG_L,
+			0x2107, 0x2108, 0x2109, 0x210A, HM_MAX_AGAIN, HM_MAX_DGAIN };
+		printk("[regs]");
+		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+			uint8_t v = 0; hm_rd(bus, regs[i], &v);
+			printk(" %04x=%02x", regs[i], v);
+		}
+		printk("\n");
+	}
+#endif
+
+	/* Manual exposure: disable AE and program integration/gain deterministically. */
+#if MANUAL_EXPOSURE
+	hm_wr(bus, HM_AE_CTRL, 0x00);                 /* AE off */
+	hm_wr(bus, HM_GRP_HOLD, 0x01);
+	hm_wr(bus, HM_INTG_H, (MAN_INTG >> 8) & 0xff);
+	hm_wr(bus, HM_INTG_L, MAN_INTG & 0xff);
+	hm_wr(bus, HM_ANA_GAIN, MAN_AGAIN);
+	hm_wr(bus, HM_DGAIN_H, (MAN_DGAIN >> 8) & 0xff);
+	hm_wr(bus, HM_DGAIN_L, MAN_DGAIN & 0xff);
+	hm_wr(bus, HM_GRP_HOLD, 0x00);
+	k_msleep(400);                                /* a few frames for the new exposure to take */
+	{
+		uint8_t ih = 0, il = 0, ag = 0, dh = 0, dl = 0, ae = 0;
+		hm_rd(bus, HM_AE_CTRL, &ae);
+		hm_rd(bus, HM_INTG_H, &ih); hm_rd(bus, HM_INTG_L, &il);
+		hm_rd(bus, HM_ANA_GAIN, &ag); hm_rd(bus, HM_DGAIN_H, &dh); hm_rd(bus, HM_DGAIN_L, &dl);
+		printk("[expose] manual: AE=%d intg=0x%02x%02x again=0x%02x dgain=0x%02x%02x\n",
+		       ae, ih, il, ag, dh, dl);
+	}
+#endif
 
 	/* Verify the sensor is actually driving pixels/sync before we arm. */
 	uint32_t p0 = r32(OSPI_PCLKCNT), f0 = r32(OSPI_FVLDCNT), l0 = r32(OSPI_LVLDCNT);
