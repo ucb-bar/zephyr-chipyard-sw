@@ -32,6 +32,7 @@
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/method.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 
 #define AP_SSID_PREFIX "riskybird-"
@@ -145,6 +146,64 @@ static const uint8_t mobile_html_gz[] = {
 #include "mobile_html.gz.inc"
 };
 
+/* ---- camera snapshot reassembly (served at GET /snap) --------------------------------------- *
+ * The FPGA streams a downsampled frame as newline-framed base64 chunks on the telemetry link:
+ *     IMG s=<seq> k=<k>/<total> w=<W> h=<H> <base64 of up to 150 raw grayscale bytes>
+ * (k is 0-based and the chunks arrive in order over the lossless ISR ring.) We concatenate the
+ * chunks' base64 into the base64 of the whole W*H frame and hand the last COMPLETE frame to /snap.
+ * No re-encode is needed: every chunk but the last carries a multiple of 3 raw bytes (150), so the
+ * chunk base64 strings concatenate into valid base64 of the full frame -- the browser atob()s it
+ * straight into pixels. A partial/corrupted frame is dropped, so /snap always holds a whole one. */
+#define SNAP_B64_MAX 8192           /* base64 of ~6144 raw px; an 80x60 thumbnail needs 6400 chars */
+static K_MUTEX_DEFINE(snap_mtx);
+static char   g_snap[SNAP_B64_MAX]; /* last complete frame: concatenated base64 (0 len = none yet) */
+static size_t g_snap_len;
+static int    g_snap_w, g_snap_h;
+/* in-progress accumulator -- touched only by the single uart_to_udp thread, so it needs no lock */
+static char     asm_buf[SNAP_B64_MAX];
+static size_t   asm_len;
+static uint32_t asm_seq;
+static int      asm_next_k, asm_total, asm_w, asm_h;
+static bool     asm_on;
+
+static void snap_feed(const char *line, size_t len)
+{
+	/* Parse "IMG s=<u> k=<u>/<u> w=<u> h=<u> <b64>" strictly; reject anything malformed so a line
+	 * mangled by an RX-ring byte-drop can't poison the accumulator (same guard rationale as /t). */
+	if (len < 20 || memcmp(line, "IMG s=", 6) != 0) { return; }
+	char *p = (char *)line + 6;
+	unsigned long seq   = strtoul(p, &p, 10); if (*p != ' ') { return; } while (*p == ' ') { p++; }
+	if (memcmp(p, "k=", 2) != 0) { return; } p += 2;
+	unsigned long k     = strtoul(p, &p, 10); if (*p != '/') { return; } p++;
+	unsigned long total = strtoul(p, &p, 10); if (*p != ' ') { return; } while (*p == ' ') { p++; }
+	if (memcmp(p, "w=", 2) != 0) { return; } p += 2;
+	unsigned long w     = strtoul(p, &p, 10); if (*p != ' ') { return; } while (*p == ' ') { p++; }
+	if (memcmp(p, "h=", 2) != 0) { return; } p += 2;
+	unsigned long h     = strtoul(p, &p, 10); if (*p != ' ') { return; } while (*p == ' ') { p++; }
+	const char *b64 = p;
+	size_t blen = (size_t)(line + len - b64);
+	while (blen && (b64[blen - 1] == '\n' || b64[blen - 1] == '\r' || b64[blen - 1] == ' ')) { blen--; }
+	if (total == 0 || total > 128 || blen == 0 || blen > 300) { return; }
+
+	if (k == 0) {                       /* first chunk -> start a fresh frame */
+		asm_seq = (uint32_t)seq; asm_total = (int)total; asm_w = (int)w; asm_h = (int)h;
+		asm_len = 0; asm_next_k = 0; asm_on = true;
+	}
+	/* accept only the next in-order chunk of the current frame; else drop this partial frame */
+	if (!asm_on || (uint32_t)seq != asm_seq || (int)k != asm_next_k) { asm_on = false; return; }
+	if (asm_len + blen > sizeof(asm_buf)) { asm_on = false; return; }
+	memcpy(asm_buf + asm_len, b64, blen);
+	asm_len += blen;
+	asm_next_k++;
+	if (asm_next_k >= asm_total) {       /* all chunks in -> publish the completed frame */
+		k_mutex_lock(&snap_mtx, K_FOREVER);
+		memcpy(g_snap, asm_buf, asm_len);
+		g_snap_len = asm_len; g_snap_w = asm_w; g_snap_h = asm_h;
+		k_mutex_unlock(&snap_mtx);
+		asm_on = false;
+	}
+}
+
 static void fpga_uart_isr(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -193,6 +252,9 @@ static void uart_to_udp(void *a, void *b, void *c)
 					g_telem_len = len;
 					memcpy(g_telem, buf, len);
 					k_mutex_unlock(&telem_mtx);
+				} else if (len >= 4 && memcmp(buf, "IMG ", 4) == 0) {
+					/* camera snapshot chunk -> reassemble the frame for GET /snap */
+					snap_feed((const char *)buf, len);
 				}
 				(void)zsock_sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
 				len = 0;
@@ -233,6 +295,7 @@ static void udp_to_uart(void *a, void *b, void *c)
 /* ---- On-board HTTP server (port 80) ---------------------------------------------------------- *
  *   GET  /     -> the gzipped mobile flight page (from flash)
  *   GET  /t    -> the latest RBT telemetry line as text (the page polls this ~15 Hz)
+ *   GET  /snap -> the last complete camera frame ("<w> <h>\n<base64>"); POST /cmd SNAP forces one
  *   POST /cmd  -> forward the body to the FPGA over uart1 (ESTOP/RESET/HOVER_Z/SNAP/...)
  * A phone on the SoftAP just browses to http://192.168.4.1/ -- no laptop or bridge script. */
 static struct http_resource_detail_static page_res = {
@@ -295,11 +358,40 @@ static struct http_resource_detail_dynamic cmd_res = {
 	.cb = cmd_handler,
 };
 
+/* GET /snap -> the last complete camera frame as "<w> <h>\n<base64 of w*h grayscale bytes>"
+ * (empty until the first frame reassembles). The page atob()s the payload straight into a canvas. */
+static int snap_handler(struct http_client_ctx *client, enum http_data_status status,
+			const struct http_request_ctx *req, struct http_response_ctx *resp, void *ud)
+{
+	static uint8_t sbuf[SNAP_B64_MAX + 32];
+	ARG_UNUSED(client); ARG_UNUSED(req); ARG_UNUSED(ud);
+	if (status == HTTP_SERVER_DATA_FINAL) {
+		size_t n = 0;
+		k_mutex_lock(&snap_mtx, K_FOREVER);
+		if (g_snap_len) {
+			n = snprintk((char *)sbuf, 32, "%d %d\n", g_snap_w, g_snap_h);
+			memcpy(sbuf + n, g_snap, g_snap_len);
+			n += g_snap_len;
+		}
+		k_mutex_unlock(&snap_mtx);
+		resp->body = sbuf;
+		resp->body_len = n;
+		resp->final_chunk = true;
+	}
+	return 0;
+}
+static struct http_resource_detail_dynamic snap_res = {
+	.common = { .type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		    .bitmask_of_supported_http_methods = BIT(HTTP_GET) },
+	.cb = snap_handler,
+};
+
 static uint16_t http_port = 80;
 HTTP_SERVICE_DEFINE(rb_http, NULL, &http_port, 4, 10, NULL, NULL, NULL);
 HTTP_RESOURCE_DEFINE(rb_root, rb_http, "/", &page_res);
 HTTP_RESOURCE_DEFINE(rb_t, rb_http, "/t", &t_res);
 HTTP_RESOURCE_DEFINE(rb_cmd, rb_http, "/cmd", &cmd_res);
+HTTP_RESOURCE_DEFINE(rb_snap, rb_http, "/snap", &snap_res);
 
 K_THREAD_DEFINE(tx_tid, 4096, uart_to_udp, NULL, NULL, NULL, 7, 0, 0);
 K_THREAD_DEFINE(rx_tid, 4096, udp_to_uart, NULL, NULL, NULL, 7, 0, 0);

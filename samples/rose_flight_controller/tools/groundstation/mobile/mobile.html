@@ -81,6 +81,11 @@ main{padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:
 .sub{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:6px;display:flex;justify-content:space-between;gap:6px}
 .sub b{color:var(--ink);font-weight:700}
 canvas{width:100%;display:block;border-radius:8px;background:#05080d;touch-action:none}
+/* camera tile: nearest-neighbour upscale of the tiny grayscale frame; keep the sensor 4:3 */
+#cam{image-rendering:pixelated;aspect-ratio:4/3;object-fit:contain}
+.camrow{display:flex;align-items:center;gap:8px;margin-top:8px}
+.camrow .btn{flex:0 0 auto;padding:8px 14px}
+.camrow .camstat{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto}
 .bar{height:9px;border-radius:6px;background:#05080d;border:1px solid var(--line);overflow:hidden;margin-top:8px;position:relative}
 .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .12s linear}
 .bar>.mark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--warn);opacity:.9}
@@ -230,6 +235,16 @@ canvas{width:100%;display:block;border-radius:8px;background:#05080d;touch-actio
       <div class="mot"><div class="lbl"><span>FR · m0</span><span class="mval" id="m0">--</span></div><div class="mbar"><i id="m0b"></i></div></div>
       <div class="mot"><div class="lbl"><span>RL · m2</span><span class="mval" id="m2">--</span></div><div class="mbar"><i id="m2b"></i></div></div>
       <div class="mot"><div class="lbl"><span>RR · m1</span><span class="mval" id="m1">--</span></div><div class="mbar"><i id="m1b"></i></div></div>
+    </div>
+  </div>
+
+  <!-- Camera snapshot -->
+  <div class="card wide">
+    <h2>Camera</h2>
+    <canvas id="cam" width="80" height="60"></canvas>
+    <div class="camrow">
+      <button class="btn" id="capbtn" onpointerdown="camCapture()">📷 CAPTURE</button>
+      <span class="camstat" id="camstat">no image</span>
     </div>
   </div>
 </main>
@@ -464,7 +479,7 @@ const Transport = (()=>{
   }
   const f3=v=>{ const s=v<0?"-":""; const a=Math.abs(v);
     return s+Math.floor(a)+"."+String(Math.floor(a*1000)%1000).padStart(3,"0"); };
-  return { start, stop, sendCmd, get mode(){return mode;} };
+  return { start, stop, sendCmd, get mode(){return mode;}, get base(){return base;} };
 })();
 
 /* ---------- command UI ---------- */
@@ -478,6 +493,63 @@ function sendHover(){ cmd("HOVER_Z "+hoverMM); }
 function estop(){ const b=$("estop"); b.classList.remove("confirmed"); void b.offsetWidth; b.classList.add("confirmed");
   cmd("ESTOP"); if(navigator.vibrate) navigator.vibrate([40,30,40]); }
 setHover();
+
+/* ---------- camera snapshot ----------
+ * poll mode (ESP)  : GET base+'/snap' -> "<w> <h>\n<base64 grayscale>" -> ImageData on the canvas.
+ * sse  mode (panel): panel.py serves a reassembled PNG at /snapshot.png -> drawImage.
+ * demo mode        : a static checker placeholder (no drone). CAPTURE POSTs 'SNAP' to force a frame,
+ *                    which the FC downsamples + streams; the bridge reassembles it for /snap. */
+const CAM = (()=>{
+  let timer=null, curMode="demo", lastSig="";
+  const cv=()=>$("cam"), stat=s=>{ $("camstat").textContent=s; };
+  function drawGray(w,h,bin){
+    const c=cv(); c.width=w; c.height=h;
+    const x=c.getContext("2d"), id=x.createImageData(w,h), d=id.data;
+    for(let i=0;i<w*h;i++){ const v=bin.charCodeAt(i)&255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255; }
+    x.putImageData(id,0,0);
+  }
+  async function pullSnap(){
+    try{
+      const r=await fetch(Transport.base+"/snap",{cache:"no-store"}); if(!r.ok) return;
+      const t=await r.text(), nl=t.indexOf("\n");
+      if(nl<3){ if(!lastSig) stat("waiting for frame…"); return; }   // no complete frame yet
+      const [w,h]=t.slice(0,nl).trim().split(/\s+/).map(Number);
+      const b64=t.slice(nl+1).replace(/\s+/g,"");
+      if(!(w>0)||!(h>0)||!b64) return;
+      let bin; try{ bin=atob(b64); }catch(e){ return; }
+      if(bin.length<w*h) return;
+      const sig=w+"x"+h+":"+b64.length+":"+b64.slice(-10);
+      if(sig!==lastSig){ lastSig=sig; drawGray(w,h,bin);
+        stat(w+"×"+h+" · "+new Date().toLocaleTimeString()); }
+    }catch(e){/* dropped poll: keep last frame */}
+  }
+  function pullPng(){
+    const img=new Image();
+    img.onload=()=>{ const c=cv(), w=img.naturalWidth||80, h=img.naturalHeight||60;
+      c.width=w; c.height=h; c.getContext("2d").drawImage(img,0,0,w,h);
+      lastSig="png"; stat(w+"×"+h+" · "+new Date().toLocaleTimeString()); };
+    img.onerror=()=>{ if(!lastSig) stat("no image yet"); };
+    img.src=Transport.base+"/snapshot.png?"+Date.now();
+  }
+  function tick(){ if(curMode==="poll") pullSnap(); else if(curMode==="sse") pullPng(); }
+  function placeholder(){
+    const c=cv(), w=80, h=60; c.width=w; c.height=h;
+    const x=c.getContext("2d"), id=x.createImageData(w,h), d=id.data;
+    for(let yy=0;yy<h;yy++) for(let xx=0;xx<w;xx++){ const i=(yy*w+xx)*4;
+      const v=(((xx>>3)+(yy>>3))&1)?58:30; d[i]=d[i+1]=d[i+2]=v; d[i+3]=255; }
+    x.putImageData(id,0,0);
+  }
+  function start(m){ stop(); curMode=m; lastSig="";
+    if(m==="demo"){ placeholder(); stat("demo — no camera"); return; }
+    stat("connecting…"); tick(); timer=setInterval(tick,1500); }
+  function stop(){ if(timer){ clearInterval(timer); timer=null; } }
+  function capture(){
+    if(curMode==="demo"){ placeholder(); stat("demo — no camera"); return; }
+    stat("requesting snapshot…"); Transport.sendCmd("SNAP");
+    setTimeout(tick,700); setTimeout(tick,1500); }   // give the FC a frame or two to stream
+  return { start, stop, capture };
+})();
+function camCapture(){ CAM.capture(); }
 
 /* ---------- render loop (rAF, throttled ~25 fps — decoupled from 50 Hz packets) ---------- */
 function stateClass(t,link){
@@ -602,7 +674,7 @@ function pickMode(m){ [...document.querySelectorAll('#modeseg button')].forEach(
     b.classList.toggle("on", b.dataset.mode===m)); }
 function applyMode(m){ pickMode(m); const base=$("baseurl").value.trim();
   try{ localStorage.setItem("rb_mode",m); localStorage.setItem("rb_base",base); }catch(e){}
-  Transport.start(m,base); }
+  Transport.start(m,base); CAM.start(m); }
 document.querySelectorAll('#modeseg button').forEach(b=>
   b.addEventListener("click",()=>applyMode(b.dataset.mode)));
 $("baseurl").addEventListener("change",()=>applyMode(
@@ -619,7 +691,7 @@ $("baseurl").addEventListener("change",()=>applyMode(
   if(mode==null) mode = !location.protocol.startsWith("http") ? "demo"
                       : (location.hostname==="192.168.4.1" ? "poll" : "sse");
   if(base) $("baseurl").value=base;
-  pickMode(mode); Transport.start(mode, base||"");
+  pickMode(mode); Transport.start(mode, base||""); CAM.start(mode);
 })();
 
 /* prevent double-tap zoom on the control buttons; keep page from bouncing */
