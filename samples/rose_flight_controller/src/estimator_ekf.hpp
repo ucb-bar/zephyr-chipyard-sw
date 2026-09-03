@@ -140,7 +140,8 @@ class EkfEstimator : public IStateEstimator {
 public:
 	void init(float x0, float y0, float z0) override;
 	void update(const float accel[3], const float gyro[3], const float flow[2],
-		    bool flow_valid, float height, bool tof_valid, float dt) override;
+		    bool flow_valid, float height, bool tof_valid,
+		    float baro_rel, bool baro_valid, float dt) override;
 	void fuse_walls(float d_front, float d_back, float d_left, float d_right,
 			float rmax) override;
 	void get_state(float state[EST_NSTATES]) const override;
@@ -157,6 +158,9 @@ private:
 	float r_zupt;          /* on-ground zero-velocity (ZUPT) measurement variance */
 	float zupt_height;     /* ToF height (m) below which "at rest on the ground" -> ZUPT */
 	float r_tof;           /* ToF height measurement variance */
+	float r_baro;          /* barometer altitude measurement variance (looser than ToF; ROSE_BARO) */
+	float baro_bias;       /* floor-referenced altitude minus baro_rel: baro_z = baro_rel + baro_bias */
+	bool  baro_have;       /* baro_bias locked to a trusted ToF reference (ROSE_BARO) */
 	float flow_gate;       /* chi-square gate (NIS) for flow velocity updates */
 	float tof_gate;        /* chi-square gate (NIS) for ToF position updates */
 	float r_wall;          /* wall-derived horizontal position measurement variance */

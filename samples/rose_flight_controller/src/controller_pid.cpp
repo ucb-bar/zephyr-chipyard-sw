@@ -74,14 +74,20 @@ static const float timeConst_horizVel = VEL_TC;
 #define TILT_SLEW_RADPS 1.0f
 #endif
 
-/* attitude (angle) loop */
-static const float tau_roll           = 0.10f;
-static const float tau_pitch          = 0.10f;   /* = tau_roll */
+/* attitude (angle) loop -- larger tau = softer/slower (override via -DTAU_ROLL=<s>) */
+#ifndef TAU_ROLL
+#define TAU_ROLL 0.10f
+#endif
+static const float tau_roll           = TAU_ROLL;
+static const float tau_pitch          = TAU_ROLL;   /* = tau_roll */
 static const float tau_yaw            = 0.25f;
 
-/* body-rate loop */
-static const float tau_rollRate       = 0.025f;
-static const float tau_pitchRate      = 0.025f;  /* = tau_rollRate */
+/* body-rate (inner) loop -- larger tau = softer, less oscillation (override via -DTAU_ROLLRATE=<s>) */
+#ifndef TAU_ROLLRATE
+#define TAU_ROLLRATE 0.025f
+#endif
+static const float tau_rollRate       = TAU_ROLLRATE;
+static const float tau_pitchRate      = TAU_ROLLRATE;  /* = tau_rollRate */
 static const float tau_yawRate        = 0.05f;
 
 /* rigid-body params used by the mixer (as used in the original firmware's mixing block) */
@@ -107,9 +113,12 @@ static const float k_drag             = 0.01f;
  *                                       45-35 table, RMS 0.38 g, max 0.82 g over 0..94%)
  *   https://www.bitcraze.io/documentation/repository/crazyflie-firmware/master/functional-areas/pwm-to-thrust/
  *
- * The 47-17 prop (what we spin) delivers ~15% more thrust than the 45-35 at the same drive
- * (Bitcraze published only this relative figure, no full 47-17 polynomial), so we scale the
- * curve by PROP_4717_GAIN. forceToVoltage() inverts thrust(duty) via the quadratic formula.
+ * This airframe (riskybird v3) runs the Bitcraze THRUST-UPGRADE combo: 7x20 mm motors + HQ
+ * Ultralight 51MMX2 props. Bitcraze rates that at ~+5 g/motor (~+20 g TOTAL) over the stock
+ * 7x16 + 45-35, i.e. ~1.33x the 45-35 total-thrust curve (no full polynomial published), so we
+ * scale by PROP_GAIN. APPROXIMATE (modeled as a uniform gain from the published max-thrust
+ * delta) -- a bench thrust-stand cal for THIS airframe is still more accurate. (Was 1.15 =
+ * 47-17 vs 45-35 on the OG drone.) forceToVoltage() inverts thrust(duty) via the quadratic.
  *
  * IMPORTANT (fixed 2026-08-06): the Bitcraze table is TOTAL thrust of all 4 motors (whole
  * Crazyflie on a scale), max ~58 g total at 94% -- NOT per-motor. But the mixer feeds
@@ -120,7 +129,7 @@ static const float k_drag             = 0.01f;
  * gave ~58%.) A bench thrust-stand cal for THIS airframe would still be more accurate. */
 static const float THRUST_A        = 26.919633f;   /* g per duty^2 (45-35 TOTAL fit) */
 static const float THRUST_B        = 35.754861f;   /* g per duty   (45-35 TOTAL fit) */
-static const float PROP_4717_GAIN  = 1.15f;        /* 47-17 vs 45-35 thrust ratio */
+static const float PROP_GAIN       = 1.33f;        /* 7x20 + 51MMX2 vs 45-35 (see note above) */
 static const float GRAMS_PER_NEWTON = 101.9368f;   /* 1 / 9.80665e-3 */
 static const float MOTORS           = 4.0f;        /* curve is total-thrust -> scale per-motor x4 */
 
@@ -130,7 +139,7 @@ static float forceToVoltage(float forceNewtons)
 		return 0.0f;
 	}
 	/* per-motor force (g), scaled x4 to the TOTAL curve and de-scaled to the 45-35 base */
-	float t = (forceNewtons * GRAMS_PER_NEWTON * MOTORS) / PROP_4717_GAIN;
+	float t = (forceNewtons * GRAMS_PER_NEWTON * MOTORS) / PROP_GAIN;
 	/* solve THRUST_A*duty^2 + THRUST_B*duty - t = 0 for duty >= 0 */
 	float disc = THRUST_B * THRUST_B + 4.0f * THRUST_A * t;
 	if (disc < 0.0f) {
@@ -186,6 +195,21 @@ static float forceToVoltage(float forceNewtons)
  * baseline: it drifts horizontally but stays oriented. */
 #ifndef ROSE_VEL_LOOP
 #define ROSE_VEL_LOOP 1
+#endif
+/* POSITION-HOLD outer loop (opt-in, OFF by default). Wraps the velocity loop: latch a horizontal
+ * position reference at takeoff, then command a velocity SETPOINT back toward it -- turning "hold zero
+ * velocity" into "return to a spot", which cuts the residual dead-reckoning drift the velocity-only loop
+ * leaves (~1 m/s wander). Enable with -DROSE_POS_LOOP=1. See the block in compute() for the full
+ * rationale + the dead-reckoning-drift caveat. KP_POS is the position->velocity gain (1/s) and
+ * POS_VEL_MAX clamps the commanded return speed (m/s). */
+#ifndef ROSE_POS_LOOP
+#define ROSE_POS_LOOP 0
+#endif
+#ifndef KP_POS
+#define KP_POS 1.0f          /* position->velocity gain (1/s): desVel = -KP_POS*(pos - pos_ref) */
+#endif
+#ifndef POS_VEL_MAX
+#define POS_VEL_MAX 0.3f     /* clamp on the position-hold velocity command magnitude (m/s), per axis */
 #endif
 /* Attitude-loop authority scale on the roll+pitch moments. 1.0 = original gains; <1 = gentler / more
  * phase margin. The bare-drone gains went marginally unstable once the cage changed the mass/inertia
@@ -252,8 +276,35 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 		desVel_2 += WALL_SIGN_Y * (wall_push(g_walls.right) - wall_push(g_walls.left));
 	}
 
-	/* (1) altitude loop -> normalized vertical acceleration command (P/D + integral trim) */
-	static float alt_int = 0.0f;   /* integral of altitude error -> accel (auto FF calibration) */
+	/* (1b) POSITION-HOLD outer loop (opt-in) -> biases the horizontal-velocity setpoint. Latch a
+	 * position reference at takeoff and command a velocity back toward it:
+	 *   desVel += clamp(-KP_POS * (pos - pos_ref), +/-POS_VEL_MAX)
+	 * fed into the velocity loop below via the same "bias desVel" idiom as the wall bumper (setpoint[6/7]
+	 * are 0 in hover, so this is the horizontal setpoint). Ground-reset: while grounded (estHeight <
+	 * ALT_INT_GROUND_M) keep pos_ref = current pos, so there is NO setpoint jump at takeoff -- mirroring
+	 * the altitude/velocity integrator ground-reset above.
+	 *
+	 * KNOWN LIMITATION: pos (state[0]/state[1]) is DEAD-RECKONED by integrating the fused/flow velocity;
+	 * there is NO absolute position reference, so pos_ref and the estimate drift together and slowly. This
+	 * loop REDUCES but CANNOT eliminate long-term drift -- it is exactly the "dead-reckoned position
+	 * control" intended, not a GPS/anchored hold. */
+#if ROSE_POS_LOOP
+	const float estPos_1 = state[0];   /* x (fwd) */
+	const float estPos_2 = state[1];   /* y (left) */
+	if (estHeight < ALT_INT_GROUND_M) {
+		pos_ref_1 = estPos_1; pos_ref_2 = estPos_2;   /* on the ground: track pos -> no jump at takeoff */
+	} else {
+		float posVel_1 = -KP_POS * (estPos_1 - pos_ref_1);
+		float posVel_2 = -KP_POS * (estPos_2 - pos_ref_2);
+		if (posVel_1 >  POS_VEL_MAX) { posVel_1 =  POS_VEL_MAX; } else if (posVel_1 < -POS_VEL_MAX) { posVel_1 = -POS_VEL_MAX; }
+		if (posVel_2 >  POS_VEL_MAX) { posVel_2 =  POS_VEL_MAX; } else if (posVel_2 < -POS_VEL_MAX) { posVel_2 = -POS_VEL_MAX; }
+		desVel_1 += posVel_1;
+		desVel_2 += posVel_2;
+	}
+#endif
+
+	/* (1) altitude loop -> normalized vertical acceleration command (P/D + integral trim). alt_int is a
+	 * member (reset in init()) so a soft-RESET clears the auto-hover-thrust between flights. */
 	if (estHeight < ALT_INT_GROUND_M) {
 		alt_int = 0.0f;        /* on the ground: no windup before takeoff */
 	} else {
@@ -274,7 +325,6 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	 * error (auto-trims the mount/CG tilt). (1/VEL_TC)*err == the old -(1/VEL_TC)*(est-des). */
 	const float verr1 = desVel_1 - estVel_1;
 	const float verr2 = desVel_2 - estVel_2;
-	static float vel_int_1 = 0.0f, vel_int_2 = 0.0f;
 	if (estHeight < ALT_INT_GROUND_M) {
 		vel_int_1 = 0.0f; vel_int_2 = 0.0f;   /* on the ground: no windup before takeoff */
 	} else {
@@ -293,7 +343,6 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	/* Slew-limit the tilt command: cap its rate of change so the induced body rate stays low (keeps
 	 * rotation from corrupting the flow -> breaks the roll<->flow oscillation). See TILT_SLEW_RADPS. */
 	if (TILT_SLEW_RADPS > 0.0f) {
-		static float desRoll_prev, desPitch_prev;
 		const float dmax = TILT_SLEW_RADPS * dt;
 		if (estHeight < ALT_INT_GROUND_M) { desRoll_prev = 0.0f; desPitch_prev = 0.0f; }  /* reset on ground */
 		if (desRoll  > desRoll_prev  + dmax) { desRoll  = desRoll_prev  + dmax; }

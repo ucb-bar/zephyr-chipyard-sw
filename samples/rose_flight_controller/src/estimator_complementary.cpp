@@ -22,9 +22,56 @@
 #define FLOW_GAIN_Y 1.0f
 #endif
 
+/* ---- Barometer (BMP388) altitude fusion (ROSE_BARO) -------------------------------------------
+ * The down-ToF is the absolute-to-floor altitude anchor when valid, but it drops out under large
+ * tilt (R[8] <= 0.05 -> tof_vert=false) and STEP-JUMPS over obstacles/desks. The barometer supplies
+ * a smooth, tilt-immune RELATIVE altitude (baro_rel, referenced to the arm point in main.cpp) to
+ * coast through both. Strategy (complementary blend): while the ToF agrees with the current estimate
+ * (within BARO_TOF_STEP_M) it stays the low-frequency truth AND slowly (re)calibrates the baro bias;
+ * when the ToF is invalid (tilt) or disagrees (obstacle jump / beam glitch) we reject it and lean on
+ * the baro absolute estimate (baro_rel + baro_bias) so altitude never dead-reckons on accel alone.
+ * OFF by default (ROSE_BARO=0) -> identical to the ToF-only filter. */
+#ifndef ROSE_BARO
+#define ROSE_BARO 0
+#endif
+#ifndef BARO_Z_GAIN
+#define BARO_Z_GAIN 0.10f    /* z pull toward the baro estimate while coasting (ToF gap/jump) */
+#endif
+#ifndef BARO_VZ_GAIN
+#define BARO_VZ_GAIN 0.05f   /* vz pull from the baro innovation (small: baro is noisy as a rate) */
+#endif
+#ifndef BARO_BIAS_GAIN
+#define BARO_BIAS_GAIN 0.01f /* slow tracking of baro_bias to the ToF-anchored floor (drift cal) */
+#endif
+#ifndef BARO_TOF_STEP_M
+#define BARO_TOF_STEP_M 0.15f/* |ToF - estimate| above this => reject ToF (obstacle/glitch), lean on baro */
+#endif
+
+/* ---- IMU lever-arm (off-CoM) compensation ----------------------------------------------------
+ * The IMU sits at r (body frame) from the CoM, so it reads a_imu = a_com + alpha x r + omega x
+ * (omega x r). Left uncompensated, those rotational terms integrate into velocity/position as fake
+ * translation -- a rotation-correlated drift that is WORST on takeoff (the velocity integrator that
+ * otherwise trims it hasn't wound up yet). r for riskybird v3 (PCB): IMU is 16 mm LEFT of the CoM
+ * -> IMU_OFFSET_Y = -0.016. Default 0 (opt-in); set via -DIMU_OFFSET_* . */
+#ifndef IMU_OFFSET_X
+#define IMU_OFFSET_X 0.0f      /* body +x = forward */
+#endif
+#ifndef IMU_OFFSET_Y
+#define IMU_OFFSET_Y 0.0f      /* body +y = right; PCB value -0.016 (16 mm left) */
+#endif
+#ifndef IMU_OFFSET_Z
+#define IMU_OFFSET_Z 0.0f      /* body +z = up */
+#endif
+#ifndef IMU_ALPHA_TAU
+#define IMU_ALPHA_TAU 0.02f    /* LP time-constant (s) for the gyro-derivative (angular accel) */
+#endif
+
 void ComplementaryEstimator::init(float x0, float y0, float z0)
 {
 	att.init();
+	w_prev[0] = w_prev[1] = w_prev[2] = 0.0f;
+	alpha_f[0] = alpha_f[1] = alpha_f[2] = 0.0f;
+	have_wprev = false;
 	x = x0; y = y0; z = z0;
 	vx = vy = vz = 0.0f;
 	gx = gy = gz = 0.0f;
@@ -35,13 +82,41 @@ void ComplementaryEstimator::init(float x0, float y0, float z0)
 	lead = 1.0f;         /* translation lead: compensate the 1-step actuation delay */
 	lead_att = 0.5f;     /* attitude lead: smaller (predicting the noisy gyro forward a full
 	                      * step over-amplifies the fast attitude loop) */
+	baro_bias = 0.0f; baro_have = false;   /* baro reference locks on the first trusted ToF */
 }
 
 void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
-				    const float flow[2], bool flow_valid, float height, bool tof_valid, float dt)
+				    const float flow[2], bool flow_valid, float height, bool tof_valid,
+				    float baro_rel, bool baro_valid, float dt)
 {
 	gx = gyro[0]; gy = gyro[1]; gz = gyro[2];
-	att.update(accel, gyro, dt);
+
+	/* IMU lever-arm compensation: a_com = a_imu - (alpha x r + omega x (omega x r)). alpha =
+	 * LP-filtered d(omega)/dt. Skips cleanly (a == accel) when the offset is 0. */
+	float a[3] = { accel[0], accel[1], accel[2] };
+	{
+		const float rx = IMU_OFFSET_X, ry = IMU_OFFSET_Y, rz = IMU_OFFSET_Z;
+		if ((rx != 0.0f || ry != 0.0f || rz != 0.0f) && dt > 1e-6f) {
+			if (have_wprev) {
+				const float k = dt / (IMU_ALPHA_TAU + dt);
+				alpha_f[0] += k * ((gx - w_prev[0]) / dt - alpha_f[0]);
+				alpha_f[1] += k * ((gy - w_prev[1]) / dt - alpha_f[1]);
+				alpha_f[2] += k * ((gz - w_prev[2]) / dt - alpha_f[2]);
+			}
+			w_prev[0] = gx; w_prev[1] = gy; w_prev[2] = gz; have_wprev = true;
+			const float alx = alpha_f[0], aly = alpha_f[1], alz = alpha_f[2];
+			/* alpha x r */
+			const float axr0 = aly*rz - alz*ry, axr1 = alz*rx - alx*rz, axr2 = alx*ry - aly*rx;
+			/* omega x r, then omega x (omega x r) */
+			const float wr0 = gy*rz - gz*ry, wr1 = gz*rx - gx*rz, wr2 = gx*ry - gy*rx;
+			const float wwr0 = gy*wr2 - gz*wr1, wwr1 = gz*wr0 - gx*wr2, wwr2 = gx*wr1 - gy*wr0;
+			a[0] -= (axr0 + wwr0);
+			a[1] -= (axr1 + wwr1);
+			a[2] -= (axr2 + wwr2);
+		}
+	}
+
+	att.update(a, gyro, dt);
 	float R[9]; att.rot(R);
 	/* Down-ToF SLANT range -> VERTICAL height via the fresh attitude: cos(tilt) = R[8] (exact). Past
 	 * ~87 deg off vertical (R[8] <= 0.05) the beam isn't measuring the floor below -> unavailable. */
@@ -49,10 +124,10 @@ void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
 	bool  tof_vert = tof_valid && ctilt > 0.05f;
 	float h_vert = height * ctilt;
 
-	/* world acceleration = R f_body + g */
-	float ax_w = R[0]*accel[0] + R[1]*accel[1] + R[2]*accel[2];
-	float ay_w = R[3]*accel[0] + R[4]*accel[1] + R[5]*accel[2];
-	float az_w = R[6]*accel[0] + R[7]*accel[1] + R[8]*accel[2] - GRAVITY;
+	/* world acceleration = R f_body + g  (using the lever-arm-corrected body accel) */
+	float ax_w = R[0]*a[0] + R[1]*a[1] + R[2]*a[2];
+	float ay_w = R[3]*a[0] + R[4]*a[1] + R[5]*a[2];
+	float az_w = R[6]*a[0] + R[7]*a[1] + R[8]*a[2] - GRAVITY;
 	awx = ax_w; awy = ay_w; awz = az_w; dt_last = dt;
 
 	vx += ax_w*dt; vy += ay_w*dt; vz += az_w*dt;
@@ -85,12 +160,44 @@ void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
 
 	/* ToF altitude observer -- only on steps with a fresh (low-rate) ToF sample. Between
 	 * samples z/vz dead-reckon on the accelerometer (fast layer); the ToF corrects the
-	 * accumulated drift when it arrives (slow layer). */
+	 * accumulated drift when it arrives (slow layer). With ROSE_BARO, the barometer fills
+	 * the gaps where the ToF is invalid (tilt) or a step-jump (obstacle) is rejected. */
+#if ROSE_BARO
+	if (baro_valid) {
+		float baro_z = baro_rel + baro_bias;   /* baro's floor-referenced absolute altitude */
+		bool  tof_ok = false;
+		if (tof_vert) {
+			float rz = h_vert - z;
+			/* Gate the ToF against the baro-propagated estimate: a step larger than
+			 * BARO_TOF_STEP_M is an obstacle/desk edge or beam glitch, not true altitude ->
+			 * reject it and coast on the smooth baro. Before the reference is locked
+			 * (baro_have==false) trust the ToF unconditionally to seed baro_bias. */
+			if (!baro_have || fabsf(rz) < BARO_TOF_STEP_M) {
+				z  += z_gain*rz;
+				vz += vz_gain*rz;
+				tof_ok = true;
+				if (!baro_have) { baro_bias = z - baro_rel; baro_have = true; }
+				else            { baro_bias += BARO_BIAS_GAIN*((z - baro_rel) - baro_bias); }
+			}
+		}
+		if (!tof_ok && baro_have) {
+			float rzb = baro_z - z;   /* lean on baro through the ToF gap / rejected jump */
+			z  += BARO_Z_GAIN*rzb;
+			vz += BARO_VZ_GAIN*rzb;
+		}
+	} else if (tof_vert) {
+		float rz = h_vert - z;
+		z  += z_gain*rz;
+		vz += vz_gain*rz;
+	}
+#else
+	(void)baro_rel; (void)baro_valid;   /* barometer disabled -> ToF-only (unchanged behavior) */
 	if (tof_vert) {
 		float rz = h_vert - z;
 		z  += z_gain*rz;
 		vz += vz_gain*rz;
 	}
+#endif
 }
 
 void ComplementaryEstimator::get_state(float state[EST_NSTATES]) const

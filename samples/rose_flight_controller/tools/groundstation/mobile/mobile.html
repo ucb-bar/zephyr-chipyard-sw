@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0a0e14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>riskybird v3 · mobile FC</title>
+<style>
+/* ===================================================================================
+ * riskybird v3 — touch-first, portrait mobile flight-controller interface.
+ * SELF-CONTAINED: all CSS + JS inline, NO external resources (works offline on the
+ * drone's SoftAP, which has no internet). Dark, high-contrast, sunlight-legible.
+ * =================================================================================== */
+:root{
+  --bg:#0a0e14; --bg2:#0d1117; --card:#151b24; --card2:#1b2331; --line:#28303c;
+  --ink:#eef4fb; --dim:#93a1b3; --faint:#5d6b7d;
+  --accent:#4aa8ff; --ok:#3fd15a; --warn:#f5c04a; --bad:#ff5347; --arm:#ff8a1e; --cal:#5bc0ff;
+  --mono:'SF Mono',ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  --estop-h:76px;
+}
+@media (prefers-color-scheme: light){
+  /* Light fallback for bright daylight; still high-contrast. Dark stays the default. */
+  :root:not([data-theme="dark"]){
+    --bg:#e9eef4; --bg2:#f2f5f9; --card:#ffffff; --card2:#f4f7fb; --line:#c9d3df;
+    --ink:#0d141d; --dim:#4a5765; --faint:#8695a5;
+  }
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+  overscroll-behavior:none;-webkit-text-size-adjust:100%}
+body{padding-bottom:calc(var(--estop-h) + env(safe-area-inset-bottom));
+  min-height:100dvh}
+h1,h2,h3{margin:0}
+button{font-family:inherit}
+
+/* ---- top status bar (sticky) ---- */
+header{position:sticky;top:0;z-index:20;background:linear-gradient(180deg,var(--bg2),var(--bg));
+  border-bottom:1px solid var(--line);padding:calc(8px + env(safe-area-inset-top)) 12px 8px}
+.topline{display:flex;align-items:center;gap:10px}
+.brand{font-size:13px;font-weight:700;letter-spacing:.3px;white-space:nowrap}
+.brand small{color:var(--dim);font-weight:500}
+.link{margin-left:auto;display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--bad);box-shadow:0 0 7px var(--bad);flex:none}
+.dot.on{background:var(--ok);box-shadow:0 0 7px var(--ok)}
+.dot.stale{background:var(--warn);box-shadow:0 0 7px var(--warn)}
+
+/* ---- big state banner ---- */
+#state{margin-top:8px;border-radius:12px;padding:11px 14px;display:flex;align-items:center;gap:10px;
+  font-weight:800;font-size:19px;letter-spacing:.4px;border:1px solid var(--line);background:var(--card)}
+#state .badge{margin-left:auto;font-family:var(--mono);font-size:10px;font-weight:700;padding:3px 8px;
+  border-radius:20px;background:var(--bg);border:1px solid var(--line);color:var(--dim);letter-spacing:.4px}
+#state.s-estop{background:rgba(255,83,71,.18);border-color:var(--bad);color:var(--bad);animation:pulse 1s infinite}
+#state.s-armed{background:rgba(255,138,30,.16);border-color:var(--arm);color:var(--arm)}
+#state.s-arming{background:rgba(245,192,74,.16);border-color:var(--warn);color:var(--warn)}
+#state.s-ready{background:rgba(63,209,90,.14);border-color:var(--ok);color:var(--ok)}
+#state.s-cal{background:rgba(91,192,255,.14);border-color:var(--cal);color:var(--cal)}
+#state.s-nolink{color:var(--dim)}
+@keyframes pulse{50%{opacity:.5}}
+
+/* ---- status pills ---- */
+.pills{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.pill{flex:1;min-width:0;text-align:center;font-family:var(--mono);font-size:10px;font-weight:700;
+  padding:6px 4px;border-radius:8px;background:var(--card);border:1px solid var(--line);color:var(--faint);
+  letter-spacing:.5px;text-transform:uppercase}
+.pill.on-armed{background:rgba(255,138,30,.18);border-color:var(--arm);color:var(--arm)}
+.pill.on-estop{background:rgba(255,83,71,.2);border-color:var(--bad);color:var(--bad)}
+.pill.on-arming{background:rgba(245,192,74,.18);border-color:var(--warn);color:var(--warn)}
+.pill.on-cal{background:rgba(63,209,90,.16);border-color:var(--ok);color:var(--ok)}
+
+/* ---- metrics grid ---- */
+main{padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:640px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px}
+.card.wide{grid-column:1 / -1}
+.card h2{font-size:9.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);font-weight:700;margin-bottom:7px}
+.big{font-family:var(--mono);font-weight:800;font-size:30px;line-height:1}
+.unit{font-size:12px;color:var(--dim);font-weight:500}
+.sub{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:6px;display:flex;justify-content:space-between;gap:6px}
+.sub b{color:var(--ink);font-weight:700}
+canvas{width:100%;display:block;border-radius:8px;background:#05080d;touch-action:none}
+.bar{height:9px;border-radius:6px;background:#05080d;border:1px solid var(--line);overflow:hidden;margin-top:8px;position:relative}
+.bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .12s linear}
+.bar>.mark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--warn);opacity:.9}
+
+/* ---- motors ---- */
+.motors{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.mot{background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:6px 7px}
+.mot .lbl{font-size:9px;color:var(--dim);letter-spacing:.6px;display:flex;justify-content:space-between}
+.mot .mval{font-family:var(--mono);font-size:14px;font-weight:800}
+.mbar{height:5px;border-radius:3px;background:#05080d;margin-top:4px;overflow:hidden}
+.mbar>i{display:block;height:100%;width:0;background:var(--ok)}
+
+/* ---- control section ---- */
+.controls{padding:0 12px 12px;max-width:640px;margin:0 auto;display:grid;gap:10px}
+.ctlcard{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.ctlcard h2{font-size:9.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);font-weight:700;margin-bottom:9px}
+.hoverrow{display:flex;align-items:stretch;gap:8px}
+.hoverrow .hz{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;
+  background:var(--card2);border:1px solid var(--line);border-radius:10px;font-family:var(--mono)}
+.hoverrow .hz .hzv{font-size:22px;font-weight:800}
+.hoverrow .hz .hzl{font-size:9px;color:var(--dim);letter-spacing:.6px}
+.btn{border:1px solid var(--line);background:var(--card2);color:var(--ink);border-radius:10px;
+  font-weight:700;font-size:15px;padding:14px 12px;cursor:pointer;user-select:none;touch-action:manipulation}
+.btn:active{transform:translateY(1px);filter:brightness(1.25)}
+.btn.step{min-width:64px;font-size:22px;font-family:var(--mono)}
+.btn.wide{width:100%}
+.btn.set{background:#123a2a;border-color:var(--ok);color:var(--ok)}
+.btn.reset{background:#12233a;border-color:var(--accent);color:var(--accent)}
+.btn.ghost{background:var(--card2);color:var(--dim)}
+.btnrow{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#ack{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:9px;min-height:14px;word-break:break-word}
+
+/* ---- manual joystick STUB (future VTARGET) ---- */
+.manual{position:relative;opacity:.62}
+.manual .soon{position:absolute;top:8px;right:10px;font-family:var(--mono);font-size:9px;font-weight:700;
+  letter-spacing:.5px;color:var(--warn);border:1px solid var(--warn);border-radius:20px;padding:3px 8px;
+  background:rgba(245,192,74,.1)}
+.padwrap{display:flex;gap:10px;align-items:stretch;margin-top:4px}
+.joypad{flex:1;aspect-ratio:1/1;max-width:220px;margin:0 auto;position:relative;border-radius:16px;
+  background:radial-gradient(circle at 50% 50%,#0f1620,#070b11);border:1px solid var(--line)}
+.joypad .ring{position:absolute;inset:14%;border:1px dashed #2b3644;border-radius:50%}
+.joypad .cross{position:absolute;background:#232d3b}
+.joypad .cross.h{left:10%;right:10%;top:50%;height:1px}
+.joypad .cross.v{top:10%;bottom:10%;left:50%;width:1px}
+.joypad .knob{position:absolute;top:50%;left:50%;width:34%;height:34%;transform:translate(-50%,-50%);
+  border-radius:50%;background:radial-gradient(circle at 40% 35%,#3a4657,#1a2230);border:1px solid #3a4657}
+.joypad .axlabel{position:absolute;font-family:var(--mono);font-size:8.5px;color:var(--faint)}
+.vthr{width:52px;position:relative;border-radius:12px;background:linear-gradient(180deg,#0f1620,#070b11);
+  border:1px solid var(--line);display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:8px 0}
+.vthr .track{position:absolute;top:12px;bottom:12px;width:4px;left:50%;transform:translateX(-50%);
+  background:#232d3b;border-radius:3px}
+.vthr .thumb{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:30px;height:14px;
+  border-radius:6px;background:#3a4657;border:1px solid #4a5767}
+.vthr .cap{font-family:var(--mono);font-size:8.5px;color:var(--faint);z-index:1}
+.manual .note{font-size:10px;color:var(--dim);margin-top:8px;line-height:1.4}
+.manual .note code{font-family:var(--mono);color:var(--ink);background:var(--card2);padding:1px 4px;border-radius:4px}
+
+/* ---- transport / settings row ---- */
+.xport{max-width:640px;margin:0 auto;padding:0 12px 14px;display:flex;gap:8px;align-items:center;
+  font-family:var(--mono);font-size:11px;color:var(--dim);flex-wrap:wrap}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{background:var(--card);color:var(--dim);border:0;padding:7px 12px;font-size:11px;font-weight:700;
+  font-family:var(--mono);cursor:pointer;border-right:1px solid var(--line)}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--accent);color:#04121f}
+.xport input{background:var(--bg2);border:1px solid var(--line);border-radius:7px;color:var(--ink);
+  padding:6px 8px;font-family:var(--mono);font-size:11px;min-width:120px;flex:1}
+
+/* ---- sticky ESTOP bar (ALWAYS reachable) ---- */
+#estopbar{position:fixed;left:0;right:0;bottom:0;z-index:30;height:calc(var(--estop-h) + env(safe-area-inset-bottom));
+  padding:8px 12px calc(8px + env(safe-area-inset-bottom));background:linear-gradient(0deg,var(--bg2),rgba(13,17,23,.86));
+  border-top:1px solid var(--line);backdrop-filter:blur(6px);display:flex;gap:10px;align-items:stretch}
+#estop{flex:1;border:0;border-radius:14px;background:var(--bad);color:#fff;font-size:22px;font-weight:900;
+  letter-spacing:1px;cursor:pointer;box-shadow:0 0 0 2px rgba(255,83,71,.35),0 6px 18px rgba(255,83,71,.3);
+  touch-action:manipulation;display:flex;align-items:center;justify-content:center;gap:10px}
+#estop:active{transform:scale(.98);filter:brightness(1.12)}
+#estop.confirmed{animation:estopflash .5s 3}
+@keyframes estopflash{50%{background:#fff;color:var(--bad)}}
+.mini{width:96px;border-radius:14px;background:var(--card);border:1px solid var(--line);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:var(--mono);gap:1px}
+.mini .r{font-size:15px;font-weight:800} .mini .l{font-size:8.5px;color:var(--dim);letter-spacing:.5px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="topline">
+    <div class="brand">riskybird&nbsp;v3 <small>· mobile FC</small></div>
+    <div class="link">
+      <span id="rate">-- Hz</span>
+      <span id="dot" class="dot"></span>
+      <span id="linktxt">no link</span>
+    </div>
+  </div>
+  <div id="state" class="s-nolink"><span id="statetxt">WAITING FOR TELEMETRY</span>
+    <span class="badge" id="itbadge">it --</span>
+  </div>
+  <div class="pills">
+    <div class="pill" id="p-armed">ARMED</div>
+    <div class="pill" id="p-estop">ESTOP</div>
+    <div class="pill" id="p-arming">ARMING</div>
+    <div class="pill" id="p-cal">CAL</div>
+  </div>
+</header>
+
+<!-- ======================= METRICS ======================= -->
+<main>
+  <!-- Attitude -->
+  <div class="card">
+    <h2>Attitude</h2>
+    <canvas id="ah" width="320" height="240"></canvas>
+    <div class="sub"><span>roll <b id="roll">--</b></span><span>pitch <b id="pitch">--</b></span></div>
+    <div class="sub"><span>yaw <b id="yaw">--</b></span><span></span></div>
+  </div>
+
+  <!-- Altitude -->
+  <div class="card">
+    <h2>Altitude</h2>
+    <div><span class="big" id="zbig">--</span> <span class="unit">m</span></div>
+    <div class="bar"><i id="zbar"></i><span class="mark" id="zspmark" style="left:0;display:none"></span></div>
+    <div class="sub"><span>target <b id="zsp">-- m</b></span><span>ToF <b id="tofh">-- m</b></span></div>
+    <div class="sub"><span>vz <b id="vz">-- m/s</b></span><span>ToF ok <b id="tofv">--</b></span></div>
+  </div>
+
+  <!-- Horizontal drift / velocity -->
+  <div class="card">
+    <h2>Drift &amp; velocity</h2>
+    <canvas id="drift" width="280" height="240"></canvas>
+    <div class="sub"><span>vx <b id="vx">--</b></span><span>vy <b id="vy">--</b></span></div>
+    <div class="sub"><span>speed <b id="spd">-- m/s</b></span><span>drift <b id="pos">-- m</b></span></div>
+  </div>
+
+  <!-- Battery + link -->
+  <div class="card">
+    <h2>Battery</h2>
+    <div><span class="big" id="vbat">--</span> <span class="unit">V</span></div>
+    <div class="bar"><i id="vbatbar"></i></div>
+    <div class="sub"><span>link age <b id="age">-- ms</b></span><span>loop <b id="loop">-- Hz</b></span></div>
+    <div class="sub"><span>quality <b id="qual">--%</b></span><span>pkts <b id="pkts">0</b></span></div>
+  </div>
+
+  <!-- Motors -->
+  <div class="card wide">
+    <h2>Motor commands (u[])</h2>
+    <div class="motors">
+      <div class="mot"><div class="lbl"><span>FL · m3</span><span class="mval" id="m3">--</span></div><div class="mbar"><i id="m3b"></i></div></div>
+      <div class="mot"><div class="lbl"><span>FR · m0</span><span class="mval" id="m0">--</span></div><div class="mbar"><i id="m0b"></i></div></div>
+      <div class="mot"><div class="lbl"><span>RL · m2</span><span class="mval" id="m2">--</span></div><div class="mbar"><i id="m2b"></i></div></div>
+      <div class="mot"><div class="lbl"><span>RR · m1</span><span class="mval" id="m1">--</span></div><div class="mbar"><i id="m1b"></i></div></div>
+    </div>
+  </div>
+</main>
+
+<!-- ======================= CONTROL ======================= -->
+<div class="controls">
+  <div class="ctlcard">
+    <h2>Altitude setpoint · HOVER_Z</h2>
+    <div class="hoverrow">
+      <button class="btn step" onpointerdown="hoverStep(-50)">−</button>
+      <div class="hz"><span class="hzv" id="hzv">300</span><span class="hzl">mm  (<span id="hzm">0.30</span> m)</span></div>
+      <button class="btn step" onpointerdown="hoverStep(50)">+</button>
+      <button class="btn set" onpointerdown="sendHover()">SET</button>
+    </div>
+    <div class="btnrow" style="margin-top:10px">
+      <button class="btn reset" onpointerdown="cmd('RESET')">↺ RESET / ENABLE</button>
+      <button class="btn ghost" onpointerdown="cmd('PING')">PING</button>
+    </div>
+    <div id="ack">ready · demo mode (no drone) — switch to Live below</div>
+  </div>
+
+  <!-- Manual velocity control STUB (future VTARGET uplink) -->
+  <div class="ctlcard manual">
+    <span class="soon">COMING SOON</span>
+    <h2>Manual velocity target</h2>
+    <div class="padwrap">
+      <div class="joypad">
+        <div class="ring"></div>
+        <div class="cross h"></div><div class="cross v"></div>
+        <div class="knob"></div>
+        <span class="axlabel" style="top:4px;left:50%;transform:translateX(-50%)">+vx fwd</span>
+        <span class="axlabel" style="bottom:4px;left:50%;transform:translateX(-50%)">−vx</span>
+        <span class="axlabel" style="right:4px;top:50%;transform:translateY(-50%)">+vy</span>
+        <span class="axlabel" style="left:4px;top:50%;transform:translateY(-50%)">−vy</span>
+      </div>
+      <div class="vthr"><span class="cap">+vz</span><div class="track"></div><div class="thumb"></div><span class="cap">−vz</span></div>
+    </div>
+    <div class="note">Thumbpad → body-frame <code>vx,vy</code>; slider → climb rate <code>vz</code>.
+      Disabled until the firmware adds the <code>VTARGET vx vy vz</code> uplink command
+      (rate-limited, envelope-clamped, and hover-failsafe on comms loss — see DESIGN.md).</div>
+  </div>
+</div>
+
+<!-- ======================= TRANSPORT / SETTINGS ======================= -->
+<div class="xport">
+  <span>src</span>
+  <span class="seg" id="modeseg">
+    <button data-mode="demo">DEMO</button>
+    <button data-mode="sse">LIVE·SSE</button>
+    <button data-mode="poll">LIVE·POLL</button>
+  </span>
+  <input id="baseurl" placeholder="base URL (blank = same host)" autocomplete="off" autocapitalize="off" spellcheck="false">
+</div>
+
+<!-- ======================= STICKY ESTOP ======================= -->
+<div id="estopbar">
+  <button id="estop" onpointerdown="estop()">⭘ ESTOP</button>
+  <div class="mini"><span class="r" id="minirate">--</span><span class="l">Hz</span></div>
+</div>
+
+<script>
+"use strict";
+/* ===================================================================================
+ * riskybird v3 mobile FC — logic. Pure vanilla JS, no dependencies.
+ *
+ * DATA MODEL is taken verbatim from the firmware + desktop bridge:
+ *   - telemetry v1 text line  : src/telem_wifi.c  telem_format_v1()
+ *   - Gibbs->quat/Euler recon  : tools/groundstation/riskybird_panel.py gibbs_to_quat_euler()
+ *   - command grammar          : src/telem_wifi.c  cmd_thread_fn()  (ESTOP/DISARM/RESET/HOVER_Z/PROFILE/PING)
+ *   - flag bits                : src/telem_wifi.h  TELEM_FLAG_*  (ARMED1 ESTOP2 ARMING4 CALDONE8)
+ * =================================================================================== */
+const $ = id => document.getElementById(id);
+const DEG = 180/Math.PI;
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+/* ---------- telemetry parsing (mirrors riskybird_panel.py) ---------- */
+const _F = "(-?\\d+\\.\\d+)";
+const CORE_RE = new RegExp(
+  "it=(-?\\d+)\\s+dt=(-?\\d+)ms\\s+"+
+  "roll="+_F+"\\s+pitch="+_F+"\\s+yaw="+_F+"\\s+"+
+  "z="+_F+"\\s+tofv=(\\d+)\\s+tofh="+_F+"\\s+"+
+  "u=\\["+_F+"\\s+"+_F+"\\s+"+_F+"\\s+"+_F+"\\]");
+const TAIL_RE = new RegExp(
+  "vx="+_F+"\\s+vy="+_F+"\\s+vz="+_F+"\\s+zsp="+_F+"\\s+vbat="+_F+"\\s+st=(\\d+)");
+const POS_RE = new RegExp("\\bx="+_F+"\\s+y="+_F);
+const FLAG_ARMED=1, FLAG_ESTOP=2, FLAG_ARMING=4, FLAG_CALDONE=8;
+
+/* The FC emits attitude as the Gibbs/Rodrigues vector (q_xyz/q_w); reconstruct the true
+ * unit quaternion + proper ZYX Euler so the horizon is correct at all attitudes. */
+function gibbsToEuler(rx,ry,rz){
+  const n2=rx*rx+ry*ry+rz*rz, qw=1/Math.sqrt(1+n2);
+  const qx=rx*qw, qy=ry*qw, qz=rz*qw;
+  const roll=Math.atan2(2*(qw*qx+qy*qz),1-2*(qx*qx+qy*qy));
+  const sp=clamp(2*(qw*qy-qz*qx),-1,1), pitch=Math.asin(sp);
+  const yaw=Math.atan2(2*(qw*qz+qx*qy),1-2*(qy*qy+qz*qz));
+  return {qw,qx,qy,qz,roll,pitch,yaw};
+}
+function parseLine(line){
+  const m=CORE_RE.exec(line); if(!m) return null;
+  const g=m.slice(1).map(Number);
+  const e=gibbsToEuler(g[2],g[3],g[4]);
+  const d={ it:g[0]|0, dt_ms:g[1]|0, roll:e.roll, pitch:e.pitch, yaw:e.yaw,
+    qw:e.qw,qx:e.qx,qy:e.qy,qz:e.qz, z:g[5], tofv:g[6]|0, tofh:g[7],
+    u:[g[8],g[9],g[10],g[11]], vx:null,vy:null,vz:null,zsp:null,vbat:null,st:0,x:null,y:null };
+  const t=TAIL_RE.exec(line);
+  if(t){ const tg=t.slice(1);
+    d.vx=+tg[0]; d.vy=+tg[1]; d.vz=+tg[2]; d.zsp=+tg[3]; d.vbat=+tg[4]; d.st=+tg[5]; }
+  const p=POS_RE.exec(line); if(p){ d.x=+p[1]; d.y=+p[2]; }
+  d.armed=!!(d.st&FLAG_ARMED); d.estop=!!(d.st&FLAG_ESTOP);
+  d.arming=!!(d.st&FLAG_ARMING); d.caldone=!!(d.st&FLAG_CALDONE);
+  return d;
+}
+
+/* ---------- link stats hub (mirrors panel.py Hub) ---------- */
+const HUB={ latest:null, count:0, rate:0, lastRx:0, _prev:0,
+  onPacket(d){ const now=performance.now()/1000;
+    if(this._prev){ const dt=now-this._prev; if(dt>0){ const inst=1/dt;
+      this.rate=this.rate? 0.85*this.rate+0.15*inst : inst; } }
+    this._prev=now; this.lastRx=now; this.count++; this.latest=d; },
+  link(){ const now=performance.now()/1000;
+    const age=this.lastRx? (now-this.lastRx)*1000 : null;
+    const connected=age!=null && age<750;
+    return { connected, stale: age!=null && age>=750,
+      rate: connected? this.rate:0, count:this.count, age_ms: age==null?null:age|0,
+      quality: connected? clamp(Math.round(this.rate/50*100),0,100):0 }; } };
+
+/* accept EITHER the desktop bridge JSON snapshot {link,t} OR a raw firmware text line */
+function ingest(payload){
+  if(typeof payload!=="string"){ if(payload && payload.t){ HUB.onPacket(payload.t);
+      if(payload.link){ HUB.count=payload.link.count??HUB.count; } } return; }
+  const s=payload.trim(); if(!s) return;
+  if(s[0]==="{"){ try{ const j=JSON.parse(s); if(j.t){ HUB.onPacket(j.t); return; } }catch(e){} }
+  const d=parseLine(s); if(d) HUB.onPacket(d);
+}
+
+/* ================================================================================
+ * TRANSPORT ADAPTER  —  pluggable. Three modes:
+ *   demo : animate fake telemetry locally (works in any desktop browser, no drone)
+ *   sse  : EventSource(base + '/stream')   [desktop bridge OR future firmware SSE]
+ *   poll : fetch(base + '/t') at ~15 Hz    [light firmware HTTP fallback]
+ * Commands POST to base + '/cmd' (text body) — same contract as panel.py /cmd.
+ * The base URL defaults to same-origin (served by bridge/firmware) or is user-set.
+ * ================================================================================ */
+const Transport = (()=>{
+  let mode="demo", base="", es=null, pollTimer=null, demoTimer=null, alive=false;
+  function stop(){ alive=false;
+    if(es){ es.close(); es=null; }
+    if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+    if(demoTimer){ clearInterval(demoTimer); demoTimer=null; } }
+  function start(m,b){ stop(); mode=m; base=(b||"").replace(/\/$/,""); alive=true;
+    if(mode==="demo") startDemo();
+    else if(mode==="sse") startSSE();
+    else if(mode==="poll") startPoll(); }
+  function startSSE(){
+    try{ es=new EventSource(base+"/stream");
+      es.onmessage=e=>ingest(e.data);
+      es.onerror=()=>{ /* EventSource auto-reconnects; just reflect it */ };
+    }catch(e){ setAck("SSE unavailable: "+e); }
+  }
+  function startPoll(){
+    pollTimer=setInterval(async()=>{ if(!alive) return;
+      try{ const r=await fetch(base+"/t",{cache:"no-store"});
+        ingest(await r.text()); }catch(e){/* dropped poll: keep last */ }
+    },66); // ~15 Hz
+  }
+  async function sendCmd(text){
+    if(mode==="demo"){ demoCmd(text); return "ACK "+text+" (demo)"; }
+    try{ const r=await fetch(base+"/cmd",{method:"POST",body:text});
+      const ct=r.headers.get("content-type")||"";
+      if(ct.includes("json")){ const j=await r.json(); return j.ack||j.sent||"(no ack)"; }
+      return (await r.text()).trim()||"(no ack)";
+    }catch(e){ return "send failed: "+e; }
+  }
+  /* ----- demo generator: physically-plausible hover with gentle drift ----- */
+  let dz=0.30, phase=0, demoState={armed:false,estop:false,cal:false,arming:false,it:0};
+  function startDemo(){
+    demoState={armed:false,estop:false,cal:false,arming:false,it:0}; phase=0;
+    setAck("DEMO mode — animating fake telemetry (no drone). Use ESTOP/RESET/HOVER to see the UI react.");
+    demoTimer=setInterval(()=>{ if(!alive) return; phase+=0.02; demoState.it++;
+      if(!demoState.cal && demoState.it>25){ demoState.cal=true; }
+      const t=phase;
+      const roll=0.05*Math.sin(t*1.3)+ (demoState.armed?0.02*Math.sin(t*5):0);
+      const pitch=0.04*Math.cos(t*1.1);
+      const yaw=0.6*Math.sin(t*0.2);
+      // Gibbs vector ~ tan(theta/2)*axis; for small angles ~ euler/2 works for the demo
+      const gz=Math.tan(yaw/2);
+      const z=demoState.armed? dz+0.02*Math.sin(t*2.1):0.0;
+      const vx=demoState.armed?0.08*Math.sin(t*0.9):0, vy=demoState.armed?0.06*Math.cos(t*0.7):0;
+      const vz=demoState.armed?0.03*Math.cos(t*2.1):0;
+      const x=0.15*Math.sin(t*0.3), y=0.12*Math.cos(t*0.25);
+      const base=demoState.armed?0.42:0.0;
+      const u=[base+0.03*Math.sin(t*5), base+0.03*Math.cos(t*5),
+               base+0.03*Math.sin(t*5+2), base+0.03*Math.cos(t*5+2)].map(v=>clamp(v,0,1));
+      const vbat=3.95-0.0002*demoState.it;
+      let st=0; if(demoState.armed)st|=1; if(demoState.estop)st|=2; if(demoState.arming)st|=4; if(demoState.cal)st|=8;
+      const line=`flight_controller: it=${demoState.it} dt=1ms `+
+        `roll=${f3(roll/2)} pitch=${f3(pitch/2)} yaw=${f3(gz)} z=${f3(z)} tofv=1 tofh=${f3(z)} `+
+        `u=[${f3(u[0])} ${f3(u[1])} ${f3(u[2])} ${f3(u[3])}] `+
+        `vx=${f3(vx)} vy=${f3(vy)} vz=${f3(vz)} zsp=${f3(demoState.armed?dz:0)} vbat=${f3(vbat)} st=${st} `+
+        `x=${f3(x)} y=${f3(y)}`;
+      ingest(line);
+    },20); // 50 Hz
+  }
+  function demoCmd(text){
+    const head=text.split(/\s+/)[0].toUpperCase();
+    if(head==="ESTOP"){ demoState.estop=true; demoState.armed=false; }
+    else if(head==="DISARM"){ demoState.armed=false; }
+    else if(head==="RESET"){ demoState.estop=false; demoState.cal=false; demoState.arming=true; demoState.it=0;
+      setTimeout(()=>{ demoState.arming=false; demoState.armed=true; },1400); }
+    else if(head==="HOVER_Z"){ const mm=parseInt(text.slice(7))||0; dz=mm/1000; }
+  }
+  const f3=v=>{ const s=v<0?"-":""; const a=Math.abs(v);
+    return s+Math.floor(a)+"."+String(Math.floor(a*1000)%1000).padStart(3,"0"); };
+  return { start, stop, sendCmd, get mode(){return mode;} };
+})();
+
+/* ---------- command UI ---------- */
+let hoverMM=300;
+function setHover(){ $("hzv").textContent=hoverMM; $("hzm").textContent=(hoverMM/1000).toFixed(2); }
+function hoverStep(d){ hoverMM=clamp(hoverMM+d,0,600); setHover(); }
+function setAck(s){ $("ack").textContent=s; }
+async function cmd(text){ setAck("→ "+text+" …"); const ack=await Transport.sendCmd(text);
+  setAck(text+"  ⇒  "+ack); }
+function sendHover(){ cmd("HOVER_Z "+hoverMM); }
+function estop(){ const b=$("estop"); b.classList.remove("confirmed"); void b.offsetWidth; b.classList.add("confirmed");
+  cmd("ESTOP"); if(navigator.vibrate) navigator.vibrate([40,30,40]); }
+setHover();
+
+/* ---------- render loop (rAF, throttled ~25 fps — decoupled from 50 Hz packets) ---------- */
+function stateClass(t,link){
+  if(!t||!link.connected) return ["s-nolink","WAITING FOR TELEMETRY"];
+  if(t.estop) return ["s-estop","⛔ ESTOP — MOTORS CUT"];
+  if(t.armed) return ["s-armed","● ARMED — LIVE"];
+  if(t.arming) return ["s-arming","◐ ARMING…"];
+  if(!t.caldone) return ["s-cal","CALIBRATING"];
+  return ["s-ready","READY — disarmed"];
+}
+const fmt=(x,n=2)=> x==null? "--" : x.toFixed(n);
+function setPill(id,on,cls){ const el=$(id); el.className="pill"+(on?(" on-"+cls):""); }
+
+let lastDraw=0;
+function frame(ts){
+  requestAnimationFrame(frame);
+  if(ts-lastDraw<40) return;   // cap ~25 fps for battery/CPU
+  lastDraw=ts;
+  const t=HUB.latest, L=HUB.link();
+
+  // top bar
+  $("rate").textContent=(L.connected?L.rate:0).toFixed(0)+" Hz";
+  $("minirate").textContent=(L.connected?L.rate:0).toFixed(0);
+  $("dot").className="dot"+(L.connected?" on":(L.stale?" stale":""));
+  $("linktxt").textContent=L.connected?"linked":(L.age_ms==null?"no link":"stale");
+
+  const [cls,txt]=stateClass(t,L);
+  const sb=$("state"); sb.className=cls; $("statetxt").textContent=txt;
+
+  if(!t){ drawAH(0,0); drawDrift(null,null); return; }
+  $("itbadge").textContent="it "+t.it;
+  setPill("p-armed",t.armed,"armed"); setPill("p-estop",t.estop,"estop");
+  setPill("p-arming",t.arming,"arming"); setPill("p-cal",t.caldone,"cal");
+
+  // attitude
+  $("roll").textContent=(t.roll*DEG).toFixed(1)+"°";
+  $("pitch").textContent=(t.pitch*DEG).toFixed(1)+"°";
+  $("yaw").textContent=(t.yaw*DEG).toFixed(1)+"°";
+  drawAH(t.roll,t.pitch);
+
+  // altitude
+  $("zbig").textContent=t.z.toFixed(2);
+  $("zbar").style.width=clamp(t.z/0.6*100,0,100)+"%";
+  const zspEl=$("zspmark");
+  if(t.zsp!=null){ zspEl.style.display="block"; zspEl.style.left=clamp(t.zsp/0.6*100,0,100)+"%"; }
+  $("zsp").textContent=fmt(t.zsp)+" m"; $("tofh").textContent=fmt(t.tofh)+" m";
+  $("vz").textContent=fmt(t.vz)+" m/s";
+  $("tofv").innerHTML=t.tofv? '<span style="color:var(--ok)">yes</span>':'<span style="color:var(--bad)">no</span>';
+
+  // drift/velocity
+  $("vx").textContent=fmt(t.vx); $("vy").textContent=fmt(t.vy);
+  $("spd").textContent=(t.vx==null?"--":Math.hypot(t.vx,t.vy).toFixed(2))+" m/s";
+  $("pos").textContent=(t.x==null?"--":Math.hypot(t.x,t.y).toFixed(2))+" m";
+  drawDrift(t.vx,t.vy);
+
+  // battery + link
+  if(t.vbat!=null && t.vbat>=1){ $("vbat").textContent=t.vbat.toFixed(2);
+    $("vbatbar").style.width=clamp((t.vbat-3.2)/(4.2-3.2)*100,0,100)+"%";
+    $("vbatbar").style.background=t.vbat<3.4?"var(--bad)":t.vbat<3.7?"var(--warn)":"var(--ok)";
+  } else { $("vbat").textContent="--"; $("vbatbar").style.width="0"; }
+  $("age").textContent=(L.age_ms==null?"--":L.age_ms)+" ms";
+  $("loop").textContent=(t.dt_ms>0?Math.round(1000/t.dt_ms):0)+" Hz";
+  $("qual").textContent=L.quality+"%"; $("pkts").textContent=L.count;
+
+  // motors
+  const ids=["m0","m1","m2","m3"];
+  for(let i=0;i<4;i++){ const v=t.u[i]; $(ids[i]).textContent=v.toFixed(3);
+    const b=$(ids[i]+"b"); b.style.width=clamp(v*100,0,100)+"%";
+    b.style.background=v<0.4?"var(--ok)":v<0.75?"var(--warn)":"var(--bad)"; }
+}
+requestAnimationFrame(frame);
+
+/* ---------- compact artificial horizon ---------- */
+function drawAH(roll,pitch){
+  const c=$("ah"), ctx=c.getContext("2d"), W=c.width, H=c.height;
+  const cx=W/2, cy=H/2, R=Math.min(W,H)/2-3;
+  ctx.clearRect(0,0,W,H);
+  ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,R,0,7); ctx.clip();
+  ctx.translate(cx,cy); ctx.rotate(-(roll||0));
+  const px=220, off=(pitch||0)*px;
+  ctx.fillStyle="#1f6f9e"; ctx.fillRect(-W,-H*2+off,W*2,H*2);
+  ctx.fillStyle="#6b4a22"; ctx.fillRect(-W,off,W*2,H*2);
+  ctx.strokeStyle="#eef4fb"; ctx.lineWidth=2; ctx.beginPath();
+  ctx.moveTo(-W,off); ctx.lineTo(W,off); ctx.stroke();
+  ctx.strokeStyle="rgba(238,244,251,.6)"; ctx.fillStyle="rgba(238,244,251,.75)";
+  ctx.lineWidth=1; ctx.font="9px monospace"; ctx.textAlign="center";
+  for(let d=-30;d<=30;d+=10){ if(!d) continue; const y=off-d/DEG*px, w=(d%20===0)?30:16;
+    ctx.beginPath(); ctx.moveTo(-w,y); ctx.lineTo(w,y); ctx.stroke(); ctx.fillText(d+"",w+11,y+3); }
+  ctx.restore();
+  // fixed aircraft marker
+  ctx.strokeStyle="#ffcc33"; ctx.lineWidth=3; ctx.beginPath();
+  ctx.moveTo(cx-34,cy); ctx.lineTo(cx-12,cy); ctx.moveTo(cx+12,cy); ctx.lineTo(cx+34,cy); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,2.5,0,7); ctx.fillStyle="#ffcc33"; ctx.fill();
+  ctx.strokeStyle="rgba(238,244,251,.35)"; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,7); ctx.stroke();
+  // roll pointer
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(-(roll||0));
+  ctx.beginPath(); ctx.moveTo(0,-R); ctx.lineTo(-5,-R+9); ctx.lineTo(5,-R+9); ctx.closePath();
+  ctx.fillStyle="#ffcc33"; ctx.fill(); ctx.restore();
+}
+
+/* ---------- compact top-down drift/velocity ---------- */
+function drawDrift(vx,vy){
+  const c=$("drift"), ctx=c.getContext("2d"), W=c.width, H=c.height;
+  const cx=W/2, cy=H/2, R=Math.min(W,H)/2-8, MAX=0.5, sc=R/MAX;
+  ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle="#1c2634"; ctx.fillStyle="#5d6b7d"; ctx.font="8px monospace"; ctx.textAlign="center";
+  [0.15,0.3,0.5].forEach(r=>{ ctx.beginPath(); ctx.arc(cx,cy,r*sc,0,7); ctx.stroke();
+    ctx.fillText(r.toFixed(2),cx,cy-r*sc+10); });
+  ctx.strokeStyle="#161f2b"; ctx.beginPath(); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy);
+  ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R); ctx.stroke();
+  ctx.fillStyle="#5d6b7d"; ctx.fillText("+x",cx,cy-R+2);
+  if(vx==null||vy==null) return;
+  const px=cx+vy*sc, py=cy-vx*sc, spd=Math.hypot(vx,vy);
+  const col=spd<0.12?"#3fd15a":spd<0.3?"#f5c04a":"#ff5347";
+  ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(px,py); ctx.stroke();
+  ctx.fillStyle=col; ctx.beginPath(); ctx.arc(px,py,4.5,0,7); ctx.fill();
+}
+
+/* ---------- mode switcher + config persistence ---------- */
+function pickMode(m){ [...document.querySelectorAll('#modeseg button')].forEach(b=>
+    b.classList.toggle("on", b.dataset.mode===m)); }
+function applyMode(m){ pickMode(m); const base=$("baseurl").value.trim();
+  try{ localStorage.setItem("rb_mode",m); localStorage.setItem("rb_base",base); }catch(e){}
+  Transport.start(m,base); }
+document.querySelectorAll('#modeseg button').forEach(b=>
+  b.addEventListener("click",()=>applyMode(b.dataset.mode)));
+$("baseurl").addEventListener("change",()=>applyMode(
+  [...document.querySelectorAll('#modeseg button.on')][0]?.dataset.mode||"demo"));
+
+/* boot: restore saved config, else auto-pick (http origin -> SSE, file:// -> demo) */
+(function boot(){
+  const q=new URLSearchParams(location.search);
+  let mode=q.get("mode"), base=q.get("base");
+  try{ if(mode==null) mode=localStorage.getItem("rb_mode");
+       if(base==null) base=localStorage.getItem("rb_base"); }catch(e){}
+  if(mode==null) mode = location.protocol.startsWith("http") ? "sse" : "demo";
+  if(base) $("baseurl").value=base;
+  pickMode(mode); Transport.start(mode, base||"");
+})();
+
+/* prevent double-tap zoom on the control buttons; keep page from bouncing */
+document.addEventListener("gesturestart",e=>e.preventDefault());
+</script>
+</body>
+</html>
