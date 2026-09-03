@@ -2,20 +2,20 @@
  * Copyright (c) 2026 UC Berkeley
  * SPDX-License-Identifier: Apache-2.0
  *
- * camera_image_fpga -- capture and reconstruct HM01B0 frames over the FPGA OSPI core, with manual
- * exposure/gain control and an exposure-sweep mode for motion calibration.
+ * camera_image_fpga -- HM01B0 capture over the FPGA OSPI core, using the Himax reference QVGA
+ * register init (the config lineage the Crazyflie AI-deck / OpenMV / SparkFun drivers use), plus
+ * camera throughput characterization.
  *
- * Pipeline: configure the sensor over I2C (SCCB), stream, then a frame-aligned bounded capture
- * through the OSPI capture core (ospi@10080000); reconstruct via the in-band sof/eol/eof markers.
+ * Why the full init: the minimal "test-pattern + MODE_SELECT" config relied on power-on defaults and
+ * left black-level calibration off, so at high gain the dark pedestal dominated (flat images). The
+ * reference init turns on BLC (0x1000/0x1003/0x1006), sets explicit 8-bit output (BIT_CONTROL
+ * 0x3059=0x02), the oscillator/PCLK divider (0x3060), and QVGA window mode (0x3010=0x01, 320x240).
+ * Gain limits per the datasheet: analog max 8x (0x0205 code 0x30, MAX_AGAIN 0x2108=0x03), digital
+ * max ~4x (0x020E/0F, MAX_DGAIN 0x210B).
  *
- * Exposure: AE is off; integration (0x0202/03, in lines) + analog gain (0x0205) + digital gain
- * (0x020e/0f) are programmed manually. Exposure time = integration_lines * line_time, where
- * line_time = frame_time/VTS ~= 59.3 us at MCLKDIV=1 (12.5 MHz MCLK -> ~6.25 MHz PCLK, 30 fps,
- * VTS 0x0232=562). So 560 lines ~= 33 ms (still scene); short integration freezes motion.
- *
- * SWEEP=1 runs a table of (intg,again,dgain), printing mean/min/max/spread per row (no hex dump) so
- * a good motion setting can be picked in one load. SWEEP=0 captures once at MAN_* and dumps the
- * frame as hex rows between <<<PGM W H>>>/<<<END>>> for scripts/camera_pgm_from_hex.py.
+ * Throughput: prints sensor frame rate (from FVLDCNT) and the CPU drain rate (cycle-timed MMIO
+ * reads of DATA @ 0x20). The current OSPI core has NO DMA -- the CPU must pop every pixel from the
+ * frame buffer through DATA, so the drain rate is the ceiling for sustained (streaming) capture.
  *
  * Build (DroneFullDDR shell):
  *   west build -b chipyard_riscv64 -d build_camimg samples/riskybird/camera_image_fpga -- \
@@ -39,7 +39,6 @@
 #define OSPI_DATA       0x20
 #define OSPI_CAPACITY   0x24
 #define OSPI_PIXTARGET  0x28
-#define OSPI_CAPCOUNT   0x2c
 #define OSPI_PCLKCNT    0x30
 #define OSPI_FVLDCNT    0x34
 #define OSPI_LVLDCNT    0x38
@@ -55,68 +54,50 @@
 #define DATA_EOL    (1u << 9)
 #define DATA_SOF    (1u << 8)
 
-#define MCLK_DIV       1
-#define LINE_TIME_NS   59300      /* ~59.3 us/line at MCLKDIV=1 (measured) -- for exp-time reporting */
+#define MCLK_DIV       1          /* MCLK = 50/(2*(1+1)) = 12.5 MHz */
+#define CPU_HZ         50000000UL
 
-/* ---- HM01B0 SCCB registers ---- */
 #define HM_ADDR         0x24
-#define HM_MODEL_ID_H   0x0000
 #define HM_MODE_SELECT  0x0100
-#define HM_GRP_HOLD     0x0104
-#define HM_INTG_H       0x0202
-#define HM_INTG_L       0x0203
-#define HM_ANA_GAIN     0x0205   /* code: 0=1x 0x10=2x 0x20=4x 0x30=8x 0x40=16x */
-#define HM_DGAIN_H      0x020E   /* digital gain 8.8: 0x0100=1.0x */
-#define HM_DGAIN_L      0x020F
-#define HM_TEST_PATTERN 0x0601
-#define HM_AE_CTRL      0x2100
 #define HM_MODEL_ID     0x01B0
+#define TEST_PATTERN_REG 0x0601
+#define TEST_PATTERN     0        /* 0 = live scene */
 
-#define TEST_PATTERN    0        /* 0 = live scene */
-
-/* ---- Reconstruction bounds ---- */
 #define MAX_W       340
 #define MAX_H       324
-#define CAP_PIXELS  104900       /* just under the 104977-beat frame buffer */
-
-/* ======================= exposure calibration =======================
- * SWEEP=1: characterize the table below (no hex dump). SWEEP=0: single capture at MAN_* + dump.
- * DBG=1: print OSPI counters inside capture_frame.
- *
- * MOTION-vs-LIGHT finding (2026-09-02, indoor scene lit by ONE ceiling lamp):
- *   - exposure_time = integration_lines * ~59.3 us  (560 lines ~= 33 ms, the 30fps max).
- *   - Changing integration WHILE streaming stalls the HM01B0's pixel clock -> must standby,
- *     reprogram, then re-stream (see main). Digital gain (0x020e/0f) has a ceiling ~0x0bff;
- *     above it the output goes black. Analog-gain codes: 0=1x 0x10=2x 0x20=4x 0x30=8x 0x40=16x.
- *   - In this dim scene, motion-safe short exposures (2-4 ms) are light-starved: the scene signal
- *     falls below the noise floor and gain only amplifies a flat pedestal -> no detail. Even 15 ms
- *     with 8x analog was flat, while 33 ms with LOW (2x) analog had good detail. Lesson: in low
- *     light, detail needs LONG integration + LOW analog gain; high gain buries low-contrast detail.
- *   - => A true motion calibration needs MORE LIGHT on the scene; then the SWEEP finds the shortest
- *     exposure with mean ~110 that keeps detail. Default below = the good still-scene config. */
-#define SWEEP           0
-#define DBG             0
-#define MAN_INTG        560      /* ~33 ms -- best still-scene detail in one-lamp lighting */
-#define MAN_AGAIN       0x10     /* 2x analog (low gain = clean, keeps low-contrast detail) */
-#define MAN_DGAIN       0x0300   /* 3x digital */
-
-/* {integration lines, analog-gain code, digital-gain 8.8}. Shorter integration = shorter exposure
- * (freezes motion) but needs more gain. */
-struct expo { uint16_t intg; uint8_t again; uint16_t dgain; };
-static const struct expo SWEEP_TBL[] __attribute__((unused)) = {
-	{ 135, 0x30, 0x0500 },   /* ~8 ms   8x*5x */
-	{  68, 0x30, 0x0b00 },   /* ~4 ms   8x*11x */
-	{  40, 0x40, 0x0900 },   /* ~2.4 ms 16x*9x */
-	{  34, 0x40, 0x0b00 },   /* ~2 ms   16x*11x */
-	{  24, 0x40, 0x1000 },   /* ~1.4 ms 16x*16x */
-	{  17, 0x40, 0x1800 },   /* ~1 ms   16x*24x */
-};
-/* ==================================================================== */
+#define CAP_PIXELS  104900        /* ~one full 326x324 frame + markers, < buffer 104977 */
 
 static uint8_t img[MAX_H][MAX_W];
 
+/* Himax HM01B0 reference init (AI-deck / OpenMV / SparkFun lineage), CLOCK-SAFE subset: the full
+ * reference sets OSC_CLK_DIV(0x3060)/QVGA-window(0x3010)/VTS/HTS/BIT_CONTROL tuned for the AI-deck's
+ * master clock, and applying those to our 12.5 MHz MCLK killed frame output (PCLK dropped 10x,
+ * FVLD/LVLD stopped). So we keep our known-good clock + full-frame geometry and apply only the
+ * clock-INDEPENDENT quality regs: black-level calibration (the big win -- subtracts the dark
+ * pedestal so gain amplifies signal not noise), analog/ADC tuning, and the AE block. */
+static const struct { uint16_t r; uint8_t v; } HM_INIT[] = {
+	/* black-level calibration + defect-pixel + dgain floor */
+	{0x1003,0x08},{0x1007,0x08},
+	{0x1000,0x43},{0x1001,0x40},{0x1002,0x32},{0x0350,0x7F},{0x1006,0x01},{0x1008,0x00},
+	{0x1009,0xA0},{0x100A,0x60},{0x100B,0x90},{0x100C,0x40},
+	/* analog/ADC tuning (no pixel-clock division) */
+	{0x3044,0x0A},{0x3045,0x00},{0x3047,0x0A},{0x3050,0xC0},{0x3051,0x42},{0x3052,0x50},
+	{0x3053,0x00},{0x3054,0x03},{0x3055,0xF7},{0x3056,0xF8},{0x3057,0x29},{0x3058,0x1F},
+	{0x3064,0x00},{0x3065,0x04},
+	{0x3022,0x01},{0x1012,0x01},
+	/* auto-exposure: enable, target, converge, limits (analog max 8x, digital max) */
+	{0x2000,0x07},
+	{0x2100,0x01},{0x2101,0x40},{0x2102,0x0A},{0x2103,0x03},{0x2104,0x07},
+	{0x2105,0x02},{0x2106,0x20},   /* MAX_INTG ~0x0220 (< our ~562-line frame) */
+	{0x2108,0x03},{0x2109,0x03},   /* MAX_AGAIN = 8x */
+	{0x210B,0x80},          /* MAX_DGAIN */
+	{0x0101,0x01},          /* IMG_ORIENTATION */
+	{0x0104,0x01},          /* GRP_PARAM_HOLD -> commit */
+};
+
 static inline void     w32(uintptr_t o, uint32_t v) { *(volatile uint32_t *)(OSPI_BASE + o) = v; }
 static inline uint32_t r32(uintptr_t o) { return *(volatile uint32_t *)(OSPI_BASE + o); }
+static inline uint64_t rdcycle(void) { uint64_t c; __asm__ volatile("csrr %0, cycle" : "=r"(c)); return c; }
 
 static int hm_wr(const struct device *b, uint16_t reg, uint8_t val)
 {
@@ -129,95 +110,11 @@ static int hm_rd(const struct device *b, uint16_t reg, uint8_t *val)
 	return i2c_write_read(b, HM_ADDR, rb, sizeof(rb), val, 1);
 }
 
-static void set_exposure(const struct device *b, uint16_t intg, uint8_t again, uint16_t dgain)
-{
-	hm_wr(b, HM_AE_CTRL, 0x00);            /* AE off */
-	hm_wr(b, HM_GRP_HOLD, 0x01);
-	hm_wr(b, HM_INTG_H, (intg >> 8) & 0xff);
-	hm_wr(b, HM_INTG_L, intg & 0xff);
-	hm_wr(b, HM_ANA_GAIN, again);
-	hm_wr(b, HM_DGAIN_H, (dgain >> 8) & 0xff);
-	hm_wr(b, HM_DGAIN_L, dgain & 0xff);
-	hm_wr(b, HM_GRP_HOLD, 0x00);
-}
-
-/* Frame-aligned bounded capture + reconstruct into img[][]. Fills *W,*H and pixel stats. */
-static int capture_frame(int *pW, int *pH, uint32_t *pmean, uint8_t *pmin, uint8_t *pmax,
-			 uint32_t *poverflow)
-{
-	/* Fully reset the core each call so a repeated capture never inherits stale armed/done/overflow
-	 * state. FVLDCNT advances regardless of enable, so frame-align still works after a disable. */
-	w32(OSPI_CTRL, 0);                                     /* stop frontend */
-	w32(OSPI_PIXTARGET, CAP_PIXELS);
-	w32(OSPI_CTRL, CTRL_EN | CTRL_CLEAR | CTRL_FLUSH);     /* enable + clear status + flush buffer */
-	w32(OSPI_CTRL, CTRL_EN);
-	uint32_t fv = r32(OSPI_FVLDCNT);
-	uint32_t spins = 4000000;
-	while (r32(OSPI_FVLDCNT) == fv && spins-- > 0) { /* spin to a frame boundary */ }
-	w32(OSPI_CTRL, CTRL_EN | CTRL_CLEAR | CTRL_FLUSH);     /* flush at the boundary */
-	w32(OSPI_CTRL, CTRL_EN | CTRL_ARM);                   /* arm */
-	w32(OSPI_CTRL, CTRL_EN);
-	/* Poll until the bounded capture has actually filled the buffer (robust to exposure/timing),
-	 * rather than a fixed sleep. */
-	uint32_t pclk0 = r32(OSPI_PCLKCNT), fvld0 = r32(OSPI_FVLDCNT), lvld0 = r32(OSPI_LVLDCNT);
-	int t = 400;
-	while (r32(OSPI_FIFOCOUNT) < (CAP_PIXELS - 4096) && t-- > 0) { k_msleep(1); }
-	*poverflow = (r32(OSPI_FLAGS) >> 1) & 1;
-#if DBG
-	printk("[dbg] armed->fifo=%u capcnt=%u capstat=0x%x flags=0x%02x dpclk=%u dfvld=%u dlvld=%u\n",
-	       r32(OSPI_FIFOCOUNT), r32(OSPI_CAPCOUNT), r32(OSPI_CAPSTAT), r32(OSPI_FLAGS),
-	       r32(OSPI_PCLKCNT) - pclk0, r32(OSPI_FVLDCNT) - fvld0, r32(OSPI_LVLDCNT) - lvld0);
-#else
-	(void)pclk0; (void)fvld0; (void)lvld0;
-#endif
-
-	int started = 0, row = 0, col = 0, W = 0;
-	uint32_t npix = 0, guard = CAP_PIXELS + 64, sum = 0;
-	uint8_t mn = 0xff, mx = 0;
-	for (;;) {
-		uint32_t d = r32(OSPI_DATA);
-		if (!(d & DATA_VALID)) break;
-		if (guard-- == 0) break;
-		if (d & DATA_EOF) { if (started && row >= 4) break; started = 0; row = 0; col = 0; continue; }
-		uint8_t px = (uint8_t)(d & 0xff);
-		if (!started) {
-			if (d & DATA_SOF) started = 1;
-			else { if (d & DATA_EOL) started = 1; continue; }
-		}
-		if (row >= MAX_H) break;
-		if (col < MAX_W) img[row][col] = px;
-		col++; npix++; sum += px;
-		if (px < mn) mn = px;
-		if (px > mx) mx = px;
-		if (d & DATA_EOL) { if (col > W) W = col; row++; col = 0; }
-	}
-	*pW = W; *pH = row; *pmin = mn; *pmax = mx;
-	*pmean = npix ? sum / npix : 0;
-	return (int)npix;
-}
-
-static void dump_hex(int W, int H) __attribute__((unused));
-static void dump_hex(int W, int H)
-{
-	printk("<<<PGM %d %d>>>\n", W, H);
-	for (int y = 0; y < H; y++) {
-		char hexline[MAX_W * 2 + 2];
-		int k = 0;
-		static const char hx[] = "0123456789abcdef";
-		for (int x = 0; x < W; x++) {
-			hexline[k++] = hx[(img[y][x] >> 4) & 0xf];
-			hexline[k++] = hx[img[y][x] & 0xf];
-		}
-		hexline[k] = 0;
-		printk("%s\n", hexline);
-	}
-	printk("<<<END>>>\n");
-}
-
 int main(void)
 {
-	printk("\n=== camera_image_fpga: HM01B0 capture (SWEEP=%d) ===\n", SWEEP);
-	if (r32(OSPI_CAPACITY) == 0) { printk("FAIL: no OSPI capture peripheral\n"); return 0; }
+	printk("\n=== camera_image_fpga: HM01B0 reference-config capture + throughput ===\n");
+	uint32_t cap = r32(OSPI_CAPACITY);
+	if (cap == 0) { printk("FAIL: no OSPI capture peripheral\n"); return 0; }
 
 	w32(OSPI_MCLKDIV, MCLK_DIV);
 	w32(OSPI_PIXTARGET, CAP_PIXELS);
@@ -226,54 +123,91 @@ int main(void)
 	const struct device *bus = DEVICE_DT_GET(DT_NODELABEL(i2c0));
 	if (!device_is_ready(bus)) { printk("FAIL: i2c0 not ready\n"); return 0; }
 	uint8_t hi = 0, lo = 0;
-	if (hm_rd(bus, HM_MODEL_ID_H, &hi) || hm_rd(bus, 0x0001, &lo) ||
+	if (hm_rd(bus, 0x0000, &hi) || hm_rd(bus, 0x0001, &lo) ||
 	    (((uint16_t)hi << 8) | lo) != HM_MODEL_ID) { printk("FAIL: MODEL_ID 0x%02x%02x\n", hi, lo); return 0; }
 
-	hm_wr(bus, HM_TEST_PATTERN, TEST_PATTERN);
+	/* SW-reset first: restores all regs (incl. the clock divider 0x3060) to power-on defaults, so a
+	 * prior run that changed clock/timing can't leave the sensor in a stalled state. */
+	hm_wr(bus, 0x0103, 0x01);
+	k_msleep(50);
+	hm_wr(bus, HM_MODE_SELECT, 0x00);   /* standby while we configure */
+
+	/* Apply the clock-safe reference regs, then test pattern + stream. */
+	int nerr = 0;
+	for (unsigned i = 0; i < sizeof(HM_INIT) / sizeof(HM_INIT[0]); i++) {
+		nerr += (hm_wr(bus, HM_INIT[i].r, HM_INIT[i].v) != 0);
+	}
+	hm_wr(bus, TEST_PATTERN_REG, TEST_PATTERN);
 	hm_wr(bus, HM_MODE_SELECT, 0x01);   /* streaming */
-	k_msleep(200);
+	printk("[cfg] applied %u reference regs (%d NACKs), test_pattern=%d, streaming\n",
+	       (unsigned)(sizeof(HM_INIT) / sizeof(HM_INIT[0])), nerr, TEST_PATTERN);
+	k_msleep(1500);   /* AE convergence */
 
-	int W, H, npix; uint32_t mean, ovf; uint8_t mn, mx;
+	/* --- Throughput: sensor frame/line rate from the diagnostic counters --- */
+	uint32_t f0 = r32(OSPI_FVLDCNT), l0 = r32(OSPI_LVLDCNT), p0 = r32(OSPI_PCLKCNT);
+	k_msleep(500);
+	uint32_t dfvld = r32(OSPI_FVLDCNT) - f0, dlvld = r32(OSPI_LVLDCNT) - l0, dpclk = r32(OSPI_PCLKCNT) - p0;
+	printk("[rate] over 500ms: frames=%u (%u fps), lines=%u (%u/s), pclk=%u (%u kHz)\n",
+	       dfvld, dfvld * 2, dlvld, dlvld * 2, dpclk, dpclk / 500);
 
-#if SWEEP
-	printk("[sweep] line_time~%u ns; cols: intg(lines) exp(us) again dgain -> mean min max spread ovf\n",
-	       LINE_TIME_NS);
-	for (unsigned i = 0; i < sizeof(SWEEP_TBL) / sizeof(SWEEP_TBL[0]); i++) {
-		struct expo e = SWEEP_TBL[i];
-		/* Clean restart per entry: changing exposure while streaming throws transient black
-		 * frames. Standby -> reprogram -> stream mirrors the known-good boot path. */
-		hm_wr(bus, HM_MODE_SELECT, 0x00);   /* standby */
-		set_exposure(bus, e.intg, e.again, e.dgain);
-		hm_wr(bus, HM_MODE_SELECT, 0x01);   /* stream */
-		k_msleep(700);   /* streaming needs to fully resume after an integration change */
-		/* retry: a capture right after an exposure change can catch an empty frame */
-		npix = 0;
-		for (int tries = 0; tries < 3 && npix < 20000; tries++) {
-			npix = capture_frame(&W, &H, &mean, &mn, &mx, &ovf);
-			if (npix < 20000) k_msleep(120);
+	/* --- Frame-aligned bounded capture --- */
+	w32(OSPI_CTRL, CTRL_EN | CTRL_CLEAR | CTRL_FLUSH);
+	uint32_t fv = r32(OSPI_FVLDCNT);
+	uint32_t spins = 4000000;
+	while (r32(OSPI_FVLDCNT) == fv && spins-- > 0) { }
+	w32(OSPI_CTRL, CTRL_EN | CTRL_CLEAR | CTRL_FLUSH);
+	w32(OSPI_CTRL, CTRL_EN | CTRL_ARM);
+	w32(OSPI_CTRL, CTRL_EN);
+	int t = 500;
+	while (r32(OSPI_FIFOCOUNT) < (CAP_PIXELS - 4096) && t-- > 0) { k_msleep(1); }
+
+	/* --- Drain, timing the CPU MMIO pops to characterize drain throughput --- */
+	int started = 0, row = 0, col = 0, W = 0;
+	uint32_t npix = 0, guard = CAP_PIXELS + 64, sum = 0, reads = 0;
+	uint8_t mn = 0xff, mx = 0;
+	uint64_t c0 = rdcycle();
+	for (;;) {
+		uint32_t d = r32(OSPI_DATA);
+		reads++;
+		if (!(d & DATA_VALID)) break;
+		if (guard-- == 0) break;
+		if (d & DATA_EOF) { if (started && row >= 4) break; started = 0; row = 0; col = 0; continue; }
+		uint8_t px = (uint8_t)(d & 0xff);
+		if (!started) { if (d & DATA_SOF) started = 1; else { if (d & DATA_EOL) started = 1; continue; } }
+		if (row >= MAX_H) break;
+		if (col < MAX_W) img[row][col] = px;
+		col++; npix++; sum += px;
+		if (px < mn) mn = px;
+		if (px > mx) mx = px;
+		if (d & DATA_EOL) { if (col > W) W = col; row++; col = 0; }
+	}
+	uint64_t dc = rdcycle() - c0;
+	int H = row;
+	uint32_t us = (uint32_t)(dc * 1000000ULL / CPU_HZ);            /* drain time in microseconds */
+	uint32_t fps = dfvld * 2;
+	/* Drain rate: pixel bytes moved per microsecond == MB/s. Report x100 for two decimals. */
+	uint32_t drain_x100  = us ? (uint32_t)((uint64_t)npix * 100 / us) : 0;
+	uint32_t ns_per_read = reads ? (uint32_t)(dc * 20ULL / reads) : 0;   /* 20 ns/cycle @ 50 MHz */
+	/* Sensor rate: pixels/frame * fps, in MB/s x100. */
+	uint32_t sensor_x100 = (uint32_t)((uint64_t)npix * fps / 10000);
+	printk("[img] %dx%d  %u pixels  mean=%u range=%u..%u\n", W, H, npix, npix ? sum / npix : 0, mn, mx);
+	printk("[drain] %u beats in %u us -> %u.%02u MB/s pixel payload, %u ns/read\n",
+	       reads, us, drain_x100 / 100, drain_x100 % 100, ns_per_read);
+	printk("[tput] sensor %u.%02u MB/s (%dx%d @ %u fps) vs CPU drain %u.%02u MB/s -> %s\n",
+	       sensor_x100 / 100, sensor_x100 % 100, W, H, fps, drain_x100 / 100, drain_x100 % 100,
+	       (drain_x100 > sensor_x100) ? "CPU keeps up at this fps" : "CPU CANNOT sustain -> DMA needed");
+
+	/* Dump the frame as hex rows. */
+	if (npix > 100) {
+		printk("<<<PGM %d %d>>>\n", W, H);
+		for (int y = 0; y < H; y++) {
+			char hexline[MAX_W * 2 + 2]; int k = 0;
+			static const char hx[] = "0123456789abcdef";
+			for (int x = 0; x < W; x++) { hexline[k++] = hx[(img[y][x] >> 4) & 0xf]; hexline[k++] = hx[img[y][x] & 0xf]; }
+			hexline[k] = 0; printk("%s\n", hexline);
 		}
-		uint32_t exp_us = ((uint32_t)e.intg * LINE_TIME_NS) / 1000;
-		printk("  intg=%-4u exp=%-6u again=0x%02x dgain=0x%04x -> mean=%-3u min=%-3u max=%-3u spread=%-3u ovf=%u (%dx%d)\n",
-		       e.intg, exp_us, e.again, e.dgain, mean, mn, mx, (unsigned)(mx - mn), ovf, W, H);
+		printk("<<<END>>>\n");
 	}
-	printk("[sweep] done -- pick the shortest exp with mean ~110-140 and good spread, set MAN_* + SWEEP=0\n");
-#else
-	/* Clean restart: standby, reprogram exposure, stream, long settle. */
-	hm_wr(bus, HM_MODE_SELECT, 0x00);
-	set_exposure(bus, MAN_INTG, MAN_AGAIN, MAN_DGAIN);
-	hm_wr(bus, HM_MODE_SELECT, 0x01);
-	k_msleep(700);
-	{
-		uint32_t a = r32(OSPI_PCLKCNT), b = r32(OSPI_FVLDCNT);
-		k_msleep(50);
-		printk("[pre] streaming check: dpclk=%u dfvld=%u\n", r32(OSPI_PCLKCNT) - a, r32(OSPI_FVLDCNT) - b);
-	}
-	npix = capture_frame(&W, &H, &mean, &mn, &mx, &ovf);
-	uint32_t exp_us = ((uint32_t)MAN_INTG * LINE_TIME_NS) / 1000;
-	printk("[capture] intg=%u exp=%u us again=0x%02x dgain=0x%04x -> %dx%d mean=%u min=%u max=%u spread=%u ovf=%u\n",
-	       MAN_INTG, exp_us, MAN_AGAIN, MAN_DGAIN, W, H, mean, mn, mx, (unsigned)(mx - mn), ovf);
-	if (npix > 100) dump_hex(W, H);
-#endif
 	printk("[done]\n");
 	for (;;) { k_msleep(1000); }
 	return 0;
