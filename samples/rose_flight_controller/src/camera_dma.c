@@ -45,6 +45,93 @@ static uint8_t __aligned(64) cam_buf[128 * 1024];   /* DDR sink for the DMA */
 static volatile uint32_t g_frames;
 static volatile uint32_t g_last_mean;
 
+/* ---- on-demand snapshot streaming over uart1 (GCS "SNAP <w> <h>" command) ------------------- *
+ * The captured frame is ~326 wide; CAP_PIXELS/326 full rows fit the DDR buffer. On request we
+ * nearest-neighbour downsample cam_buf to w x h, base64 it, and emit newline-framed chunks the
+ * ESP bridge relays to the GCS on UDP :14550:
+ *     IMG s=<seq> k=<chunk>/<total> w=<W> h=<H> <base64 of W*H grayscale bytes>
+ * Streaming runs in this low-prio camera thread (between captures) so the control loop is undisturbed. */
+#include "telem_uart.h"
+#include <zephyr/sys/printk.h>   /* snprintk */
+
+/* True line stride of the captured frame in cam_buf = 324 (HM01B0 active line). Verified by
+ * reconstructing a raw buffer dump: at 324 the image is coherent with straight vertical edges; at
+ * 326/325 it sheared/duplicated (326 was the old guess; a 648=2x324 autocorrelation alias briefly
+ * looked like 325). 104000/324 = 320 rows captured. */
+#define SRC_W 324
+#define SRC_H (CAP_PIXELS / SRC_W)   /* 320 rows */
+
+/* Periodic auto-snapshot: stream a snapshot every Nth captured frame so the GCS shows a live camera
+ * view even without the uplink command path. 0 = off (on-demand SNAP only). */
+#ifndef ROSE_CAM_AUTOSNAP
+#define ROSE_CAM_AUTOSNAP 0
+#endif
+#ifndef ROSE_CAM_AUTOSNAP_W
+#define ROSE_CAM_AUTOSNAP_W 80
+#endif
+#ifndef ROSE_CAM_AUTOSNAP_H
+#define ROSE_CAM_AUTOSNAP_H 60
+#endif
+
+static volatile int      g_snap_w, g_snap_h;
+static volatile uint32_t g_snap_req;   /* nonzero seq = a snapshot is requested */
+
+static const char B64[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/* base64-encode n (<=3) bytes into out (4 chars, with '=' padding); returns 4. */
+static int b64_triplet(const uint8_t *in, int n, char *out)
+{
+	uint32_t v = (uint32_t)in[0] << 16;
+	if (n > 1) v |= (uint32_t)in[1] << 8;
+	if (n > 2) v |= (uint32_t)in[2];
+	out[0] = B64[(v >> 18) & 0x3F];
+	out[1] = B64[(v >> 12) & 0x3F];
+	out[2] = (n > 1) ? B64[(v >> 6) & 0x3F] : '=';
+	out[3] = (n > 2) ? B64[v & 0x3F] : '=';
+	return 4;
+}
+
+static void stream_snapshot(uint32_t seq, int w, int h)
+{
+	if (w < 8) w = 8;  if (w > SRC_W) w = SRC_W;
+	if (h < 8) h = 8;  if (h > SRC_H) h = SRC_H;
+
+	enum { RAW_PER = 150 };            /* multiple of 3 -> clean base64; 200 b64/chunk (~240 B line).
+					    * Safe now the ESP bridge does interrupt-driven RX into an 8 KB ring
+					    * (fpga_telem_bridge) -- it no longer loses bytes on a sustained burst. */
+	const int total = (w * h + RAW_PER - 1) / RAW_PER;
+	char line[560];
+	uint8_t raw[RAW_PER];
+	int rn = 0, k = 0;
+
+	for (int oy = 0; oy < h; oy++) {
+		int sy = oy * SRC_H / h;
+		const uint8_t *row = &cam_buf[(uint32_t)sy * SRC_W];
+		for (int ox = 0; ox < w; ox++) {
+			raw[rn++] = row[ox * SRC_W / w];
+			if (rn == RAW_PER) {
+				int off = snprintk(line, sizeof(line), "IMG s=%u k=%d/%d w=%d h=%d ",
+						   seq, k++, total, w, h);
+				for (int i = 0; i < rn; i += 3)
+					off += b64_triplet(&raw[i], (rn - i) < 3 ? (rn - i) : 3, &line[off]);
+				line[off++] = '\n'; line[off] = '\0';
+				telem_uart_line(line);
+				k_msleep(5);   /* light pace so the ISR-relayed ring drains via UDP + RBT interleaves */
+				rn = 0;
+			}
+		}
+	}
+	if (rn > 0) {
+		int off = snprintk(line, sizeof(line), "IMG s=%u k=%d/%d w=%d h=%d ",
+				   seq, k++, total, w, h);
+		for (int i = 0; i < rn; i += 3)
+			off += b64_triplet(&raw[i], (rn - i) < 3 ? (rn - i) : 3, &line[off]);
+		line[off++] = '\n'; line[off] = '\0';
+		telem_uart_line(line);
+	}
+}
+
 /* Himax reference init (clock-safe subset; matches camera_image_fpga / camera_dma_fpga). */
 static const struct { uint16_t r; uint8_t v; } HM_INIT[] = {
 	{0x1003,0x08},{0x1007,0x08},{0x1000,0x43},{0x1001,0x40},{0x1002,0x32},{0x0350,0x7F},
@@ -74,8 +161,14 @@ static int cam_rd(const struct device *b, uint16_t reg, uint8_t *val)
 static void cam_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	/* The one-time SCCB init is ~40 I2C transactions on the shared i2c0 bus. At the capture-loop
+	 * priority (12) it is starved forever by the flat-out control loop + the down-ToF thread (which
+	 * always win the bus mutex). Boost above them for the init, then drop back so the capture loop
+	 * never disturbs the control loop. */
+	k_thread_priority_set(k_current_get(), 5);
 	const struct device *bus = DEVICE_DT_GET(DT_NODELABEL(i2c0));
 	if (!device_is_ready(bus)) { printk("camera_dma: i2c0 not ready\n"); return; }
+	printk("camera_dma: OSPI capacity=%u\n", r32(O_CAPACITY));
 
 	if (r32(O_CAPACITY) == 0) { printk("camera_dma: no OSPI capture peripheral (need DMA shell)\n"); return; }
 
@@ -93,6 +186,7 @@ static void cam_thread(void *a, void *b, void *c)
 	cam_wr(bus, 0x0100, 0x01);          /* stream */
 	k_msleep(1200);
 	printk("camera_dma: HM01B0 streaming; DMA capture thread running (buf @ %p)\n", (void *)cam_buf);
+	k_thread_priority_set(k_current_get(), 12);   /* init done -> low prio for the capture loop */
 
 	uintptr_t dst = (uintptr_t)cam_buf;
 	for (;;) {
@@ -127,6 +221,20 @@ static void cam_thread(void *a, void *b, void *c)
 		g_last_mean = n ? sum / n : 0;
 		g_frames++;
 
+		/* Service a pending on-demand snapshot request with the frame we just captured. */
+		uint32_t req = g_snap_req;
+		if (req) {
+			stream_snapshot(req, g_snap_w, g_snap_h);
+			g_snap_req = 0;
+		}
+#if ROSE_CAM_AUTOSNAP
+		/* Periodic auto-snapshot (high seq bit set to mark it auto vs on-demand) so the GCS shows a
+		 * live camera view without needing the uart1 RX uplink. */
+		else if ((g_frames % ROSE_CAM_AUTOSNAP) == 0) {
+			stream_snapshot(0x80000000u | g_frames, ROSE_CAM_AUTOSNAP_W, ROSE_CAM_AUTOSNAP_H);
+		}
+#endif
+
 		k_msleep(20);   /* ~cap the camera thread rate + yield to the control loop */
 	}
 }
@@ -138,10 +246,18 @@ void camera_dma_init(void) { /* thread auto-starts */ }
 uint32_t camera_dma_frames(void) { return g_frames; }
 uint32_t camera_dma_last_mean(void) { return g_last_mean; }
 
+void camera_dma_request_snapshot(uint32_t seq, int w, int h)
+{
+	g_snap_w = w;
+	g_snap_h = h;
+	g_snap_req = seq ? seq : 1;   /* nonzero -> serviced by the camera thread */
+}
+
 #else  /* ROSE_CAMERA == 0 */
 
 void camera_dma_init(void) {}
 uint32_t camera_dma_frames(void) { return 0; }
 uint32_t camera_dma_last_mean(void) { return 0; }
+void camera_dma_request_snapshot(uint32_t seq, int w, int h) { (void)seq; (void)w; (void)h; }
 
 #endif

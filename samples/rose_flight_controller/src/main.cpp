@@ -29,6 +29,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <string.h>
+#include <stdlib.h>   /* strtol -- parse SNAP/HOVER_Z command args from the uplink */
 
 #include "estimator.hpp"
 #include "controller.hpp"
@@ -839,8 +840,16 @@ static struct k_thread tof_thread_data;
 static void tof_thread_fn(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	uint32_t dbg_n = 0, dbg_ok = 0; int dbg_last = 123;
 	for (;;) {
-		if (sensor_sample_fetch(tof_dev) == 0) {   /* blocks ~1 ranging budget on this thread */
+		int rc = sensor_sample_fetch(tof_dev);   /* blocks ~1 ranging budget on this thread */
+		dbg_n++; dbg_last = rc; if (rc == 0) { dbg_ok++; }
+#if defined(ROSE_TOF_DBG) && ROSE_TOF_DBG
+		if ((dbg_n % 50) == 0) {
+			printk("tofdbg: fetch calls=%u ok=%u last_rc=%d\n", dbg_n, dbg_ok, dbg_last);
+		}
+#endif
+		if (rc == 0) {
 			struct sensor_value h;
 			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
 			float hv = (float)sensor_value_to_double(&h);
@@ -1374,9 +1383,10 @@ static void ctrl_block(void *a, void *b, void *c)
 }
 #endif /* ROSE_THREADED */
 
-#if defined(CONFIG_WIFI)
-/* Uplink command hooks (declared in telem_wifi.h); the command-RX thread calls these. Each just
- * pokes a control-loop shared flag consumed on the next iteration -- no locks, no blocking. */
+#if defined(CONFIG_WIFI) || ROSE_UART_TELEM
+/* Uplink command hooks (declared in telem_wifi.h); the command-RX path calls these -- the ESP-native
+ * WiFi build via its UDP thread, the FPGA build via the uart1 command poll in the control loop. Each
+ * just pokes a control-loop shared flag consumed on the next iteration -- no locks, no blocking. */
 extern "C" void rose_cmd_estop(void) { g_estop = true; }   /* latched remote kill */
 extern "C" void rose_cmd_disarm(void)
 {
@@ -1809,20 +1819,61 @@ int main(void)
 		if ((iter % ROSE_UART_TELEM_DIV) == 0) {
 			int fl = (g_armed ? 1 : 0) | (g_estop ? 2 : 0) |
 				 (g_arming ? 4 : 0) | (g_gyro_cal_done ? 8 : 0);
-			char tbuf[176];
-			snprintf(tbuf, sizeof(tbuf),
+			char tbuf[248];
+			int tn = snprintf(tbuf, sizeof(tbuf),
 				 "RBT it=%d r=%s%d.%03d p=%s%d.%03d y=%s%d.%03d z=%s%d.%03d "
-				 "vz=%s%d.%03d h=%s%d.%03d tv=%d fl=%d cam=%u camm=%u\n",
+				 "vz=%s%d.%03d h=%s%d.%03d tv=%d fl=%d cam=%u camm=%u rx=%u",
 				 iter, FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
 				 FP3(state[8]), FP3(f.height), (int)f.tof_valid, fl,
-				 camera_dma_frames(), camera_dma_last_mean());
+				 camera_dma_frames(), camera_dma_last_mean(), telem_uart_rx_count());
+#if ROSE_BUMPER
+			/* Side-ToF walls (mm; -1 = no target) + seq so the GCS shows the full ToF flow. */
+			struct side_walls wl;
+			side_tof_get(&wl);
+			tn += snprintf(tbuf + tn, sizeof(tbuf) - tn, " wl=%d,%d,%d,%d wsq=%u",
+				       wl.front_mm, wl.back_mm, wl.left_mm, wl.right_mm, wl.seq);
+#endif
+			snprintf(tbuf + tn, sizeof(tbuf) - tn, "\n");
 			telem_uart_line(tbuf);
 		}
+		/* Poll the ESP uplink (GCS :14551 commands relayed onto uart1 RX). Non-blocking; a
+		 * complete line dispatches once. This is the FPGA equivalent of telem_wifi.c's UDP cmd
+		 * thread -- without it the panel's buttons (and camera SNAP) have no path to the FC. */
+		{
+			const char *cmd = telem_uart_poll_cmd();
+			if (cmd) {
+				if (strncmp(cmd, "SNAP", 4) == 0) {
+					int w = 80, h = 60;                 /* default thumbnail */
+					const char *p = cmd + 4;
+					while (*p == ' ') p++;
+					if (*p) { w = (int)strtol(p, (char **)&p, 10);
+						  h = (int)strtol(p, (char **)&p, 10); }
+					if (w <= 0) w = 80;
+					if (h <= 0) h = 60;
+					static uint32_t snap_seq;
+					camera_dma_request_snapshot(++snap_seq, w, h);
+					telem_uart_line("ACK SNAP\n");
+				} else if (strncmp(cmd, "ESTOP", 5) == 0) {
+					rose_cmd_estop();      telem_uart_line("ACK ESTOP\n");
+				} else if (strncmp(cmd, "DISARM", 6) == 0) {
+					rose_cmd_disarm();     telem_uart_line("ACK DISARM\n");
+				} else if (strncmp(cmd, "RESET", 5) == 0) {
+					rose_cmd_reset();      telem_uart_line("ACK RESET\n");
+				} else if (strncmp(cmd, "HOVER_Z", 7) == 0) {
+					int mm = (int)strtol(cmd + 7, nullptr, 10);
+					rose_cmd_set_hover_z((float)mm / 1000.0f);
+					telem_uart_line("ACK HOVER_Z\n");
+				} else if (strncmp(cmd, "PING", 4) == 0) {
+					telem_uart_line("ACK PONG\n");
+				}
+			}
+		}
 #endif
-#if ROSE_CAMERA
-		/* Yield CPU to the lower-priority background threads (camera DMA capture, down-ToF). The
-		 * flat-out ~2 kHz control loop is higher priority and would otherwise starve them on the
-		 * shared I2C mutex. ~300 us/iter paces the loop to ~1.3 kHz -- still ample for control. */
+#if ROSE_CAMERA || ROSE_BUMPER || ROSE_FLOW || HAVE_TOF
+		/* Yield CPU to the lower-priority background sensor threads (camera DMA capture, side-ToF
+		 * ranging, down-ToF). The flat-out ~2 kHz control loop is higher priority and would
+		 * otherwise starve them on the shared I2C mutex. ~300 us/iter paces the loop to ~1.3 kHz --
+		 * still ample for control. */
 		k_usleep(300);
 #endif
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG

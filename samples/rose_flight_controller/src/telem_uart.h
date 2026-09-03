@@ -11,6 +11,8 @@
 #ifndef ROSE_TELEM_UART_H_
 #define ROSE_TELEM_UART_H_
 
+#include <stdint.h>
+
 #ifndef ROSE_UART_TELEM
 #define ROSE_UART_TELEM 0
 #endif
@@ -22,8 +24,10 @@
 extern "C" {
 #endif
 
-void telem_uart_init(void);          /* configure uart1 (115200 @ 50 MHz peripheral clock) */
+void telem_uart_init(void);          /* configure uart1 (921600 @ 50 MHz peripheral clock), TX+RX */
 void telem_uart_line(const char *s); /* blocking-polled write of a NUL-terminated line to uart1 */
+const char *telem_uart_poll_cmd(void); /* non-blocking: a complete command line from the ESP, or NULL */
+uint32_t telem_uart_rx_count(void);    /* total bytes ever seen on uart1 RX (0 = RX link dead) */
 
 #ifdef __cplusplus
 }

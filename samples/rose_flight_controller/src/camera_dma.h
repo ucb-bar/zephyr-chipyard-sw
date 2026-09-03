@@ -25,6 +25,11 @@ void     camera_dma_init(void);    /* start the capture thread (no-op if ROSE_CA
 uint32_t camera_dma_frames(void);  /* frames DMA'd since boot (0 if disabled) */
 uint32_t camera_dma_last_mean(void); /* mean pixel of the last frame (cheap liveness signal) */
 
+/* Request an on-demand snapshot: the capture thread nearest-neighbour downsamples the next frame to
+ * w x h and streams it as base64 "IMG s=<seq> k=.." lines over uart1 (relayed to the GCS). seq tags
+ * the frame so the GCS can group its chunks; w/h are clamped to [8, sensor size]. */
+void camera_dma_request_snapshot(uint32_t seq, int w, int h);
+
 #ifdef __cplusplus
 }
 #endif

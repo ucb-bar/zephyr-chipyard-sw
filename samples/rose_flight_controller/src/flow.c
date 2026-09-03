@@ -49,7 +49,15 @@
 #define FLOW_LP_TAU_Y 0.0f       /* y low-pass time constant (s); 0 = off */
 #endif
 
-#define CS_GPIO_PIN 19           /* software chip-select (v3: SCLK=6 MOSI=7 MISO=18 CS=19) */
+/* Software chip-select pin index on the gpio0 controller.
+ *   ESP32 target : ESP GPIO 19 (v3 wiring SCLK=6 MOSI=7 MISO=18 CS=19).
+ *   FPGA target  : gpio@10010000 bit 0 (ball D16) — PMW3901 NCS routed in the DMA shell
+ *                  (SCK=F16, MOSI=E17, MISO=E16). See boards/chipyard_riscv64.overlay. */
+#if defined(CONFIG_BOARD_CHIPYARD_RISCV64)
+#define CS_GPIO_PIN 0
+#else
+#define CS_GPIO_PIN 19
+#endif
 
 /* Manually-constructed pmw3901 device (the driver takes cfg/data via a struct device, same as the
  * pmw3901_test bring-up sample). */
