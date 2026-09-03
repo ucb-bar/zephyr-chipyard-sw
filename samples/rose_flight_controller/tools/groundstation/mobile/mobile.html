@@ -81,8 +81,9 @@ main{padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:
 .sub{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:6px;display:flex;justify-content:space-between;gap:6px}
 .sub b{color:var(--ink);font-weight:700}
 canvas{width:100%;display:block;border-radius:8px;background:#05080d;touch-action:none}
-/* camera tile: nearest-neighbour upscale of the tiny grayscale frame; keep the sensor 4:3 */
-#cam{image-rendering:pixelated;aspect-ratio:4/3;object-fit:contain}
+/* camera tile: upscale the small grayscale frame; aspect-ratio is set from the frame dims in JS
+ * (the sensor is ~square, not 4:3), so the scene isn't stretched */
+#cam{image-rendering:auto;aspect-ratio:1/1;object-fit:contain}
 .camrow{display:flex;align-items:center;gap:8px;margin-top:8px}
 .camrow .btn{flex:0 0 auto;padding:8px 14px}
 .camrow .camstat{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto}
@@ -503,7 +504,7 @@ const CAM = (()=>{
   let timer=null, curMode="demo", lastSig="";
   const cv=()=>$("cam"), stat=s=>{ $("camstat").textContent=s; };
   function drawGray(w,h,bin){
-    const c=cv(); c.width=w; c.height=h;
+    const c=cv(); c.width=w; c.height=h; c.style.aspectRatio=w+" / "+h;
     const x=c.getContext("2d"), id=x.createImageData(w,h), d=id.data;
     for(let i=0;i<w*h;i++){ const v=bin.charCodeAt(i)&255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255; }
     x.putImageData(id,0,0);
@@ -526,17 +527,17 @@ const CAM = (()=>{
   function pullPng(){
     const img=new Image();
     img.onload=()=>{ const c=cv(), w=img.naturalWidth||80, h=img.naturalHeight||60;
-      c.width=w; c.height=h; c.getContext("2d").drawImage(img,0,0,w,h);
+      c.width=w; c.height=h; c.style.aspectRatio=w+" / "+h; c.getContext("2d").drawImage(img,0,0,w,h);
       lastSig="png"; stat(w+"×"+h+" · "+new Date().toLocaleTimeString()); };
     img.onerror=()=>{ if(!lastSig) stat("no image yet"); };
     img.src=Transport.base+"/snapshot.png?"+Date.now();
   }
   function tick(){ if(curMode==="poll") pullSnap(); else if(curMode==="sse") pullPng(); }
   function placeholder(){
-    const c=cv(), w=80, h=60; c.width=w; c.height=h;
+    const c=cv(), w=128, h=126; c.width=w; c.height=h; c.style.aspectRatio=w+" / "+h;
     const x=c.getContext("2d"), id=x.createImageData(w,h), d=id.data;
     for(let yy=0;yy<h;yy++) for(let xx=0;xx<w;xx++){ const i=(yy*w+xx)*4;
-      const v=(((xx>>3)+(yy>>3))&1)?58:30; d[i]=d[i+1]=d[i+2]=v; d[i+3]=255; }
+      const v=(((xx>>4)+(yy>>4))&1)?58:30; d[i]=d[i+1]=d[i+2]=v; d[i+3]=255; }
     x.putImageData(id,0,0);
   }
   function start(m){ stop(); curMode=m; lastSig="";
@@ -545,8 +546,9 @@ const CAM = (()=>{
   function stop(){ if(timer){ clearInterval(timer); timer=null; } }
   function capture(){
     if(curMode==="demo"){ placeholder(); stat("demo — no camera"); return; }
-    stat("requesting snapshot…"); Transport.sendCmd("SNAP");
-    setTimeout(tick,700); setTimeout(tick,1500); }   // give the FC a frame or two to stream
+    stat("requesting snapshot…"); Transport.sendCmd("SNAP 128 126");
+    // a 128x126 frame streams in ~2-3 s over the 115200 link; poll a few times to catch it
+    [1000,2200,3200,4200].forEach(ms=>setTimeout(tick,ms)); }
   return { start, stop, capture };
 })();
 function camCapture(){ CAM.capture(); }

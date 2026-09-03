@@ -154,7 +154,7 @@ static const uint8_t mobile_html_gz[] = {
  * No re-encode is needed: every chunk but the last carries a multiple of 3 raw bytes (150), so the
  * chunk base64 strings concatenate into valid base64 of the full frame -- the browser atob()s it
  * straight into pixels. A partial/corrupted frame is dropped, so /snap always holds a whole one. */
-#define SNAP_B64_MAX 8192           /* base64 of ~6144 raw px; an 80x60 thumbnail needs 6400 chars */
+#define SNAP_B64_MAX 24576          /* base64 of ~18 KB raw px; a 128x126 frame needs 21504 chars */
 static K_MUTEX_DEFINE(snap_mtx);
 static char   g_snap[SNAP_B64_MAX]; /* last complete frame: concatenated base64 (0 len = none yet) */
 static size_t g_snap_len;
@@ -163,7 +163,7 @@ static int    g_snap_w, g_snap_h;
 static char     asm_buf[SNAP_B64_MAX];
 static size_t   asm_len;
 static uint32_t asm_seq;
-static int      asm_next_k, asm_total, asm_w, asm_h;
+static int      asm_next_k, asm_total, asm_w, asm_h, asm_chunk_len;
 static bool     asm_on;
 
 static void snap_feed(const char *line, size_t len)
@@ -188,9 +188,16 @@ static void snap_feed(const char *line, size_t len)
 	if (k == 0) {                       /* first chunk -> start a fresh frame */
 		asm_seq = (uint32_t)seq; asm_total = (int)total; asm_w = (int)w; asm_h = (int)h;
 		asm_len = 0; asm_next_k = 0; asm_on = true;
+		asm_chunk_len = (int)blen;  /* every non-final chunk must be exactly this long */
 	}
 	/* accept only the next in-order chunk of the current frame; else drop this partial frame */
 	if (!asm_on || (uint32_t)seq != asm_seq || (int)k != asm_next_k) { asm_on = false; return; }
+	/* Length gate: every chunk but the last carries the same 150 raw bytes -> identical base64 length.
+	 * A short one is a mid-payload byte-drop that would shift all following chunks in the concatenated
+	 * base64 (garbling the lower frame); reject the frame instead of publishing a corrupted image. */
+	if ((int)k < asm_total - 1 ? (int)blen != asm_chunk_len : (int)blen > asm_chunk_len) {
+		asm_on = false; return;
+	}
 	if (asm_len + blen > sizeof(asm_buf)) { asm_on = false; return; }
 	memcpy(asm_buf + asm_len, b64, blen);
 	asm_len += blen;

@@ -1843,7 +1843,7 @@ int main(void)
 			const char *cmd = telem_uart_poll_cmd();
 			if (cmd) {
 				if (strncmp(cmd, "SNAP", 4) == 0) {
-					int w = 80, h = 60;                 /* default thumbnail */
+					int w = 128, h = 126;               /* default: near-square, hi-res */
 					const char *p = cmd + 4;
 					while (*p == ' ') p++;
 					if (*p) { w = (int)strtol(p, (char **)&p, 10);

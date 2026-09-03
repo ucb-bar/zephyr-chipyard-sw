@@ -66,11 +66,13 @@ static volatile uint32_t g_last_mean;
 #ifndef ROSE_CAM_AUTOSNAP
 #define ROSE_CAM_AUTOSNAP 0
 #endif
+/* 128x126 keeps the sensor's near-square 324x320 aspect (vs a stretched 80x60) and is high enough
+ * that the phone doesn't show chunky pixels; ~21.5 KB base64 -> ~2 s per frame over the 115200 link. */
 #ifndef ROSE_CAM_AUTOSNAP_W
-#define ROSE_CAM_AUTOSNAP_W 80
+#define ROSE_CAM_AUTOSNAP_W 128
 #endif
 #ifndef ROSE_CAM_AUTOSNAP_H
-#define ROSE_CAM_AUTOSNAP_H 60
+#define ROSE_CAM_AUTOSNAP_H 126
 #endif
 
 static volatile int      g_snap_w, g_snap_h;
