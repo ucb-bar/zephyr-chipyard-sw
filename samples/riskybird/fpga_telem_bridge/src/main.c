@@ -27,6 +27,7 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/net/dhcpv4_server.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <string.h>
 #include <errno.h>
 
@@ -38,7 +39,8 @@
 #define TELEM_PORT     14550
 #define CMD_PORT       14551
 #ifndef FPGA_LINK_BAUD
-#define FPGA_LINK_BAUD 115200          /* matches the FPGA uart1 initBaudRate */
+#define FPGA_LINK_BAUD 921600          /* matches the FPGA uart1 baud (telem_uart.c) -- fast enough
+                                        * for downsampled camera snapshots + never back-pressures telem */
 #endif
 
 /* The FPGA-link UART: the board overlay points chosen `riskybird,fpga-uart` at uart0. */
@@ -110,7 +112,31 @@ static void start_softap(void)
 	printk("fpga_bridge: SoftAP SSID '%s' (open), IP %s\n", ssid, AP_IP);
 }
 
-/* ---- FPGA UART -> WiFi (downlink) ------------------------------------------------------------ */
+/* ---- FPGA UART -> WiFi (downlink) ------------------------------------------------------------ *
+ * Interrupt-driven RX into a ring buffer: the ISR drains the small hardware RX FIFO into an 8 KB
+ * ring the instant bytes arrive, so a sustained burst (e.g. a camera snapshot's chunk stream) never
+ * overflows the FIFO. The relay thread then reframes the ring on newlines and ships UDP at its own
+ * pace -- decoupling ingest from the (slower, blocking) UDP send is what the old poll+sleep loop
+ * lacked, which corrupted any line that landed while it was mid-send or mid-sleep. */
+RING_BUF_DECLARE(rx_ring, 8192);
+static K_SEM_DEFINE(rx_data, 0, 1);
+
+static void fpga_uart_isr(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+	while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
+		uint8_t tmp[64];
+		int n = uart_fifo_read(dev, tmp, sizeof(tmp));
+		if (n <= 0) {
+			break;
+		}
+		/* Best-effort: if the ring is full the ground station will just see a dropped line and
+		 * resync on the next newline -- far better than losing bytes mid-line (which merges lines). */
+		(void)ring_buf_put(&rx_ring, tmp, n);
+		k_sem_give(&rx_data);
+	}
+}
+
 static void uart_to_udp(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -125,33 +151,26 @@ static void uart_to_udp(void *a, void *b, void *c)
 	dst.sin_port = htons(TELEM_PORT);
 	(void)zsock_inet_pton(AF_INET, AP_BROADCAST, &dst.sin_addr);
 
-	uint8_t buf[512];
+	uart_irq_callback_user_data_set(fpga_uart, fpga_uart_isr, NULL);
+	uart_irq_rx_enable(fpga_uart);
+
+	uint8_t buf[600];
 	size_t len = 0;
 	for (;;) {
-		unsigned char ch;
-		bool got = false;
-		/* drain everything currently available, framing on newlines */
-		while (uart_poll_in(fpga_uart, &ch) == 0) {
-			got = true;
+		uint8_t ch;
+		if (ring_buf_get(&rx_ring, &ch, 1) == 1) {
 			buf[len++] = ch;
 			if (ch == '\n' || len == sizeof(buf)) {
-#if defined(BRIDGE_DEBUG_ECHO) && BRIDGE_DEBUG_ECHO
-				/* Echo each framed line to the USB console BEFORE the UDP send, so the FPGA->ESP
-				 * UART link can be verified without a WiFi client (sendto to the broadcast can
-				 * stall when no station is associated; the UDP hop itself still needs the dongle). */
-				printk("rx[%u]: %.*s", (unsigned)len, (int)len, buf);
-#endif
 				(void)zsock_sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
 				len = 0;
 			}
-		}
-		if (!got) {
-			/* idle: flush any partial line so the last (unterminated) bytes still ship */
+		} else {
+			/* ring empty: flush a pending partial line, then wait for the ISR to signal more */
 			if (len > 0) {
 				(void)zsock_sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
 				len = 0;
 			}
-			k_msleep(5);
+			(void)k_sem_take(&rx_data, K_MSEC(20));
 		}
 	}
 }
