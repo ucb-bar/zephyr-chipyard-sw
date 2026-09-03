@@ -53,6 +53,11 @@ set(ROSE_BUMPER 0 CACHE STRING "1=enable side-ToF wall bumper, 0=disabled")
 set(ROSE_BUMPER_READDRESS_ONLY 0 CACHE STRING "1=re-address sides only (fast boot, no ranging)")
 # Optical flow: 1 = bring up the PMW3901 (SPI2) + feed body-frame velocity to the estimator.
 set(ROSE_FLOW 0 CACHE STRING "1=enable PMW3901 optical flow, 0=disabled")
+# Barometer altitude fusion: 1 = read the BMP388 (needs a `baro` DT alias + CONFIG_BMP388) and fuse
+# its smooth relative altitude with the down-ToF in the estimator (robust altitude under tilt /
+# obstacle step-jumps). 0 = ToF-only (unchanged). Fine-tuning knobs (BARO_Z_GAIN, BARO_VZ_GAIN,
+# BARO_BIAS_GAIN, BARO_TOF_STEP_M, R_BARO) are passed via -DEXTRA_CPPFLAGS like the flow knobs.
+set(ROSE_BARO 0 CACHE STRING "1=enable BMP388 barometer altitude fusion, 0=disabled")
 
 target_sources(app PRIVATE
   src/main.cpp
@@ -68,11 +73,18 @@ target_sources(app PRIVATE
   src/pmw3901.c
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
+# WiFi SoftAP UDP telemetry downlink (docs/TELEMETRY_PLAN.md phase 2). Compiled ONLY when the
+# opt-in telem.conf enables CONFIG_WIFI, so the normal flight build never sees it and stays
+# byte-identical. All call sites in main.cpp are likewise `#if defined(CONFIG_WIFI)`.
+if(CONFIG_WIFI)
+  target_sources(app PRIVATE src/telem_wifi.c)
+endif()
+
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_USE_PID=${ROSE_USE_PID}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
-  ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW}
+  ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW} ROSE_BARO=${ROSE_BARO}
   ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY})
 
 target_include_directories(app PRIVATE

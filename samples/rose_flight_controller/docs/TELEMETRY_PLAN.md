@@ -20,6 +20,13 @@ ESP32‑C6‑MINI‑1U (which is MHF3 / W.FL — *not* MHF1/U.FL; see the antenn
   existing WiFi — is the fallback if the laptop must keep internet during flights.)
 - **Downlink (telemetry): UDP**, 50–100 Hz. Loss‑tolerant: each packet carries the latest
   state, so a dropped packet just means "wait for the next one" — no retransmit stalls.
+  - **DESIGN CHANGE (2026‑08‑16): unicast, not broadcast.** WiFi broadcast/multicast is buffered at
+    the AP and released only at DTIM/beacon boundaries and is never MAC‑ACKed/retried → bursty
+    ~37 Hz with 100 ms+ gaps. The firmware now **unicasts the telemetry to each DHCP‑leased client**
+    (it runs the DHCP server, so it knows their addresses via `net_dhcpv4_server_foreach_lease`);
+    broadcast remains only as a no‑lease fallback. Unicast is ACKed + retried + delivered
+    immediately → smooth ~50 Hz, <0.5 % loss. **See `docs/TELEMETRY_BRINGUP.md` for the working
+    config + receive procedure + root causes of the earlier connect failure.**
 - **Uplink (commands): UDP** with an app‑level ACK for critical commands (or a small TCP
   control socket). Commands: `ARM` / `DISARM` / **`ESTOP`** / `HOVER_Z` / gain tweaks / `DUMP`.
 - Suggested ports: `14550` telemetry, `14551` commands (document + keep consistent).
@@ -83,9 +90,10 @@ Both spikes are in; on‑chip WiFi telemetry is **viable**.
   re‑measure the real combined FC+WiFi build to confirm the footprint, then start the downlink.
 
 ## 6. Roadmap / milestones
-1. **RAM spikes (A + B)** → confirm WiFi fits on a lean FC, or pivot to BLE. *(in progress)*
+1. **RAM spikes (A + B)** → confirm WiFi fits on a lean FC, or pivot to BLE. ✅ *(WiFi fits; combined FC+WiFi build ≈ 71 % SRAM)*
 2. **Downlink:** telemetry thread → UDP text @ 50 Hz on a lean FC; adapt one Python tool to
-   read UDP → live wireless plots.
+   read UDP → live wireless plots. ✅ **DONE (2026‑08‑16) — reliable ~50 Hz, <0.5 % loss, no crashes,
+   reproducible across power cycles. See `docs/TELEMETRY_BRINGUP.md`.**
 3. **Uplink + remote kill:** command handler → arm / estop / setpoint; host buttons;
    link‑loss watchdog. *(safety milestone)*
 4. **Binary format + dashboard + link stats.**

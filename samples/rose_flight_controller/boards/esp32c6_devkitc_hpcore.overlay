@@ -106,6 +106,20 @@
 		status = "okay";
 	};
 
+	/* BMP388 barometer (U5 @0x76; ADR/SDO tied low). Bosch "drone" preset: ODR 50 Hz, pressure
+	 * oversampling x8 (19-bit, ~0.33 Pa), IIR filter 3. Fused with the down-ToF for altitude
+	 * (ROSE_BARO=1): the ToF is the absolute floor anchor, the baro fills tilt/step gaps and is
+	 * bias-calibrated by the ToF in the estimator. `baro` alias -> HAVE_BARO. */
+	bmp388: bmp388@76 {
+		compatible = "bosch,bmp388";
+		reg = <0x76>;
+		odr = "50";
+		osr-press = <8>;
+		osr-temp = <1>;
+		iir-filter = <3>;
+		status = "okay";
+	};
+
 	/* 4 side-facing VL53L5CX wall sensors (bumper). All default to 0x29; side_tof.c enables each
 	 * via ADS7128 GPIO1-4 and readdresses to 0x31-0x34 at runtime, so the DT reg is the FINAL
 	 * address. Map: 0x31=GPIO1=J9=back, 0x32=GPIO2=J2=front, 0x33=GPIO3=J11=right, 0x34=GPIO4=J10=left. */
@@ -165,6 +179,7 @@
 		bmi088-accel = &bmi088_accel;
 		bmi088-gyro  = &bmi088_gyro;
 		tof = &vl53l1x;
+		baro = &bmp388;
 		motors = &pwm_motors;
 	};
 };

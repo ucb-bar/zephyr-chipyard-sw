@@ -27,6 +27,23 @@
 #define ROSE_FLOW_FUSE 1
 #endif
 
+/* ---- Barometer (BMP388) altitude fusion (ROSE_BARO) -------------------------------------------
+ * Same intent as the complementary filter: the ToF is the absolute floor anchor when valid, the
+ * barometer coasts through ToF dropouts (tilt) and step-jumps (obstacle). Here it drops straight
+ * into the z-axis Kalman filter: while the ToF update PASSES its chi-square gate we (re)calibrate
+ * baro_bias to kz.p; when the ToF is invalid or its update is GATED OUT (a jump reads as an outlier),
+ * we fuse the baro absolute estimate (baro_rel + baro_bias) as a looser position measurement so the
+ * z KF never runs purely on accel. OFF by default (ROSE_BARO=0) -> identical to the ToF-only KF. */
+#ifndef ROSE_BARO
+#define ROSE_BARO 0
+#endif
+#ifndef R_BARO
+#define R_BARO 4.0e-2f       /* barometer altitude ~ (0.2 m)^2 -- looser than the ToF (r_tof) */
+#endif
+#ifndef BARO_BIAS_GAIN
+#define BARO_BIAS_GAIN 0.01f /* slow tracking of baro_bias to the ToF-anchored floor (drift cal) */
+#endif
+
 void EkfEstimator::init(float x0, float y0, float z0)
 {
 	att.init();
@@ -47,6 +64,8 @@ void EkfEstimator::init(float x0, float y0, float z0)
 	zupt_height = 0.05f; /* "on the ground" band: at or below this ToF height, at rest -> ZUPT.
 	                      * Kept well under any hover setpoint so it never fires in flight. */
 	r_tof  = 1e-4f;      /* trust ToF height strongly (~0.01 m std) */
+	r_baro = R_BARO;     /* barometer altitude (looser); fused only when the ToF is absent/gated */
+	baro_bias = 0.0f; baro_have = false;   /* baro reference locks on the first gated-in ToF */
 	/* Flow velocity outlier gate DISABLED (0). A fixed chi-square gate can't distinguish "bad flow"
 	 * from "good flow vs a diverged state": once the accel-predicted velocity drifts past the gate
 	 * (e.g. noisy flow amplified at large ToF height is rejected -> predict-only), EVERY subsequent
@@ -62,7 +81,8 @@ void EkfEstimator::init(float x0, float y0, float z0)
 }
 
 void EkfEstimator::update(const float accel[3], const float gyro[3],
-			  const float flow[2], bool flow_valid, float height, bool tof_valid, float dt)
+			  const float flow[2], bool flow_valid, float height, bool tof_valid,
+			  float baro_rel, bool baro_valid, float dt)
 {
 	gx = gyro[0]; gy = gyro[1]; gz = gyro[2];
 	att.update(accel, gyro, dt);
@@ -114,9 +134,27 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 	/* update: altitude from downward ToF (position measurement) -- only when a fresh
 	 * low-rate ToF sample is available. Between samples the z-axis KF runs predict-only
 	 * (accel), and its covariance grows so the next ToF correction is weighted more. */
+#if ROSE_BARO
+	/* ToF is the primary anchor; its chi-square gate (tof_gate) already rejects step-jumps as
+	 * outliers. Calibrate baro_bias whenever a ToF update is accepted; when the ToF is invalid
+	 * (tilt) or its update is gated out (obstacle jump), fall back to the baro absolute estimate. */
+	bool tof_used = false;
+	if (tof_vert) {
+		tof_used = kz.update_pos(h_vert, r_tof, tof_gate);
+		if (tof_used && baro_valid) {
+			if (!baro_have) { baro_bias = kz.p - baro_rel; baro_have = true; }
+			else            { baro_bias += BARO_BIAS_GAIN*((kz.p - baro_rel) - baro_bias); }
+		}
+	}
+	if (!tof_used && baro_valid && baro_have) {
+		kz.update_pos(baro_rel + baro_bias, r_baro, 0.0f);   /* coast on baro through the ToF gap/jump */
+	}
+#else
+	(void)baro_rel; (void)baro_valid;   /* barometer disabled -> ToF-only (unchanged behavior) */
 	if (tof_vert) {
 		kz.update_pos(h_vert, r_tof, tof_gate);
 	}
+#endif
 
 	/* Hard backstop against non-physical horizontal-velocity runaway. With the flow gate off the
 	 * flow normally pulls velocity back, but a flow dropout (predict-only) can still integrate accel

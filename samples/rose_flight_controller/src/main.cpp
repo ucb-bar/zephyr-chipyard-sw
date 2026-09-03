@@ -35,6 +35,9 @@
 #include "flightlog.h"
 #include "side_tof.h"           /* side-ToF wall "bumper" (ROSE_BUMPER); no-op if disabled */
 #include "flow.h"               /* PMW3901 optical flow (ROSE_FLOW); no-op if disabled */
+#if defined(CONFIG_WIFI)
+#include "telem_wifi.h"         /* WiFi SoftAP UDP telemetry downlink (opt-in telem.conf; see plan) */
+#endif
 
 /* Repulsion bridge into the PID controller (defined in controller_pid.cpp). Feeding walls only has
  * an effect when the PID controller is active + built with ROSE_BUMPER; harmless otherwise. */
@@ -49,6 +52,7 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
  * (flow may be absent on a given board -> the app compiles and runs without it). */
 #define HAVE_FLOW DT_NODE_EXISTS(DT_ALIAS(flow))
 #define HAVE_TOF  DT_NODE_EXISTS(DT_ALIAS(tof))
+#define HAVE_BARO DT_NODE_EXISTS(DT_ALIAS(baro))   /* BMP388 (bosch,bmp388) -> `baro` alias */
 #if HAVE_FLOW
 #include <rose/rose_sensor.h>   /* RoSE private optical-flow channels */
 #endif
@@ -80,6 +84,75 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
 #define ROSE_TELEM 1
 #endif
 
+/* ---- Battery voltage sense + thrust sag-compensation + low-voltage protection (1S LiPo) -------
+ * riskybird v3 senses the pack through a 200k/100k divider (Vsense = Vbat * 100k/(200k+100k) =
+ * Vbat/3) into the ADS7128 AIN5/GPIO5 channel (U1 pin 4, ref = AVDD/+3V3). The ADS7128 is already
+ * driven for the VL53L1X XSHUT rails (see the st_vl53l1x block below); this reads AIN5 as an ADC.
+ * OFF by default -- enable with -DROSE_BATT_SENSE=1. When on:
+ *   (1) g_vbat is polled every BATT_CHECK_DIV control iters and smoothed (EMA),
+ *   (2) send_control() scales motor duty by BATT_NOMINAL_V/g_vbat (clamped) to hold thrust as the
+ *       pack sags, (3) arming is blocked below BATT_ARM_MIN_V, (4) in flight a valid reading below
+ *       BATT_CUTOFF_V trips the emergency watchdog (safety_violation() "battery"). */
+#ifndef ROSE_BATT_SENSE
+#define ROSE_BATT_SENSE 0
+#endif
+#ifndef BATT_NOMINAL_V
+#define BATT_NOMINAL_V 3.8f      /* thrust-scaling reference; sag comp targets this pack voltage */
+#endif
+#ifndef BATT_ARM_MIN_V
+#define BATT_ARM_MIN_V 3.4f      /* refuse to ARM below this (pre-flight gate) */
+#endif
+#ifndef BATT_CUTOFF_V
+#define BATT_CUTOFF_V  3.2f      /* in-flight: trip the emergency estop below this */
+#endif
+#ifndef BATT_DIVIDER
+#define BATT_DIVIDER   3.0f      /* Vbat = Vadc * (R30+R31)/R31 = Vadc * (200k+100k)/100k = Vadc*3 */
+#endif
+#ifndef BATT_VREF_V
+#define BATT_VREF_V    3.3f      /* ADS7128 reference = AVDD (+3V3); 12-bit full-scale = 4096 counts */
+#endif
+#ifndef BATT_CHECK_DIV
+#define BATT_CHECK_DIV 200       /* poll the ADC every N control iters (~1 kHz loop -> ~5 Hz) */
+#endif
+#ifndef BATT_SMOOTH_ALPHA
+#define BATT_SMOOTH_ALPHA 0.20f  /* EMA weight on each new sample (higher = less smoothing) */
+#endif
+#ifndef BATT_SCALE_MAX
+#define BATT_SCALE_MAX 1.30f     /* max sag-comp boost -- never over-drive the motors */
+#endif
+/* Smoothed pack voltage (V); 0 until the first valid ADC read. Written by battery_poll() (real
+ * board only), read by the helpers below. Treated as "invalid / not yet read" outside [1.0, 5.0] V. */
+static volatile float g_vbat = 0.0f;
+
+/* Motor-duty multiplier that compensates for pack sag. Returns 1.0 (no-op) when battery sense is
+ * disabled or g_vbat looks invalid (0 / absurd); otherwise clamp(BATT_NOMINAL_V/g_vbat, [1, max]).
+ * Never REDUCES thrust (a fresh pack above nominal clamps to 1.0). */
+static inline float batt_thrust_scale(void)
+{
+#if ROSE_BATT_SENSE
+	float v = g_vbat;
+	if (v < 1.0f || v > 5.0f) { return 1.0f; }   /* invalid / not-yet-read -> no scaling */
+	float s = BATT_NOMINAL_V / v;
+	if (s < 1.0f) { s = 1.0f; }
+	if (s > BATT_SCALE_MAX) { s = BATT_SCALE_MAX; }
+	return s;
+#else
+	return 1.0f;
+#endif
+}
+/* Pre-arm battery gate: true = OK to arm. Disabled or a not-yet-read/absurd g_vbat -> permit (so a
+ * broken sensor or bring-up race never hard-locks the drone); only a VALID low reading blocks. */
+static inline bool batt_ok_to_arm(void)
+{
+#if ROSE_BATT_SENSE
+	float v = g_vbat;
+	if (v < 1.0f || v > 5.0f) { return true; }   /* not yet read -> don't block bring-up */
+	return v >= BATT_ARM_MIN_V;
+#else
+	return true;
+#endif
+}
+
 /* Sign-correct fixed-point print of a float as "[-]int.frac(3)" without needing %f (portable to
  * builds with printf FP support off). Expands to the sign string + magnitude int + 3-digit frac. */
 #include <math.h>
@@ -95,6 +168,18 @@ static const struct device *flow_dev = DEVICE_DT_GET(DT_ALIAS(flow));
 #if HAVE_TOF
 static const struct device *tof_dev  = DEVICE_DT_GET(DT_ALIAS(tof));
 #define TOF_FETCH_PERIOD_MS 33   /* ~30 Hz: matches the VL53L1X ranging budget */
+#endif
+
+/* Barometer altitude fusion (BMP388 -> smooth relative altitude, fused with the down-ToF in the
+ * estimator so altitude survives ToF dropouts under tilt / obstacle step-jumps). OFF by default:
+ * the BMP388 is NOT yet on the DT overlay (no `baro` alias), so with ROSE_BARO=1 the read stubs to
+ * baro_valid=false and a #warning fires. See the enable notes in the report / README. */
+#ifndef ROSE_BARO
+#define ROSE_BARO 0
+#endif
+#if HAVE_BARO
+static const struct device *baro_dev = DEVICE_DT_GET(DT_ALIAS(baro));
+#define BARO_FETCH_PERIOD_MS 20   /* ~50 Hz: a modest BMP388 ODR, ample for altitude */
 #endif
 
 /* ---- Board sensor-init hook (HW-specific power/enable; no-op on RoSE) --------------------------
@@ -115,6 +200,7 @@ static const struct device *tof_dev  = DEVICE_DT_GET(DT_ALIAS(tof));
 #define ADS7128_GPO_DRIVE_CFG 0x09
 #define ADS7128_GPO_VALUE     0x0B
 #define VL53L1X_XSHUT_CH      6      /* ADS7128 GPIO6 = DOWN VL53L1X XSHUT (riskybird v3) */
+#define STATUS_LED_CH         7      /* ADS7128 GPIO7 = D8 status LED (active-low: GPIO7 LOW = LED on) */
 /* ADS7128 GPIO1-4 = XSHUT of the 4 SIDE VL53L1X. They power-on at the SAME I2C address (0x29) as
  * the down ToF and still carry their protective film, so if left enabled they contend on 0x29 and
  * dominate it with a 0mm / ~87 Mcps crosstalk return (the down sensor's real reads only occasionally
@@ -147,6 +233,43 @@ static int ads7128_clr_bit(const struct device *bus, uint8_t reg, uint8_t ch)
 	if (rc) return rc;
 	return ads7128_wr(bus, reg, (uint8_t)(v & ~(1U << ch)));
 }
+
+/* Status LED (D8) I2C bus handle. Set by board_sensor_init() ONLY after the GPIO7 config ACKs,
+ * so it stays NULL on targets without the ADS7128 (RoSE co-sim) and the LED thread no-ops there. */
+static const struct device *g_led_bus;
+
+#if ROSE_BATT_SENSE
+/* ---- Battery ADC on ADS7128 AIN5/GPIO5 (U1 pin 4; riskybird v3 200k/100k divider) ------------
+ * AIN5 is left as an ANALOG input (PIN_CFG bit 5 = 0, the power-on default -- the XSHUT setup only
+ * flips channels 1-4 and 6 to GPIO, never 5). Manual mode (SEQUENCE_CFG default): select the channel
+ * once via CHANNEL_SEL, then each bare 2-byte I2C read returns that channel's latest conversion
+ * (12-bit, left-justified in the 16-bit frame). One short transaction -> called at a low rate. */
+#define BATT_ADC_CH         5
+#define ADS7128_CHANNEL_SEL 0x11
+static const struct device *g_batt_bus;   /* cached by battery_sense_init() (== the ToF I2C bus) */
+
+static void battery_sense_init(const struct device *bus)
+{
+	g_batt_bus = bus;
+	ads7128_clr_bit(bus, ADS7128_PIN_CFG, BATT_ADC_CH);   /* ensure AIN5 is an analog input */
+	ads7128_wr(bus, ADS7128_CHANNEL_SEL, BATT_ADC_CH);    /* manual-mode conversion channel = AIN5 */
+}
+
+/* One non-blocking-ish ADC read (single 2-byte I2C transfer) + EMA into g_vbat. Silently skips on
+ * a bus error or an implausible result (keeps the previous g_vbat). */
+static void battery_poll(void)
+{
+	const struct device *bus = g_batt_bus;
+	if (!bus) { return; }
+	uint8_t rx[2];
+	if (i2c_read(bus, rx, sizeof(rx), ADS7128_I2C_ADDR) != 0) { return; }
+	uint16_t raw = (uint16_t)(((uint16_t)rx[0] << 4) | (rx[1] >> 4));   /* 12-bit, left-justified */
+	float vbat = ((float)raw / 4096.0f) * BATT_VREF_V * BATT_DIVIDER;
+	if (vbat < 0.5f || vbat > 6.0f) { return; }          /* reject garbage */
+	if (g_vbat <= 0.0f) { g_vbat = vbat; }               /* seed the EMA on the first sample */
+	else { g_vbat = g_vbat + BATT_SMOOTH_ALPHA * (vbat - g_vbat); }
+}
+#endif /* ROSE_BATT_SENSE */
 
 /* Power the VL53L1X via the ADS7128 GPIO6 XSHUT rail. This runs on every boot, but a warm reset
  * (ESP EN pin) does NOT power-cycle the ADS7128, so GPIO6 stays high and the VL53L1X keeps stale
@@ -181,6 +304,22 @@ static int board_sensor_init(void)
 	}
 	k_msleep(10);   /* let the VL53L1X boot before the sensor driver (prio 90) talks to it */
 	printk("board_sensor_init: VL53L1X powered via ADS7128 GPIO%d\n", VL53L1X_XSHUT_CH);
+	/* Status LED D8 = ADS7128 GPIO7 (active-low). Push-pull output, start OFF. RMW set-bit ops
+	 * leave GPIO6 (ToF XSHUT) + AIN5 (batt) untouched. Enable the LED thread's writes (g_led_bus)
+	 * only if the config ACKs, so a target without the ADS7128 stays silent. */
+	int led_rc = ads7128_set_bit(bus, ADS7128_PIN_CFG, STATUS_LED_CH)          /* GPIO mode */
+		   | ads7128_set_bit(bus, ADS7128_GPIO_CFG, STATUS_LED_CH)         /* output */
+		   | ads7128_set_bit(bus, ADS7128_GPO_DRIVE_CFG, STATUS_LED_CH)    /* push-pull */
+		   | ads7128_set_bit(bus, ADS7128_GPO_VALUE, STATUS_LED_CH);       /* HIGH = LED off */
+	if (led_rc == 0) {
+		g_led_bus = bus;
+		printk("board_sensor_init: status LED on ADS7128 GPIO%d\n", STATUS_LED_CH);
+	}
+#if ROSE_BATT_SENSE
+	battery_sense_init(bus);   /* configure ADS7128 AIN5 as ADC for battery-voltage sensing */
+	printk("board_sensor_init: battery sense on ADS7128 AIN%d (Vbat = Vadc * %d)\n",
+	       BATT_ADC_CH, (int)BATT_DIVIDER);
+#endif
 	return 0;
 }
 SYS_INIT(board_sensor_init, POST_KERNEL, 80);   /* before CONFIG_SENSOR_INIT_PRIORITY (90) */
@@ -220,6 +359,11 @@ static int vl53l1x_readdress_down(void)
 }
 #endif /* st_vl53l1x present */
 
+#if !(DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x) && ROSE_BATT_SENSE)
+/* Battery sense disabled, or no ADS7128 on this target (e.g. RoSE co-sim) -> nothing to poll. */
+static inline void battery_poll(void) { }
+#endif
+
 /* ---- Emergency cutoff watchdog --------------------------------------------------------------
  * A hard, controller-independent backstop (on top of the MOTOR_MAX_DUTY cap and the actuation
  * timeout): latch motors OFF if the vehicle state exceeds safe limits -- excess tilt, body rate,
@@ -248,7 +392,10 @@ static int vl53l1x_readdress_down(void)
                                       * between-sample velocity blip -- while still catching a genuine
                                       * runaway (which persists for 100s of ms) essentially instantly. */
 #endif
-static volatile bool g_estop;        /* latched emergency stop (cleared only by reset) */
+static volatile bool g_estop;        /* latched emergency stop (cleared only by a reset -- chip OR soft) */
+static volatile bool g_arming;       /* autoflight arm-settle countdown in progress (for status LED) */
+static volatile uint32_t g_reset_gen; /* bumped by rose_cmd_reset() -> control loop does a soft reset */
+static volatile bool g_arm_enabled;   /* FALSE on boot -> arm gate inert; set TRUE only by a RESET cmd (panel) */
 
 /* Arm gate: motors actuate only when armed. Non-autoflight builds are always armed (normal bench
  * behavior); autoflight starts DISARMED and arms via the on-ground/level check (see below). */
@@ -335,6 +482,14 @@ static const char *safety_violation(const float *state, const float *gyro)
 	if (state[2] > SAFE_MAX_HEIGHT_M) {   /* z = altitude (up); one-sided ceiling guard */
 		return "height";
 	}
+#if ROSE_BATT_SENSE
+	/* Low-voltage cutoff: only a VALID reading (>= 1.0 V) below the threshold trips -- a garbage-low
+	 * read (< 1.0 V, sensor fault) is ignored so it can't false-estop mid-flight. Debounced by the
+	 * caller (SAFE_DEBOUNCE_ITERS) like every other reason. */
+	if (g_vbat >= 1.0f && g_vbat < BATT_CUTOFF_V) {
+		return "battery";
+	}
+#endif
 	return NULL;
 }
 
@@ -377,8 +532,24 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
 #ifndef MOTOR_MAX_DUTY
 #define MOTOR_MAX_DUTY 0.10f
 #endif
+/* HARD MOTOR CUT (telemetry / bench-safety builds). When ROSE_MOTORS_INHIBIT=1 the actuator layer
+ * NEVER drives the PWM channels above 0 -- send_control() forces all four to 0 and the boot / ready /
+ * startup chirps are skipped entirely -- regardless of arm state, controller output, or estop. Use
+ * for any unattended build where props may be attached (e.g. the WiFi telemetry bring-up). Verify
+ * "MOTORS INHIBITED" appears in the boot log and that no motor duty is ever commanded. */
+#ifndef ROSE_MOTORS_INHIBIT
+#define ROSE_MOTORS_INHIBIT 0
+#endif
 static void send_control(const float *u)
 {
+#if ROSE_MOTORS_INHIBIT
+	/* Motors hard-inhibited: force every channel to 0 and never drive PWM. */
+	for (int i = 0; i < NACTIONS; i++) {
+		pwm_set_pulse_dt(&motors[i], 0);
+	}
+	(void)u;
+	return;
+#endif
 	/* Emergency cutoff OR disarmed: force every motor to 0 and ignore the command entirely. */
 	if (g_estop || !g_armed) {
 		for (int i = 0; i < NACTIONS; i++) {
@@ -402,10 +573,15 @@ static void send_control(const float *u)
 		return;
 	}
 #endif
-	/* Controller's normalized thrust (u in ~[-0.583, 0.417]) -> physical per-motor duty [0,1]. */
+	/* Controller's normalized thrust (u in ~[-0.583, 0.417]) -> physical per-motor duty [0,1].
+	 * Battery sag compensation: multiply the raw thrust command by BATT_NOMINAL_V/g_vbat (clamped to
+	 * [1.0, BATT_SCALE_MAX]) so commanded thrust holds as the pack drains. Applied BEFORE the [0,1]
+	 * clamp and the AUTOFLIGHT_MAX_DUTY cap below; batt_thrust_scale() returns 1.0 (no-op) when
+	 * battery sense is disabled or g_vbat looks invalid. */
+	const float batt_scale = batt_thrust_scale();
 	float duty[NACTIONS];
 	for (int i = 0; i < NACTIONS; i++) {
-		duty[i] = u[i] + 0.583f;
+		duty[i] = (u[i] + 0.583f) * batt_scale;
 		if (duty[i] < 0.0f) duty[i] = 0.0f;
 		if (duty[i] > 1.0f) duty[i] = 1.0f;
 	}
@@ -444,6 +620,9 @@ static void send_control(const float *u)
  * Runs once in main() BEFORE the control loop, so it is independent of the actuation timeout. */
 static void motors_startup_pulse(void)
 {
+#if ROSE_MOTORS_INHIBIT
+	return;   /* motors hard-inhibited */
+#endif
 #if defined(ROSE_START_PULSE_MS) && ROSE_START_PULSE_MS > 0
 	for (int i = 0; i < NACTIONS; i++) {
 		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * MOTOR_MAX_DUTY));
@@ -461,6 +640,9 @@ static void motors_startup_pulse(void)
  * rebooted" obvious. Runs once at boot, before arming; drives PWM directly (motors still disarmed). */
 static void motors_boot_chirp(void)
 {
+#if ROSE_MOTORS_INHIBIT
+	return;   /* motors hard-inhibited */
+#endif
 	for (int i = 0; i < NACTIONS; i++) {
 		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * 0.10f));
 		k_msleep(250);
@@ -473,6 +655,9 @@ static void motors_boot_chirp(void)
  * all-together blip). Fires once the arming gate goes live; drives PWM directly (still disarmed). */
 static void motors_ready_chirp(void)
 {
+#if ROSE_MOTORS_INHIBIT
+	return;   /* motors hard-inhibited */
+#endif
 	for (int k = 0; k < 2; k++) {
 		for (int i = 0; i < NACTIONS; i++) {
 			pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * 0.10f));
@@ -533,30 +718,45 @@ static IController &ctrl = active_controller();
 static float g_setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
 
 #if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+/* Runtime-tunable flight profile (climb/hover/descend ms, cap ms, hover altitude m), initialized
+ * from the compile-time defaults but adjustable LIVE from the ground station (PROFILE / HOVER_Z
+ * uplink commands). Read fresh each control iteration, so a change on the panel takes effect on the
+ * next flight (set them on the ground before arming). */
+static volatile int   g_t_climb_ms    = T_CLIMB_MS;
+static volatile int   g_t_hover_ms    = T_HOVER_MS;
+static volatile int   g_t_descend_ms  = T_DESCEND_MS;
+static volatile int   g_flight_max_ms = FLIGHT_MAX_MS;
+static volatile float g_hover_z_m     = HOVER_Z_M;
+
 /* Desired altitude vs time-since-arm (ms): ramp up -> hold -> ramp down. Returns <0 when the
  * profile is complete (caller then disarms). */
 static float autoflight_setpoint_z(int64_t t_ms)
 {
-	if (t_ms < T_CLIMB_MS) {
-		return HOVER_Z_M * ((float)t_ms / (float)T_CLIMB_MS);
+	const int   tc = (g_t_climb_ms > 0) ? g_t_climb_ms : 1;
+	const int   th = (g_t_hover_ms > 0) ? g_t_hover_ms : 0;
+	const int   td = (g_t_descend_ms > 0) ? g_t_descend_ms : 1;
+	const float hz = g_hover_z_m;
+	if (t_ms < tc) {
+		return hz * ((float)t_ms / (float)tc);
 	}
-	t_ms -= T_CLIMB_MS;
-	if (t_ms < T_HOVER_MS) {
-		return HOVER_Z_M;
+	t_ms -= tc;
+	if (t_ms < th) {
+		return hz;
 	}
-	t_ms -= T_HOVER_MS;
-	/* Descent + landing as ONE continuous downward ramp: from HOVER_Z_M, reaching 0 at T_DESCEND_MS
-	 * and then continuing GRADUALLY below ground at the same rate, so the loop keeps easing down to a
-	 * real touchdown; clamp at the LAND_PUSH_M floor. (Motor cut is height-based, in the loop.) */
-	float rate = HOVER_Z_M / (float)T_DESCEND_MS;   /* reach 0 at T_DESCEND, keep going negative */
-	float sp = HOVER_Z_M - rate * (float)t_ms;
+	t_ms -= th;
+	/* Descent + landing as ONE continuous downward ramp: from hover, reaching 0 at td and then
+	 * continuing GRADUALLY below ground at the same rate to a real touchdown; clamp at LAND_PUSH_M.
+	 * (Motor cut is height-based, in the loop.) Longer td = slower, gentler landing. */
+	float rate = hz / (float)td;
+	float sp = hz - rate * (float)t_ms;
 	return (sp < LAND_PUSH_M) ? LAND_PUSH_M : sp;
 }
 #endif
 
 struct sensor_frame {
 	float accel[3], gyro[3], flow[2], height;
-	bool flow_valid, tof_valid;
+	float baro_rel;                            /* baro altitude relative to the arm ref (m); ROSE_BARO */
+	bool flow_valid, tof_valid, baro_valid;
 };
 
 /* Sensor IO block: batched fetch (TX) then collect (blocking RX) of the whole sensor set. */
@@ -702,8 +902,68 @@ static float g_att_roll, g_att_pitch, g_att_yaw;   /* last estimator attitude, G
 #ifndef GYRO_CAL_STILL_RADPS
 #define GYRO_CAL_STILL_RADPS 0.30f     /* per-axis rate below which the board counts as "still" */
 #endif
+/* Continuous ground bias re-tracking -- the fix for "flight 1 good, each later flight worse". The
+ * boot cal freezes g_gyro_bias at one temperature, but the BMI088 zero-rate offset drifts as the IMU
+ * warms over a session. A soft-RESET keeps the frozen value, and a battery-only unplug does NOT
+ * re-measure it if USB keeps the ESP powered -- only a chip reset re-runs the boot cal, which is why
+ * re-flashing "fixes" it. The stale residual is injected into the rate loop, Mahony, AND the flow
+ * gyro-compensation, growing the drift flight-over-flight. So while DISARMED and very still, slowly
+ * pull g_gyro_bias toward the live rate: every flight then arms with a fresh, current-temperature
+ * bias -- no chip reset needed. Frozen while armed (no in-flight dynamics) and stillness-gated + slow,
+ * so it can't be contaminated the way the old rushed one-shot per-RESET recal was. */
+#ifndef GBIAS_TRACK_GAIN
+#define GBIAS_TRACK_GAIN 0.0008f       /* per-sample EMA (~1.3 s time constant at 1 kHz) */
+#endif
+#ifndef GBIAS_TRACK_STILL_RADPS
+#define GBIAS_TRACK_STILL_RADPS 0.10f  /* only re-track when very still (tighter than the boot-cal gate) */
+#endif
 static float g_gyro_bias[3];           /* measured gyro bias (rad/s); 0 until the cal completes */
 static volatile bool g_gyro_cal_done;  /* startup bias cal finished -> OK to arm */
+/* Gyro-cal accumulators at FILE scope so a soft-reset (rose_cmd_reset) can restart the cal cleanly;
+ * if they stayed function-local statics, re-clearing g_gyro_cal_done would leave a stale gstill_since
+ * timestamp and the recal would "complete" instantly on garbage. Zero at boot (BSS) = same as before. */
+static double  g_gcal_sum[3];
+static int     g_gcal_n;
+static int64_t g_gcal_since;
+/* Barometer reference cal -- established by averaging pressure over the SAME still startup window as
+ * the gyro-bias cal (co-calibrated). Reset together so a soft-reset (rose_cmd_reset) re-cals both. */
+static double  g_bcal_sum;     /* reference-pressure accumulator (kPa) */
+static int     g_bcal_n;
+static float   g_baro_p0;      /* reference pressure (kPa); frozen after the cal window */
+static bool    g_baro_have;    /* reference established (gyro cal complete) */
+/* On a soft-RESET, KEEP the pristine gyro-bias cal measured during the long, untouched boot
+ * bringup instead of re-calibrating. The recal window runs right after a landing/crash while the
+ * drone is being repositioned by hand -> it captures a contaminated "at-rest" bias that flight 1
+ * (boot cal) never has. That residual rate bias is a phase error in the attitude estimate, which
+ * erodes the loop's margin, so the ~0.5 Hz velocity-loop oscillation grows flight-over-flight (the
+ * "great flight 1, progressively worse" pattern that only clears on a chip reset). Reusing the boot
+ * cal makes every soft-RESET flight start bit-identical to flight 1. Set -DROSE_RECAL_ON_RESET=1 to
+ * restore per-RESET recal (then each RESET needs a still, hands-off placement to be clean). */
+#ifndef ROSE_RECAL_ON_RESET
+#define ROSE_RECAL_ON_RESET 0
+#endif
+static void __attribute__((unused)) gyro_cal_restart(void)
+{
+	g_gyro_cal_done = false;
+	g_gyro_bias[0] = g_gyro_bias[1] = g_gyro_bias[2] = 0.0f;
+	g_gcal_sum[0] = g_gcal_sum[1] = g_gcal_sum[2] = 0.0;
+	g_gcal_n = 0;
+	g_gcal_since = 0;
+	g_bcal_sum = 0.0; g_bcal_n = 0; g_baro_p0 = 0.0f; g_baro_have = false;
+}
+
+/* Barometric altitude (m) relative to a reference pressure, via the international barometric
+ * formula. The p/p0 RATIO cancels units, so p and p0 may be any consistent unit (here kPa, the
+ * Zephyr SENSOR_CHAN_PRESS convention). Referencing to p0 keeps the number small and drift-immune. */
+#if HAVE_BARO
+static float baro_rel_altitude_m(float p_kpa, float p0_kpa)
+{
+	if (p0_kpa <= 0.0f || p_kpa <= 0.0f) {
+		return 0.0f;
+	}
+	return 44330.0f * (1.0f - powf(p_kpa / p0_kpa, 0.1902949f));   /* exponent = 1/5.255 */
+}
+#endif
 
 static bool read_sensor_frame(struct sensor_frame *f)
 {
@@ -733,26 +993,35 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	 * every frame so the whole chain (Mahony attitude, rate loop, flow gyro-comp) sees a debiased
 	 * rate. Pre-cal the bias is 0 (subtraction is a no-op); motors stay disarmed until it finishes. */
 	if (!g_gyro_cal_done) {
-		static double gsum[3]; static int gn; static int64_t gstill_since;
 		bool gstill = fabsf(f->gyro[0]) < GYRO_CAL_STILL_RADPS &&
 			      fabsf(f->gyro[1]) < GYRO_CAL_STILL_RADPS &&
 			      fabsf(f->gyro[2]) < GYRO_CAL_STILL_RADPS;
 		int64_t gnow = k_uptime_get();
 		if (!gstill) {
-			gstill_since = 0; gsum[0] = gsum[1] = gsum[2] = 0.0; gn = 0;   /* bump -> restart */
+			g_gcal_since = 0; g_gcal_sum[0] = g_gcal_sum[1] = g_gcal_sum[2] = 0.0; g_gcal_n = 0;   /* bump -> restart */
 		} else {
-			if (gstill_since == 0) { gstill_since = gnow; gsum[0] = gsum[1] = gsum[2] = 0.0; gn = 0; }
-			gsum[0] += f->gyro[0]; gsum[1] += f->gyro[1]; gsum[2] += f->gyro[2]; gn++;
-			if (gnow - gstill_since >= (int64_t)(GYRO_CAL_SECONDS * 1000.0f) && gn > 0) {
-				g_gyro_bias[0] = (float)(gsum[0] / gn);
-				g_gyro_bias[1] = (float)(gsum[1] / gn);
-				g_gyro_bias[2] = (float)(gsum[2] / gn);
+			if (g_gcal_since == 0) { g_gcal_since = gnow; g_gcal_sum[0] = g_gcal_sum[1] = g_gcal_sum[2] = 0.0; g_gcal_n = 0; }
+			g_gcal_sum[0] += f->gyro[0]; g_gcal_sum[1] += f->gyro[1]; g_gcal_sum[2] += f->gyro[2]; g_gcal_n++;
+			if (gnow - g_gcal_since >= (int64_t)(GYRO_CAL_SECONDS * 1000.0f) && g_gcal_n > 0) {
+				g_gyro_bias[0] = (float)(g_gcal_sum[0] / g_gcal_n);
+				g_gyro_bias[1] = (float)(g_gcal_sum[1] / g_gcal_n);
+				g_gyro_bias[2] = (float)(g_gcal_sum[2] / g_gcal_n);
 				g_gyro_cal_done = true;
 				printk("gyro-cal: bias=[%d %d %d] millirad/s (%d samples) -- ready to arm\n",
 				       (int)(g_gyro_bias[0] * 1000.0f), (int)(g_gyro_bias[1] * 1000.0f),
-				       (int)(g_gyro_bias[2] * 1000.0f), gn);
+				       (int)(g_gyro_bias[2] * 1000.0f), g_gcal_n);
 			}
 		}
+	}
+	/* Re-track the gyro bias to the current IMU temperature while parked (see GBIAS_TRACK_* above).
+	 * Uses the raw (pre-subtraction) rate: when the board is still, that rate IS the live bias. */
+	if (g_gyro_cal_done && !g_armed &&
+	    fabsf(f->gyro[0] - g_gyro_bias[0]) < GBIAS_TRACK_STILL_RADPS &&
+	    fabsf(f->gyro[1] - g_gyro_bias[1]) < GBIAS_TRACK_STILL_RADPS &&
+	    fabsf(f->gyro[2] - g_gyro_bias[2]) < GBIAS_TRACK_STILL_RADPS) {
+		g_gyro_bias[0] += GBIAS_TRACK_GAIN * (f->gyro[0] - g_gyro_bias[0]);
+		g_gyro_bias[1] += GBIAS_TRACK_GAIN * (f->gyro[1] - g_gyro_bias[1]);
+		g_gyro_bias[2] += GBIAS_TRACK_GAIN * (f->gyro[2] - g_gyro_bias[2]);
 	}
 	f->gyro[0] -= g_gyro_bias[0];
 	f->gyro[1] -= g_gyro_bias[1];
@@ -810,6 +1079,49 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	}
 #endif /* TOF_THREADED */
 #endif /* HAVE_TOF */
+	/* ---- Barometer relative altitude (ROSE_BARO) ----------------------------------------------
+	 * Rate-limited fetch (BMP388 I2C read is short, so inline is fine) + zero-order hold. The
+	 * reference pressure p0 is CO-CALIBRATED WITH THE GYRO: averaged over the same still startup
+	 * window (motors disarmed), then frozen -- so baro_rel is height above the cal point. The
+	 * estimator re-anchors this to the ToF floor (baro_bias), so only short-term smoothness /
+	 * gap-filling matters. baro_valid stays false until the (gyro+baro) cal completes. */
+	f->baro_rel = 0.0f;
+	f->baro_valid = false;
+#if ROSE_BARO
+#if HAVE_BARO
+	{
+		static int64_t baro_next_ms = 0;
+		static float   baro_last = 0.0f;  /* last relative altitude (m), zero-order held */
+		int64_t now_ms = k_uptime_get();
+		if (now_ms >= baro_next_ms) {
+			baro_next_ms = now_ms + BARO_FETCH_PERIOD_MS;
+			if (sensor_sample_fetch(baro_dev) == 0) {
+				struct sensor_value pv;
+				sensor_channel_get(baro_dev, SENSOR_CHAN_PRESS, &pv);
+				float p = (float)sensor_value_to_double(&pv);   /* kPa */
+				if (p > 0.0f) {
+					if (!g_gyro_cal_done) {
+						/* accumulate the reference pressure over the gyro-cal still window */
+						g_bcal_sum += p; g_bcal_n++;
+					} else {
+						if (!g_baro_have) {   /* cal just finished -> freeze the averaged reference */
+							g_baro_p0 = (g_bcal_n > 0) ? (float)(g_bcal_sum / g_bcal_n) : p;
+							g_baro_have = true;
+							printk("baro-cal: p0=%d.%03d kPa (%d samples) -- altitude referenced (fused with ToF)\n",
+							       (int)g_baro_p0, ((int)(g_baro_p0 * 1000.0f)) % 1000, g_bcal_n);
+						}
+						baro_last = baro_rel_altitude_m(p, g_baro_p0);
+					}
+				}
+			}
+		}
+		f->baro_valid = g_baro_have;
+		f->baro_rel = baro_last;
+	}
+#else
+#warning "ROSE_BARO=1 but no `baro` DT alias -- barometer read stubbed (baro_valid stays false). Add a bosch,bmp388 node + `baro` alias + CONFIG_BMP388 (see report / README)."
+#endif /* HAVE_BARO */
+#endif /* ROSE_BARO */
 	/* f->height stays the RAW down-ToF slant range here. The slant->vertical tilt correction now lives
 	 * in the estimator (est.update, on its FRESH R[8]) so est_z is the true vertical height, and the
 	 * telemetry can show raw slant (tofh) vs corrected estimate (z) side by side. The optical-flow
@@ -907,7 +1219,83 @@ static void keepalive_block(void *a, void *b, void *c)
 		keepalive_spin++;
 	}
 }
+#endif /* ROSE_THREADED: thread-block defs; the status LED below is compiled in all configs */
 
+/* ---- Status LED (D8 = ADS7128 GPIO7, active-low) --------------------------------------------
+ * A low-priority thread renders a blink pattern DERIVED from the existing flight-state globals
+ * (g_estop / g_gyro_cal_done / g_armed / g_arming / g_vbat) -- no scattered setters. It drives
+ * GPIO7 via the ADS7128 set/clear-bit RMW, which never disturbs GPIO6 (ToF XSHUT) or AIN5 (batt).
+ * The bus is shared with the control loop, but writes happen only on a pattern EDGE (a few per
+ * second) and this thread sits below PRIO_IO, so the worst case is the control loop waiting one
+ * ~150 us I2C transfer. Patterns match samples/riskybird/status_led (the bench demo). */
+enum led_pattern { LEDP_CAL, LEDP_READY, LEDP_ARMING, LEDP_ARMED, LEDP_FAULT, LEDP_LOWBATT, LEDP_LOCKED };
+
+static inline void status_led_write(bool on)
+{
+	if (!g_led_bus) { return; }
+	if (on) { ads7128_clr_bit(g_led_bus, ADS7128_GPO_VALUE, STATUS_LED_CH); }  /* LOW  = on  */
+	else    { ads7128_set_bit(g_led_bus, ADS7128_GPO_VALUE, STATUS_LED_CH); }  /* HIGH = off */
+}
+
+/* Highest-priority condition wins. */
+static enum led_pattern status_led_pattern(void)
+{
+	if (g_estop)          { return LEDP_FAULT; }   /* watchdog / IMU-lost latch */
+	if (!g_gyro_cal_done) { return LEDP_CAL; }     /* boot + sensor init + gyro-bias cal */
+	if (g_armed)          { return LEDP_ARMED; }   /* motors live */
+	if (g_arming)         { return LEDP_ARMING; }  /* level+still arm countdown */
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	if (!g_arm_enabled)   { return LEDP_LOCKED; }  /* disarmed on boot -- waiting for a RESET cmd to enable */
+#endif
+#if ROSE_BATT_SENSE
+	{ float v = g_vbat; if (v >= 1.0f && v <= 5.0f && v < BATT_ARM_MIN_V) { return LEDP_LOWBATT; } }
+#endif
+	return LEDP_READY;                             /* disarmed, waiting to arm */
+}
+
+#define LED_TICK_MS 20   /* renderer tick; pattern periods are expressed in ticks */
+static bool status_led_on(enum led_pattern p, int ph)
+{
+	switch (p) {
+	case LEDP_CAL:     return (ph % 6) < 3;                 /* ~4 Hz busy blink */
+	case LEDP_READY:   return (ph % 75) < 3;               /* 60 ms blip / 1.5 s (heartbeat) */
+	case LEDP_LOCKED:  return (ph % 50) < 25;              /* ~1 Hz even blink = locked (send RESET to enable) */
+	case LEDP_ARMING: {                                     /* accelerating: period 24 -> 4 ticks */
+		int per = 24 - ph / 5;
+		if (per < 4) { per = 4; }
+		return (ph % per) < (per / 2);
+	}
+	case LEDP_ARMED:   return true;                        /* SOLID ON */
+	case LEDP_FAULT:   return (ph % 2) == 0;               /* ~25 Hz strobe */
+	case LEDP_LOWBATT: {                                    /* double-blip / 1 s */
+		int q = ph % 50;
+		return (q < 3) || (q >= 8 && q < 11);
+	}
+	}
+	return false;
+}
+
+K_THREAD_STACK_DEFINE(led_stack, 1024);
+static struct k_thread led_t;
+#define PRIO_LED 10   /* below IO/EST/CTRL (they preempt it); above keepalive */
+
+static void status_led_thread(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	enum led_pattern last_p = (enum led_pattern)-1;
+	int ph = 0;
+	bool last_on = false, first = true;
+	for (;;) {
+		enum led_pattern p = status_led_pattern();
+		if (p != last_p) { last_p = p; ph = 0; }   /* restart phase on a state change */
+		bool on = status_led_on(p, ph);
+		if (first || on != last_on) { status_led_write(on); last_on = on; first = false; }
+		ph++;
+		k_msleep(LED_TICK_MS);
+	}
+}
+
+#if ROSE_THREADED
 static void io_block(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -943,7 +1331,8 @@ static void est_block(void *a, void *b, void *c)
 		f = g_frame;
 		k_mutex_unlock(&mtx_frame);
 
-		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, CTRL_DT);
+		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid,
+			   f.baro_rel, f.baro_valid, CTRL_DT);
 		float st[NSTATES];
 		est.get_state(st);
 
@@ -983,6 +1372,45 @@ static void ctrl_block(void *a, void *b, void *c)
 }
 #endif /* ROSE_THREADED */
 
+#if defined(CONFIG_WIFI)
+/* Uplink command hooks (declared in telem_wifi.h); the command-RX thread calls these. Each just
+ * pokes a control-loop shared flag consumed on the next iteration -- no locks, no blocking. */
+extern "C" void rose_cmd_estop(void) { g_estop = true; }   /* latched remote kill */
+extern "C" void rose_cmd_disarm(void)
+{
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	g_armed = false;   /* clear the arm latch (re-arm via the gate). Non-autoflight g_armed is const. */
+#endif
+}
+extern "C" void rose_cmd_set_hover_z(float m)
+{
+	if (m < 0.0f) { m = 0.0f; }
+	if (m > SAFE_MAX_HEIGHT_M) { m = SAFE_MAX_HEIGHT_M; }
+	g_setpoint[2] = m;   /* non-autoflight hover builds regulate to this directly */
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	g_hover_z_m = m;     /* autoflight: sets the profile's hover altitude (used next flight) */
+#endif
+}
+/* Live flight-profile tuning from the ground station: climb / hover / descend durations + hard cap
+ * (all ms). Non-positive args are ignored (keep current). Takes effect on the next flight. */
+extern "C" void rose_cmd_set_profile(int climb_ms, int hover_ms, int descend_ms, int max_ms)
+{
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	if (climb_ms   > 0) { g_t_climb_ms    = climb_ms; }
+	if (hover_ms   >= 0) { g_t_hover_ms   = hover_ms; }
+	if (descend_ms > 0) { g_t_descend_ms  = descend_ms; }
+	if (max_ms     > 0) { g_flight_max_ms = max_ms; }
+	printk("AUTOFLIGHT: profile set -- climb=%d hover=%d descend=%d cap=%d ms\n",
+	       g_t_climb_ms, g_t_hover_ms, g_t_descend_ms, g_flight_max_ms);
+#else
+	(void)climb_ms; (void)hover_ms; (void)descend_ms; (void)max_ms;
+#endif
+}
+/* Soft reset: return the FC to the just-booted state (clear estop, disarm, re-run gyro cal, re-init
+ * estimator/controller) WITHOUT a chip reset. Done in the control loop; here we just bump the gen. */
+extern "C" void rose_cmd_reset(void) { g_arm_enabled = true; g_reset_gen++; }   /* enable arming + soft reset */
+#endif /* CONFIG_WIFI */
+
 int main(void)
 {
 #if defined(ROSE_FLIGHTLOG_DUMP) && ROSE_FLIGHTLOG_DUMP
@@ -999,6 +1427,10 @@ int main(void)
 	}
 	ctrl.init();
 	est.init(0.0f, 0.0f, START_Z);
+#if defined(ROSE_MOTORS_INHIBIT) && ROSE_MOTORS_INHIBIT
+	printk("flight_controller: MOTORS INHIBITED (ROSE_MOTORS_INHIBIT=1) -- PWM forced to 0, "
+	       "no chirps, no actuation\n");
+#endif
 
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
 	flightlog_init();   /* erase 'storage' partition + ready to append (see flightlog.h) */
@@ -1072,6 +1504,28 @@ int main(void)
 	printk("flight_controller: down-ToF on dedicated thread (control loop reads cached height)\n");
 #endif
 
+#if defined(CONFIG_WIFI)
+	/* Bring up the WiFi SoftAP + UDP telemetry downlink ONCE, before the control loop starts. The
+	 * heavy WiFi TX runs on telem_wifi's OWN low-priority thread; the control loop only ever does a
+	 * non-blocking mutex copy (telem_wifi_publish), so this never stalls the ~1 kHz loop. Opt-in via
+	 * telem.conf (docs/TELEMETRY_PLAN.md phase 2); no-op / not compiled without CONFIG_WIFI. */
+	{
+		int rc = telem_wifi_init();
+		printk("flight_controller: WiFi telemetry SoftAP %s\n",
+		       rc == 0 ? "starting (join 'riskybird-<id>', UDP :14550)" : "FAILED to start");
+	}
+#endif
+
+	/* Status LED: start the state-derived pattern renderer (only if the ADS7128 LED config ACK'd
+	 * at board_sensor_init). Low priority + edge-only I2C writes -> negligible load on the loop. */
+	if (g_led_bus) {
+		k_thread_create(&led_t, led_stack, K_THREAD_STACK_SIZEOF(led_stack),
+				status_led_thread, NULL, NULL, NULL, PRIO_LED, 0, K_NO_WAIT);
+		k_thread_name_set(&led_t, "status_led");
+		printk("flight_controller: status LED up (ADS7128 GPIO%d, state-derived patterns)\n",
+		       STATUS_LED_CH);
+	}
+
 #if ROSE_THREADED
 	printk("flight_controller: estimator=%s + controller=%s (%s), THREADED blocks "
 	       "(estimate@grant, control every %d) \n",
@@ -1121,12 +1575,41 @@ int main(void)
 			continue;
 		}
 		imu_miss = 0;
+		/* Soft RESET (uplink cmd): return to the just-booted state WITHOUT a chip reset -- clear the
+		 * estop latch, disarm, and re-init the estimator + controller (which clears all integrators).
+		 * The gyro-bias cal is KEPT from boot (see gyro_cal_restart above): re-calibrating in the
+		 * rushed post-landing window contaminated the bias and made each flight progressively worse.
+		 * Runs BEFORE est.update so it takes effect this iteration. (g_reset_gen==reset_seen==0 at
+		 * boot -> no spurious reset.) */
+		static uint32_t reset_seen;
+		if (g_reset_gen != reset_seen) {
+			reset_seen = g_reset_gen;
+			g_estop = false;
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+			g_armed = false; g_arming = false; g_flight_start_ms = 0;
+#endif
+#if ROSE_RECAL_ON_RESET
+			gyro_cal_restart();
+#endif
+			est.init(0.0f, 0.0f, 0.0f);
+			ctrl.init();
+			g_setpoint[2] = 0.0f;
+			printk("flight_controller: SOFT RESET -- estop cleared, disarmed"
+			       "%s\n", ROSE_RECAL_ON_RESET ? ", recalibrating gyro" : " (keeping boot gyro cal)");
+		}
+		/* Battery voltage: poll the ADS7128 ADC at a LOW rate (every BATT_CHECK_DIV iters). One short
+		 * I2C transfer shared with the ToF bus -- infrequent so it adds negligible average load; no-op
+		 * unless -DROSE_BATT_SENSE=1 on a board that has the ADS7128. */
+		if ((iter % BATT_CHECK_DIV) == 0) {
+			battery_poll();
+		}
 		int64_t t_now = k_uptime_get();
 		float dt = (float)(t_now - t_prev) * 1e-3f;   /* real loop period (s) */
 		if (dt <= 0.0f || dt > 0.5f) dt = CTRL_DT;     /* first-iter / stall guard */
 		t_prev = t_now;
 		uint32_t _pe = PF_NOW();
-		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid, dt);
+		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid,
+			   f.baro_rel, f.baro_valid, dt);
 		est.get_state(state);
 		g_att_roll = state[3]; g_att_pitch = state[4]; g_att_yaw = state[5];   /* cache for next frame's comp */
 		PF_ACC(pf_est, _pe);
@@ -1146,10 +1629,11 @@ int main(void)
 				       "motors OFF (reset to clear)\n", why, viol_count);
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
 				/* Final record: encode WHICH limit tripped in flags[2..4] (0=none 1=tilt 2=rate
-				 * 3=velocity 4=height; first char of `why` is unique per reason) and carry the raw
-				 * gyro x/y in the fvx/fvy columns -- the rate/gyro path isn't otherwise logged, so
-				 * this is how we tell a vibration rate-spike from a real tilt/velocity runaway. */
-				uint8_t rc = (why[0]=='t')?1 : (why[0]=='r')?2 : (why[0]=='v')?3 : (why[0]=='h')?4 : 0;
+				 * 3=velocity 4=height 5=battery; first char of `why` is unique per reason) and carry
+				 * the raw gyro x/y in the fvx/fvy columns -- the rate/gyro path isn't otherwise logged,
+				 * so this is how we tell a vibration rate-spike from a real tilt/velocity runaway. */
+				uint8_t rc = (why[0]=='t')?1 : (why[0]=='r')?2 : (why[0]=='v')?3 : (why[0]=='h')?4 :
+					     (why[0]=='b')?5 : 0;
 				struct flight_rec er = {0};
 				er.t_ms     = (uint32_t)k_uptime_get();
 				er.roll_mrad  = (int16_t)(state[3] * 1000.0f);
@@ -1177,6 +1661,12 @@ int main(void)
 			static bool     announced;
 			static int64_t  arm_since;    /* ms since arm conditions held (0 = not yet) */
 			static bool     flight_done;  /* one-shot: latch after a completed flight, no auto re-arm */
+			static uint32_t arm_reset_seen;
+			if (arm_reset_seen != g_reset_gen) {   /* soft RESET: clear the arm-gate latches so it re-arms */
+				arm_reset_seen = g_reset_gen;
+				announced = false; arm_since = 0; flight_done = false;
+			}
+			g_arming = false;             /* status LED: default; set true below while counting down */
 			if (!g_armed && !g_estop && !flight_done) {
 				bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
 					      fabsf(state[4]) < ARM_MAX_TILT_RAD;
@@ -1193,10 +1683,16 @@ int main(void)
 				(void)ground;
 				if (!announced) {
 					announced = true;
-					printk("AUTOFLIGHT(no-gesture): place down level + still; auto-arm in %d ms\n",
-					       (int)ARM_SETTLE_MS);
+					if (g_arm_enabled) {
+						printk("AUTOFLIGHT(no-gesture): arming ENABLED -- place down level + still; auto-arm in %d ms\n",
+						       (int)ARM_SETTLE_MS);
+					} else {
+						printk("AUTOFLIGHT: disarmed on boot -- send RESET from the panel to enable arming\n");
+					}
 				}
-				bool ready = level && still && g_gyro_cal_done;   /* wait for gyro-bias cal */
+				bool ready = g_arm_enabled                       /* boot-safe: won't arm until a RESET cmd */
+					     && level && still && g_gyro_cal_done   /* level + still + gyro-bias cal */
+					     && batt_ok_to_arm();                /* refuse to arm on a low pack */
 				int64_t hold_ms = ARM_SETTLE_MS;
 #else
 				/* Arming = LIFT-AND-PLACE gesture (glitch-reboot-safe): pick up past
@@ -1211,7 +1707,9 @@ int main(void)
 					lifted = true;
 					printk("AUTOFLIGHT: lift detected -- now set level on the ground and hold still\n");
 				}
-				bool ready = lifted && level && ground && still && g_gyro_cal_done;   /* wait for gyro-bias cal */
+				bool ready = g_arm_enabled                                          /* boot-safe: RESET cmd first */
+					     && lifted && level && ground && still && g_gyro_cal_done   /* gesture + gyro cal */
+					     && batt_ok_to_arm();                                   /* refuse to arm on a low pack */
 				int64_t hold_ms = PLACE_CONFIRM_MS;
 #endif
 				if (ready) {
@@ -1221,20 +1719,21 @@ int main(void)
 						g_armed = true;
 						g_flight_start_ms = t_now;
 						printk("AUTOFLIGHT: ARMED -- taking off (hover %d mm, cap %d ms)\n",
-						       (int)(HOVER_Z_M * 1000.0f), (int)FLIGHT_MAX_MS);
+						       (int)(g_hover_z_m * 1000.0f), g_flight_max_ms);
 					}
 				} else {
 					arm_since = 0;   /* condition broke -> restart the hold timer */
 				}
+				g_arming = (arm_since != 0 && !g_armed);   /* status LED: countdown in progress */
 			}
 			if (g_armed) {
 				int64_t tf = t_now - g_flight_start_ms;
 				float zsp = autoflight_setpoint_z(tf);
 				/* Landing phase = past the descend ramp (setpoint now LAND_PUSH_M). Cut motors on
 				 * ACTUAL touchdown (height-based), not a fixed time, so it never disarms mid-air. */
-				bool in_landing = tf >= (int64_t)(T_CLIMB_MS + T_HOVER_MS + T_DESCEND_MS);
+				bool in_landing = tf >= (int64_t)(g_t_climb_ms + g_t_hover_ms + g_t_descend_ms);
 				bool landed = in_landing && f.tof_valid && state[2] < LAND_Z_THRESH_M;
-				if (landed || tf >= FLIGHT_MAX_MS) {
+				if (landed || tf >= g_flight_max_ms) {
 					g_armed = false;
 					flight_done = true;   /* one-shot: don't auto re-arm (reset to fly again) */
 					g_setpoint[2] = 0.0f;
@@ -1266,6 +1765,26 @@ int main(void)
 		uint32_t _ps = PF_NOW();
 		send_control(u);
 		PF_ACC(pf_send, _ps);
+#if defined(CONFIG_WIFI)
+		/* Publish the latest state to the WiFi downlink. Non-blocking: just a mutex-guarded struct
+		 * copy the telemetry thread drains at 50 Hz -- same fields as the ROSE_TELEM printk line. */
+		{
+			struct telem_snapshot ts;
+			ts.iter = iter;
+			ts.dt_ms = (int32_t)(dt * 1000.0f + 0.5f);
+			ts.roll = state[3]; ts.pitch = state[4]; ts.yaw = state[5]; ts.z = state[2];
+			ts.tof_valid = (int32_t)f.tof_valid; ts.height = f.height;
+			ts.u[0] = u[0]; ts.u[1] = u[1]; ts.u[2] = u[2]; ts.u[3] = u[3];
+			ts.x = state[0]; ts.y = state[1];
+			ts.vx = state[6]; ts.vy = state[7]; ts.vz = state[8];
+			ts.zsp = g_setpoint[2]; ts.vbat = g_vbat;
+			ts.flags = (uint32_t)((g_armed         ? TELEM_FLAG_ARMED   : 0u) |
+					      (g_estop         ? TELEM_FLAG_ESTOP   : 0u) |
+					      (g_arming        ? TELEM_FLAG_ARMING  : 0u) |
+					      (g_gyro_cal_done ? TELEM_FLAG_CALDONE : 0u));
+			telem_wifi_publish(&ts);
+		}
+#endif
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
 		if (!g_estop && (iter % ROSE_FLIGHTLOG_DIV) == 0) {
 			struct flight_rec rec;

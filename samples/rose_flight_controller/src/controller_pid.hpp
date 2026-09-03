@@ -14,10 +14,25 @@
 #include "controller.hpp"
 
 struct HierarchicalPidController : IController {
-	void init() override {}   /* fixed gains -- nothing to set up */
+	/* Clear the integrators / held state so EACH flight (and each soft-RESET) starts fresh. Without
+	 * this the altitude integral (auto hover-thrust) and velocity integral (drift trim) carry over
+	 * between flights when the on-ground reset doesn't fire -> the next flight over-thrusts (altitude
+	 * overshoot -> height watchdog) and over-tilts (growing drift). */
+	void init() override {
+		pos_ref_1 = pos_ref_2 = 0.0f;
+		alt_int = 0.0f;
+		vel_int_1 = vel_int_2 = 0.0f;
+		desRoll_prev = desPitch_prev = 0.0f;
+	}
 	void compute(const float state[CTRL_NSTATES], const float setpoint[CTRL_NSTATES],
 		     float u_out[CTRL_NACTIONS], float dt) override;
 	const char *name() const override { return "hierarchical PID (cascaded)"; }
+
+private:
+	float pos_ref_1 = 0.0f, pos_ref_2 = 0.0f;         /* ROSE_POS_LOOP dead-reckoned position ref */
+	float alt_int = 0.0f;                             /* altitude integral (KI_HEIGHT) -> hover FF */
+	float vel_int_1 = 0.0f, vel_int_2 = 0.0f;         /* velocity integral (KI_VEL) -> drift trim */
+	float desRoll_prev = 0.0f, desPitch_prev = 0.0f;  /* tilt slew-limiter state */
 };
 
 #endif /* ROSE_CONTROLLER_PID_HPP */

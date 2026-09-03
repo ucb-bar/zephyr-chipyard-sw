@@ -32,11 +32,17 @@ struct IStateEstimator {
 	 *   gyro:       body-frame angular rate   (rad/s)   [gx, gy, gz]
 	 *   flow:       body-frame horizontal velocity (m/s)[vx, vy]; used only if flow_valid
 	 *   flow_valid: false on a flow dropout (stale/no sample) -> run velocity predict-only
-	 *   height:     downward ToF height above ground (m); used only if tof_valid
+	 *   height:     downward ToF SLANT range (m); used only if tof_valid (tilt-corrected inside)
 	 *   tof_valid:  true on steps where a fresh ToF sample arrived
+	 *   baro_rel:   barometer altitude relative to the arm reference (m); used only if baro_valid.
+	 *               OPTIONAL (ROSE_BARO): a smooth, tilt-immune altitude that fills ToF dropouts
+	 *               (large tilt -> beam off-vertical) and coasts through ToF step-jumps (obstacle/
+	 *               desk edge). Pass 0/false to ignore it -> the filter is unchanged (backward compat).
+	 *   baro_valid: true when a fresh/valid barometer sample is available
 	 *   dt:         control period (s)                                                  */
 	virtual void update(const float accel[3], const float gyro[3], const float flow[2],
-			    bool flow_valid, float height, bool tof_valid, float dt) = 0;
+			    bool flow_valid, float height, bool tof_valid,
+			    float baro_rel, bool baro_valid, float dt) = 0;
 
 	/* Optional: fuse horizontal wall distances (4x multizone ToF, nearest-wall per direction)
 	 * for obstacle-relative position. In a corridor, (d_right - d_left)/2 is an exact lateral
