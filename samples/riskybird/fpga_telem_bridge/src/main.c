@@ -28,6 +28,9 @@
 #include <zephyr/net/dhcpv4_server.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <zephyr/net/http/service.h>
+#include <zephyr/net/http/server.h>
+#include <zephyr/net/http/method.h>
 #include <string.h>
 #include <errno.h>
 
@@ -49,6 +52,7 @@ static const struct device *const fpga_uart = DEVICE_DT_GET(DT_CHOSEN(riskybird_
 static struct net_if *ap_iface;
 static struct net_mgmt_event_callback wifi_cb;
 static K_SEM_DEFINE(ap_up, 0, 1);
+static volatile bool g_ap_ready;   /* set when the SoftAP is operational (AP_ENABLE_RESULT) */
 
 #define WIFI_AP_EVENTS (NET_EVENT_WIFI_AP_ENABLE_RESULT | NET_EVENT_WIFI_AP_STA_CONNECTED | \
 			NET_EVENT_WIFI_AP_STA_DISCONNECTED)
@@ -60,6 +64,7 @@ static void wifi_event_handler(struct net_mgmt_event_callback *cb, uint64_t ev, 
 	case NET_EVENT_WIFI_AP_ENABLE_RESULT:
 		printk("fpga_bridge: SoftAP up -- relaying FPGA UART on udp :%d, cmds on :%d\n",
 		       TELEM_PORT, CMD_PORT);
+		g_ap_ready = true;
 		k_sem_give(&ap_up);
 		break;
 	case NET_EVENT_WIFI_AP_STA_CONNECTED:   printk("fpga_bridge: client joined\n"); break;
@@ -118,8 +123,27 @@ static void start_softap(void)
  * overflows the FIFO. The relay thread then reframes the ring on newlines and ships UDP at its own
  * pace -- decoupling ingest from the (slower, blocking) UDP send is what the old poll+sleep loop
  * lacked, which corrupted any line that landed while it was mid-send or mid-sleep. */
-RING_BUF_DECLARE(rx_ring, 8192);
+RING_BUF_DECLARE(rx_ring, 16384);
 static K_SEM_DEFINE(rx_data, 0, 1);
+
+/* Shared with the on-board HTTP server: the latest "RBT ..." telemetry line (served at GET /t) and a
+ * mutex serializing FPGA-link UART TX so the UDP :14551 uplink and the HTTP POST /cmd don't interleave. */
+static K_MUTEX_DEFINE(telem_mtx);
+static char   g_telem[256];
+static size_t g_telem_len;
+static K_MUTEX_DEFINE(uart_tx_mtx);
+
+static void fpga_send(const uint8_t *d, size_t n)
+{
+	k_mutex_lock(&uart_tx_mtx, K_FOREVER);
+	for (size_t i = 0; i < n; i++) { uart_poll_out(fpga_uart, d[i]); }
+	k_mutex_unlock(&uart_tx_mtx);
+}
+
+/* the shared mobile flight page, gzipped, embedded into ESP flash (served at GET /) */
+static const uint8_t mobile_html_gz[] = {
+#include "mobile_html.gz.inc"
+};
 
 static void fpga_uart_isr(const struct device *dev, void *user_data)
 {
@@ -161,15 +185,23 @@ static void uart_to_udp(void *a, void *b, void *c)
 		if (ring_buf_get(&rx_ring, &ch, 1) == 1) {
 			buf[len++] = ch;
 			if (ch == '\n' || len == sizeof(buf)) {
+				/* Stash the latest COMPLETE telemetry line for the HTTP /t poll. Require the
+				 * "RBT it=" prefix so a line corrupted by an RX-ring byte-drop (which can look
+				 * like "RBT .004 ...") doesn't overwrite the last good line. */
+				if (len >= 7 && memcmp(buf, "RBT it=", 7) == 0 && len <= sizeof(g_telem)) {
+					k_mutex_lock(&telem_mtx, K_FOREVER);
+					g_telem_len = len;
+					memcpy(g_telem, buf, len);
+					k_mutex_unlock(&telem_mtx);
+				}
 				(void)zsock_sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
 				len = 0;
 			}
 		} else {
-			/* ring empty: flush a pending partial line, then wait for the ISR to signal more */
-			if (len > 0) {
-				(void)zsock_sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
-				len = 0;
-			}
+			/* Ring empty: wait for the ISR to signal more bytes. Do NOT flush a partial line here
+			 * -- the ring routinely drains faster than the ISR delivers, so flushing on idle would
+			 * split most lines mid-way, which breaks the ground-station line framing and means the
+			 * /t telemetry capture (which keys on a complete "RBT it=" line) never sees a full one. */
 			(void)k_sem_take(&rx_data, K_MSEC(20));
 		}
 	}
@@ -194,9 +226,80 @@ static void udp_to_uart(void *a, void *b, void *c)
 	uint8_t buf[256];
 	for (;;) {
 		ssize_t n = zsock_recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
-		for (ssize_t i = 0; i < n; i++) uart_poll_out(fpga_uart, buf[i]);
+		if (n > 0) { fpga_send(buf, (size_t)n); }
 	}
 }
+
+/* ---- On-board HTTP server (port 80) ---------------------------------------------------------- *
+ *   GET  /     -> the gzipped mobile flight page (from flash)
+ *   GET  /t    -> the latest RBT telemetry line as text (the page polls this ~15 Hz)
+ *   POST /cmd  -> forward the body to the FPGA over uart1 (ESTOP/RESET/HOVER_Z/SNAP/...)
+ * A phone on the SoftAP just browses to http://192.168.4.1/ -- no laptop or bridge script. */
+static struct http_resource_detail_static page_res = {
+	.common = { .type = HTTP_RESOURCE_TYPE_STATIC,
+		    .bitmask_of_supported_http_methods = BIT(HTTP_GET),
+		    .content_encoding = "gzip", .content_type = "text/html" },
+	.static_data = mobile_html_gz,
+	.static_data_len = sizeof(mobile_html_gz),
+};
+
+static int t_handler(struct http_client_ctx *client, enum http_data_status status,
+		     const struct http_request_ctx *req, struct http_response_ctx *resp, void *ud)
+{
+	static uint8_t tbuf[sizeof(g_telem)];
+	ARG_UNUSED(client); ARG_UNUSED(req); ARG_UNUSED(ud);
+	if (status == HTTP_SERVER_DATA_FINAL) {
+		k_mutex_lock(&telem_mtx, K_FOREVER);
+		size_t n = g_telem_len;
+		memcpy(tbuf, g_telem, n);
+		k_mutex_unlock(&telem_mtx);
+		resp->body = tbuf;
+		resp->body_len = n;
+		resp->final_chunk = true;
+	}
+	return 0;
+}
+static struct http_resource_detail_dynamic t_res = {
+	.common = { .type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		    .bitmask_of_supported_http_methods = BIT(HTTP_GET) },
+	.cb = t_handler,
+};
+
+static int cmd_handler(struct http_client_ctx *client, enum http_data_status status,
+		       const struct http_request_ctx *req, struct http_response_ctx *resp, void *ud)
+{
+	static uint8_t cbuf[128];
+	static size_t clen;
+	static char ack[160];
+	ARG_UNUSED(client); ARG_UNUSED(ud);
+	if (status == HTTP_SERVER_DATA_ABORTED) { clen = 0; return 0; }
+	if (req->data_len && clen + req->data_len <= sizeof(cbuf)) {
+		memcpy(cbuf + clen, req->data, req->data_len);
+		clen += req->data_len;
+	}
+	if (status == HTTP_SERVER_DATA_FINAL) {
+		while (clen && (cbuf[clen - 1] == '\n' || cbuf[clen - 1] == '\r' ||
+				cbuf[clen - 1] == ' ')) { clen--; }
+		if (clen) { fpga_send(cbuf, clen); fpga_send((const uint8_t *)"\n", 1); }
+		int n = snprintk(ack, sizeof(ack), "sent: %.*s", (int)clen, cbuf);
+		resp->body = (const uint8_t *)ack;
+		resp->body_len = n;
+		resp->final_chunk = true;
+		clen = 0;
+	}
+	return 0;
+}
+static struct http_resource_detail_dynamic cmd_res = {
+	.common = { .type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		    .bitmask_of_supported_http_methods = BIT(HTTP_POST) },
+	.cb = cmd_handler,
+};
+
+static uint16_t http_port = 80;
+HTTP_SERVICE_DEFINE(rb_http, NULL, &http_port, 4, 10, NULL, NULL, NULL);
+HTTP_RESOURCE_DEFINE(rb_root, rb_http, "/", &page_res);
+HTTP_RESOURCE_DEFINE(rb_t, rb_http, "/t", &t_res);
+HTTP_RESOURCE_DEFINE(rb_cmd, rb_http, "/cmd", &cmd_res);
 
 K_THREAD_DEFINE(tx_tid, 4096, uart_to_udp, NULL, NULL, NULL, 7, 0, 0);
 K_THREAD_DEFINE(rx_tid, 4096, udp_to_uart, NULL, NULL, NULL, 7, 0, 0);
@@ -215,5 +318,14 @@ int main(void)
 	}
 	printk("fpga_bridge: FPGA link on %s @ %d baud\n", fpga_uart->name, FPGA_LINK_BAUD);
 	start_softap();
+	/* Bind the HTTP listener only once the SoftAP interface is operational, else it attaches to no
+	 * usable interface and every connection is refused. */
+	for (int i = 0; i < 400 && !g_ap_ready; i++) { k_msleep(25); }
+	k_msleep(300);
+	if (http_server_start() == 0) {
+		printk("fpga_bridge: HTTP server on http://%s/ (phone: join the AP, open it)\n", AP_IP);
+	} else {
+		printk("fpga_bridge: HTTP server failed to start\n");
+	}
 	return 0;
 }

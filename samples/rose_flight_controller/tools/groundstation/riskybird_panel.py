@@ -92,21 +92,22 @@ def parse_rbt(line):
     if not m:
         return None
     g = m.groups()
+    fl = int(g[8])                    # fl= is the status-flag bitfield (same bits as st=), not flow
     d = {
         "it": int(g[0]), "dt_ms": 0,
         "roll": float(g[1]), "pitch": float(g[2]), "yaw": float(g[3]),
         "z": float(g[4]), "vz": float(g[5]), "tofh": float(g[6]),
-        "tofv": int(g[7]), "flow": int(g[8]),
+        "tofv": int(g[7]), "st": fl,
         "cam": int(g[9]) if g[9] is not None else None,
         "camm": int(g[10]) if g[10] is not None else None,
         "u": [None, None, None, None],
-        "vx": None, "vy": None, "zsp": None, "vbat": None, "st": 0, "x": None, "y": None,
+        "vx": None, "vy": None, "zsp": None, "vbat": None, "x": None, "y": None,
     }
     qw, qx, qy, qz, roll, pitch, yaw = gibbs_to_quat_euler(d["roll"], d["pitch"], d["yaw"])
     d["qw"], d["qx"], d["qy"], d["qz"] = qw, qx, qy, qz
     d["roll"], d["pitch"], d["yaw"] = roll, pitch, yaw
-    d["armed"] = d["estop"] = d["arming"] = False
-    d["caldone"] = bool(d["tofv"])   # no cal flag on the FPGA line; use tof-valid as a liveness proxy
+    d["armed"] = bool(fl & FLAG_ARMED); d["estop"] = bool(fl & FLAG_ESTOP)
+    d["arming"] = bool(fl & FLAG_ARMING); d["caldone"] = bool(fl & FLAG_CALDONE)
     w = WALLS_RE.search(line)         # side-ToF walls, when the bumper build appends them
     if w:
         d["walls"] = {"front": int(w.group(1)), "back": int(w.group(2)),

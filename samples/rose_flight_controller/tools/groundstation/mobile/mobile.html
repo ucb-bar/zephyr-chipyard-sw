@@ -316,6 +316,27 @@ const TAIL_RE = new RegExp(
   "vx="+_F+"\\s+vy="+_F+"\\s+vz="+_F+"\\s+zsp="+_F+"\\s+vbat="+_F+"\\s+st=(\\d+)");
 const POS_RE = new RegExp("\\bx="+_F+"\\s+y="+_F);
 const FLAG_ARMED=1, FLAG_ESTOP=2, FLAG_ARMING=4, FLAG_CALDONE=8;
+/* Compact FPGA telemetry line (src/telem_uart.c via main.cpp). fl= is the status-flag bitfield
+ * (ARMED/ESTOP/ARMING/CALDONE), not flow. Fewer fields than the ESP format -> motors/drift/battery
+ * are absent and render blank. Optional wl=/wsq= carries the side-ToF walls (mm; -1 = clear). */
+const RBT_RE = new RegExp(
+  "RBT\\s+it=(-?\\d+)\\s+r="+_F+"\\s+p="+_F+"\\s+y="+_F+"\\s+z="+_F+
+  "\\s+vz="+_F+"\\s+h="+_F+"\\s+tv=(\\d+)\\s+fl=(-?\\d+)"+
+  "(?:\\s+cam=(\\d+)\\s+camm=(\\d+))?");
+const WALLS_RE = new RegExp("wl=(-?\\d+),(-?\\d+),(-?\\d+),(-?\\d+)\\s+wsq=(\\d+)");
+function parseRBT(line){
+  const m=RBT_RE.exec(line); if(!m) return null;
+  const g=m.slice(1), e=gibbsToEuler(+g[1],+g[2],+g[3]), fl=+g[8];
+  const d={ it:+g[0]|0, dt_ms:0, roll:e.roll,pitch:e.pitch,yaw:e.yaw,
+    qw:e.qw,qx:e.qx,qy:e.qy,qz:e.qz, z:+g[4], vz:+g[5], tofh:+g[6], tofv:+g[7]|0,
+    u:[null,null,null,null], vx:null,vy:null,zsp:null,vbat:null, st:fl, x:null,y:null,
+    cam:g[9]!=null?+g[9]:null, camm:g[10]!=null?+g[10]:null };
+  d.armed=!!(fl&FLAG_ARMED); d.estop=!!(fl&FLAG_ESTOP);
+  d.arming=!!(fl&FLAG_ARMING); d.caldone=!!(fl&FLAG_CALDONE);
+  const w=WALLS_RE.exec(line);
+  if(w){ d.walls={front:+w[1],back:+w[2],left:+w[3],right:+w[4],seq:+w[5]}; }
+  return d;
+}
 
 /* The FC emits attitude as the Gibbs/Rodrigues vector (q_xyz/q_w); reconstruct the true
  * unit quaternion + proper ZYX Euler so the horizon is correct at all attitudes. */
@@ -328,7 +349,7 @@ function gibbsToEuler(rx,ry,rz){
   return {qw,qx,qy,qz,roll,pitch,yaw};
 }
 function parseLine(line){
-  const m=CORE_RE.exec(line); if(!m) return null;
+  const m=CORE_RE.exec(line); if(!m) return parseRBT(line);
   const g=m.slice(1).map(Number);
   const e=gibbsToEuler(g[2],g[3],g[4]);
   const d={ it:g[0]|0, dt_ms:g[1]|0, roll:e.roll, pitch:e.pitch, yaw:e.yaw,
@@ -587,13 +608,16 @@ document.querySelectorAll('#modeseg button').forEach(b=>
 $("baseurl").addEventListener("change",()=>applyMode(
   [...document.querySelectorAll('#modeseg button.on')][0]?.dataset.mode||"demo"));
 
-/* boot: restore saved config, else auto-pick (http origin -> SSE, file:// -> demo) */
+/* boot: restore saved config, else auto-pick. Served from the ESP SoftAP (192.168.4.1) there is
+ * no SSE endpoint -- only the light /t poll + /cmd -- so default to poll there; the laptop panel.py
+ * serves /sse too, so prefer SSE on any other http origin; file:// falls back to the demo feed. */
 (function boot(){
   const q=new URLSearchParams(location.search);
   let mode=q.get("mode"), base=q.get("base");
   try{ if(mode==null) mode=localStorage.getItem("rb_mode");
        if(base==null) base=localStorage.getItem("rb_base"); }catch(e){}
-  if(mode==null) mode = location.protocol.startsWith("http") ? "sse" : "demo";
+  if(mode==null) mode = !location.protocol.startsWith("http") ? "demo"
+                      : (location.hostname==="192.168.4.1" ? "poll" : "sse");
   if(base) $("baseurl").value=base;
   pickMode(mode); Transport.start(mode, base||"");
 })();
