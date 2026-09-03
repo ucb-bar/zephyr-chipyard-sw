@@ -1,4 +1,4 @@
-scripts/activate_conda.sh#!/usr/bin/env bash
+#!/usr/bin/env bash
 # scripts/activate_conda.sh
 # Safe conda activation script that can be sourced
 # Usage: source scripts/activate_conda.sh
