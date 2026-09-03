@@ -38,6 +38,8 @@
 #if defined(CONFIG_WIFI)
 #include "telem_wifi.h"         /* WiFi SoftAP UDP telemetry downlink (opt-in telem.conf; see plan) */
 #endif
+#include "telem_uart.h"         /* uart1 telemetry -> ESP wireless bridge (ROSE_UART_TELEM; FPGA target) */
+#include "camera_dma.h"         /* HM01B0 DMA frame capture on a bg thread (ROSE_CAMERA; DMA OSPI shell) */
 
 /* Repulsion bridge into the PID controller (defined in controller_pid.cpp). Feeding walls only has
  * an effect when the PID controller is active + built with ROSE_BUMPER; harmless otherwise. */
@@ -1516,6 +1518,21 @@ int main(void)
 	}
 #endif
 
+#if ROSE_UART_TELEM
+	/* FPGA target: emit telemetry over uart1 (E13/F14) to the ESP wireless bridge, which relays it
+	 * over its SoftAP (UDP :14550). The ESP runs samples/riskybird/fpga_telem_bridge. */
+	telem_uart_init();
+	printk("flight_controller: UART telemetry on uart1 -> ESP bridge (every %d ticks)\n",
+	       ROSE_UART_TELEM_DIV);
+#endif
+
+#if ROSE_CAMERA
+	/* Start the HM01B0 DMA capture thread (needs the DMA-capable OSPI shell). Runs alongside the
+	 * control loop; frames land in DDR by hardware DMA (no CPU drain). Results not consumed yet. */
+	camera_dma_init();
+	printk("flight_controller: camera DMA capture thread started\n");
+#endif
+
 	/* Status LED: start the state-derived pattern renderer (only if the ADS7128 LED config ACK'd
 	 * at board_sensor_init). Low priority + edge-only I2C writes -> negligible load on the loop. */
 	if (g_led_bus) {
@@ -1784,6 +1801,29 @@ int main(void)
 					      (g_gyro_cal_done ? TELEM_FLAG_CALDONE : 0u));
 			telem_wifi_publish(&ts);
 		}
+#endif
+#if ROSE_UART_TELEM
+		/* FPGA target: newline-framed telemetry line to uart1 -> ESP bridge -> SoftAP UDP. Same
+		 * fields as the ROSE_TELEM console line; FP3() formats floats without %f. Decimated so the
+		 * blocking-polled TX (~1 line = ~1 ms @ 115200) never dominates the loop. */
+		if ((iter % ROSE_UART_TELEM_DIV) == 0) {
+			int fl = (g_armed ? 1 : 0) | (g_estop ? 2 : 0) |
+				 (g_arming ? 4 : 0) | (g_gyro_cal_done ? 8 : 0);
+			char tbuf[176];
+			snprintf(tbuf, sizeof(tbuf),
+				 "RBT it=%d r=%s%d.%03d p=%s%d.%03d y=%s%d.%03d z=%s%d.%03d "
+				 "vz=%s%d.%03d h=%s%d.%03d tv=%d fl=%d cam=%u camm=%u\n",
+				 iter, FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
+				 FP3(state[8]), FP3(f.height), (int)f.tof_valid, fl,
+				 camera_dma_frames(), camera_dma_last_mean());
+			telem_uart_line(tbuf);
+		}
+#endif
+#if ROSE_CAMERA
+		/* Yield CPU to the lower-priority background threads (camera DMA capture, down-ToF). The
+		 * flat-out ~2 kHz control loop is higher priority and would otherwise starve them on the
+		 * shared I2C mutex. ~300 us/iter paces the loop to ~1.3 kHz -- still ample for control. */
+		k_usleep(300);
 #endif
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
 		if (!g_estop && (iter % ROSE_FLIGHTLOG_DIV) == 0) {

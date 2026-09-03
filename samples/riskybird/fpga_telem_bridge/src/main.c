@@ -135,6 +135,12 @@ static void uart_to_udp(void *a, void *b, void *c)
 			got = true;
 			buf[len++] = ch;
 			if (ch == '\n' || len == sizeof(buf)) {
+#if defined(BRIDGE_DEBUG_ECHO) && BRIDGE_DEBUG_ECHO
+				/* Echo each framed line to the USB console BEFORE the UDP send, so the FPGA->ESP
+				 * UART link can be verified without a WiFi client (sendto to the broadcast can
+				 * stall when no station is associated; the UDP hop itself still needs the dongle). */
+				printk("rx[%u]: %.*s", (unsigned)len, (int)len, buf);
+#endif
 				(void)zsock_sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
 				len = 0;
 			}
