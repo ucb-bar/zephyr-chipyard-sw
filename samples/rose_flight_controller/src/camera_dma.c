@@ -106,10 +106,21 @@ static void stream_snapshot(uint32_t seq, int w, int h)
 	int rn = 0, k = 0;
 
 	for (int oy = 0; oy < h; oy++) {
-		int sy = oy * SRC_H / h;
-		const uint8_t *row = &cam_buf[(uint32_t)sy * SRC_W];
+		int sy0 = oy * SRC_H / h, sy1 = (oy + 1) * SRC_H / h;
+		if (sy1 <= sy0) { sy1 = sy0 + 1; }
 		for (int ox = 0; ox < w; ox++) {
-			raw[rn++] = row[ox * SRC_W / w];
+			int sx0 = ox * SRC_W / w, sx1 = (ox + 1) * SRC_W / w;
+			if (sx1 <= sx0) { sx1 = sx0 + 1; }
+			/* Box-average the whole source block into one output pixel (not nearest-neighbour).
+			 * Averaging >=2 source rows cancels the HM01B0 even/odd row brightness pattern
+			 * (period-2 row FPN, ~92 vs ~74) that a single-row pick aliases into horizontal
+			 * stripes as sy=oy*SRC_H/h beats through the parity; it also anti-aliases the scale. */
+			uint32_t sum = 0, cnt = 0;
+			for (int sy = sy0; sy < sy1; sy++) {
+				const uint8_t *row = &cam_buf[(uint32_t)sy * SRC_W];
+				for (int sx = sx0; sx < sx1; sx++) { sum += row[sx]; cnt++; }
+			}
+			raw[rn++] = (uint8_t)(sum / cnt);
 			if (rn == RAW_PER) {
 				int off = snprintk(line, sizeof(line), "IMG s=%u k=%d/%d w=%d h=%d ",
 						   seq, k++, total, w, h);
