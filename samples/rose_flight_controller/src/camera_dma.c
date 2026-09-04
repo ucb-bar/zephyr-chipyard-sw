@@ -202,16 +202,49 @@ static void cam_thread(void *a, void *b, void *c)
 	k_thread_priority_set(k_current_get(), 12);   /* init done -> low prio for the capture loop */
 
 	uintptr_t dst = (uintptr_t)cam_buf;
+
+	/* Measure the FVLDCNT tick period (ms) so the aligned capture below can pre-sleep most of a frame
+	 * preemptibly and hold the scheduler lock only for the last few ms while it catches the exact edge. */
+	int tick_ms;
+	{
+		uint32_t c0 = r32(O_FVLDCNT), t0 = k_uptime_get_32();
+		while (r32(O_FVLDCNT) - c0 < 10 && k_uptime_get_32() - t0 < 1000) { k_busy_wait(100); }
+		uint32_t dc = r32(O_FVLDCNT) - c0, dt = k_uptime_get_32() - t0;
+		tick_ms = (dc > 0) ? (int)(dt / dc) : 16;
+		if (tick_ms < 2) { tick_ms = 2; }
+	}
+
+	uint32_t iter = 0;
 	for (;;) {
-		/* Frame-aligned bounded capture into the OSPI frame buffer. Short bounded spins with
-		 * yields so this low-prio thread never hogs the CPU from the control loop. */
+		/* cam_buf has no consumer other than the snapshot stream, and the aligned capture briefly locks
+		 * the scheduler -- so only capture when there's actually a snapshot to send. */
+		iter++;
+		uint32_t req = g_snap_req;
+		int sw = 0, sh = 0;
+		if (req)                                  { sw = g_snap_w;            sh = g_snap_h; }
+#if ROSE_CAM_AUTOSNAP
+		else if ((iter % ROSE_CAM_AUTOSNAP) == 0) { sw = ROSE_CAM_AUTOSNAP_W; sh = ROSE_CAM_AUTOSNAP_H; }
+#endif
+		if (sw == 0) { k_msleep(100); continue; }
+
+		/* --- Frame-aligned bounded capture into the OSPI frame buffer. ---
+		 * The capture core starts filling the instant it is ARMed, so ARM must land right at a frame
+		 * edge or the buffer begins mid-frame and the image comes out cyclically ROLLED (the corner
+		 * lands in the middle). This low-prio thread was being preempted between detecting the FVLD
+		 * edge and arming -- a variable ms of pixels stream through in that gap -> intermittent roll.
+		 * Fix: pre-sleep most of the frame preemptibly, then k_sched_lock (interrupts stay live) only
+		 * while spinning for the exact edge and arming, so no thread can slip in between. */
 		w32(O_PIXTARGET, CAP_PIXELS);
-		w32(O_CTRL, CTRL_EN | CTRL_CLR | CTRL_FLU);
 		uint32_t fv = r32(O_FVLDCNT);
-		for (int g = 0; g < 60 && r32(O_FVLDCNT) == fv; g++) { k_busy_wait(200); }
-		w32(O_CTRL, CTRL_EN | CTRL_CLR | CTRL_FLU);
-		w32(O_CTRL, CTRL_EN | CTRL_ARM);
+		for (int g = 0; g < 200 && r32(O_FVLDCNT) == fv; g++) { k_msleep(1); }   /* phase-lock to a frame */
+		if (tick_ms > 4) { k_msleep(tick_ms - 3); }                             /* skip most of it */
+		k_sched_lock();
+		fv = r32(O_FVLDCNT);
+		for (int g = 0; g < 500000 && r32(O_FVLDCNT) == fv; g++) { }            /* catch the exact edge */
+		w32(O_CTRL, CTRL_EN | CTRL_CLR | CTRL_FLU);                             /* drop any pre-edge pixels */
+		w32(O_CTRL, CTRL_EN | CTRL_ARM);                                        /* arm at the frame start */
 		w32(O_CTRL, CTRL_EN);
+		k_sched_unlock();
 		for (int t = 0; t < 60 && r32(O_FIFOCOUNT) < (CAP_PIXELS - 4096); t++) { k_msleep(1); }
 
 		/* Kick the DMA to drain the frame buffer to DDR (HW moves the bytes; CPU just waits). */
@@ -234,21 +267,9 @@ static void cam_thread(void *a, void *b, void *c)
 		g_last_mean = n ? sum / n : 0;
 		g_frames++;
 
-		/* Service a pending on-demand snapshot request with the frame we just captured. */
-		uint32_t req = g_snap_req;
-		if (req) {
-			stream_snapshot(req, g_snap_w, g_snap_h);
-			g_snap_req = 0;
-		}
-#if ROSE_CAM_AUTOSNAP
-		/* Periodic auto-snapshot (high seq bit set to mark it auto vs on-demand) so the GCS shows a
-		 * live camera view without needing the uart1 RX uplink. */
-		else if ((g_frames % ROSE_CAM_AUTOSNAP) == 0) {
-			stream_snapshot(0x80000000u | g_frames, ROSE_CAM_AUTOSNAP_W, ROSE_CAM_AUTOSNAP_H);
-		}
-#endif
-
-		k_msleep(20);   /* ~cap the camera thread rate + yield to the control loop */
+		/* Send it. High seq bit marks an auto-snapshot vs an on-demand one. */
+		stream_snapshot(req ? req : (0x80000000u | g_frames), sw, sh);
+		if (req) { g_snap_req = 0; }
 	}
 }
 
