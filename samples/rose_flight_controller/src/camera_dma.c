@@ -110,13 +110,19 @@ static void stream_snapshot(uint32_t seq, int w, int h)
 	for (int oy = 0; oy < h; oy++) {
 		int sy0 = oy * SRC_H / h, sy1 = (oy + 1) * SRC_H / h;
 		if (sy1 <= sy0) { sy1 = sy0 + 1; }
+		/* Force an EVEN-length row span so the block holds equal even/odd source rows -- otherwise a
+		 * 3-row block (2:1 parity) leaves a residual of the period-2 row FPN. See column note below. */
+		if (((sy1 - sy0) & 1) && sy1 < SRC_H) { sy1++; }
 		for (int ox = 0; ox < w; ox++) {
 			int sx0 = ox * SRC_W / w, sx1 = (ox + 1) * SRC_W / w;
 			if (sx1 <= sx0) { sx1 = sx0 + 1; }
-			/* Box-average the whole source block into one output pixel (not nearest-neighbour).
-			 * Averaging >=2 source rows cancels the HM01B0 even/odd row brightness pattern
-			 * (period-2 row FPN, ~92 vs ~74) that a single-row pick aliases into horizontal
-			 * stripes as sy=oy*SRC_H/h beats through the parity; it also anti-aliases the scale. */
+			if (((sx1 - sx0) & 1) && sx1 < SRC_W) { sx1++; }
+			/* Box-average the whole source block into one output pixel (not nearest-neighbour). The
+			 * HM01B0 has period-2 fixed-pattern noise on BOTH axes -- even/odd row offsets (~92 vs 74)
+			 * AND even/odd column offsets (per-column ADCs) -- which together read as a checkerboard
+			 * grid. Averaging over an EVEN number of rows and columns puts equal even/odd members in
+			 * every block, cancelling both; a plain variable 2-or-3 span left a residual grid. It also
+			 * anti-aliases the downscale. (A single-row/col pick would alias the FPN into stripes.) */
 			uint32_t sum = 0, cnt = 0;
 			for (int sy = sy0; sy < sy1; sy++) {
 				const uint8_t *row = &cam_buf[(uint32_t)sy * SRC_W];
