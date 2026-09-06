@@ -856,6 +856,16 @@ static void tof_thread_fn(void *a, void *b, void *c)
 			k_mutex_lock(&tof_mtx, K_FOREVER);
 			g_tof_h = hv; g_tof_valid = true;
 			k_mutex_unlock(&tof_mtx);
+			/* FC+DroNet tight-loop (blocker a): the single-shot VL53L1X fetch holds
+			 * the i2c bus-mutex long enough that the 2 kHz IMU read blocks ~20 ms
+			 * per ranging, capping the control loop at ~87 Hz mean. Pacing the
+			 * down-ToF to ~ROSE_TOF_PERIOD_MS (default 66 = its native ~15 Hz;
+			 * lower to trade altitude rate for a tighter loop) makes those
+			 * contention windows rare so the loop holds its ~350 Hz baseline. */
+#ifndef ROSE_TOF_PERIOD_MS
+#define ROSE_TOF_PERIOD_MS 66
+#endif
+			k_msleep(ROSE_TOF_PERIOD_MS);
 		} else {
 			k_msleep(5);   /* back off on error so a failing ToF can't spin the I2C bus */
 		}
