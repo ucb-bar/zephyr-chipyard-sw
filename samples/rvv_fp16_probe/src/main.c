@@ -44,13 +44,17 @@ int main(void)
 	}
 	printk("probe a OK: fp16 vfmul supported\n");
 
-	printk("probe b: vfncvt.f.f.w (fp32->fp16 narrowing convert -- the one that trapped)\n");
+	/* Order: fp16 arith (a) then the UNKNOWN converts (d int16<->fp16, c fp16->fp32)
+	 * BEFORE the ops already known to trap (e fp32 arith, b fp32->fp16), so one run
+	 * maps everything -- a trap halts the probe, so knowns go last. */
+	printk("probe d: vfcvt int16<->fp16 (for an int/fixed-point fp16 path)\n");
 	{
-		vfloat32m1_t a = __riscv_vle32_v_f32m1((const float *)f32buf, vl);
-		vfloat16mf2_t r = __riscv_vfncvt_f_f_w_f16mf2(a, vl);
-		__riscv_vse16_v_f16mf2((_Float16 *)f16buf, r, vl);
+		vint16m1_t x = __riscv_vle16_v_i16m1(i16buf, vl);
+		vfloat16m1_t f = __riscv_vfcvt_f_x_v_f16m1(x, vl);   /* int16 -> fp16 */
+		vint16m1_t y = __riscv_vfcvt_x_f_v_i16m1(f, vl);     /* fp16 -> int16 */
+		__riscv_vse16_v_i16m1(i16buf, y, vl);
 	}
-	printk("probe b OK: vfncvt.f.f.w supported\n");
+	printk("probe d OK: vfcvt int16<->fp16 supported\n");
 
 	printk("probe c: vfwcvt.f.f.v (fp16->fp32 widening convert)\n");
 	{
@@ -60,16 +64,7 @@ int main(void)
 	}
 	printk("probe c OK: vfwcvt.f.f.v supported\n");
 
-	printk("probe d: vfcvt int16<->fp16 (for an int32-fixed-point fallback)\n");
-	{
-		vint16m1_t x = __riscv_vle16_v_i16m1(i16buf, vl);
-		vfloat16m1_t f = __riscv_vfcvt_f_x_v_f16m1(x, vl);   /* int16 -> fp16 */
-		vint16m1_t y = __riscv_vfcvt_x_f_v_i16m1(f, vl);     /* fp16 -> int16 */
-		__riscv_vse16_v_i16m1(i16buf, y, vl);
-	}
-	printk("probe d OK: vfcvt int16<->fp16 supported\n");
-
-	printk("probe e: vfadd.vv e32 (fp32 vector ARITH -- the fp16 kernels' accumulators)\n");
+	printk("probe e: vfadd.vv e32 (fp32 vector ARITH -- known to trap on At35)\n");
 	{
 		vfloat32m1_t a = __riscv_vle32_v_f32m1((const float *)f32buf, vl);
 		vfloat32m1_t r = __riscv_vfadd_vv_f32m1(a, a, vl);
@@ -77,7 +72,15 @@ int main(void)
 	}
 	printk("probe e OK: fp32 vfadd supported\n");
 
-	printk("RVVFP16PROBE: ALL OPS OK (a-e) -- full fp16+fp32 vector supported\n");
+	printk("probe b: vfncvt.f.f.w (fp32->fp16 narrowing convert -- known to trap)\n");
+	{
+		vfloat32m1_t a = __riscv_vle32_v_f32m1((const float *)f32buf, vl);
+		vfloat16mf2_t r = __riscv_vfncvt_f_f_w_f16mf2(a, vl);
+		__riscv_vse16_v_f16mf2((_Float16 *)f16buf, r, vl);
+	}
+	printk("probe b OK: vfncvt.f.f.w supported\n");
+
+	printk("RVVFP16PROBE: ALL OPS OK (a,e,d,c,b) -- full fp16+fp32 vector supported\n");
 	/* keep the value live so nothing is optimized away */
 	printk("RVVFP16PROBE: sink f16[0]=0x%04x f32[0]=0x%08x i16[0]=%d\n",
 	       (unsigned)f16buf[0], (unsigned)f32buf[0], (int)i16buf[0]);
