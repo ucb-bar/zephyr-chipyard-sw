@@ -11,8 +11,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 TOOLS_MANUAL_DIR="${REPO_ROOT}/tools-manual"
 PATCHES_DIR="${REPO_ROOT}/tools/patches"
 
-SDK_VERSION="1.0.0-beta1"
-SDK_NAME="zephyr-sdk-${SDK_VERSION}"
+SDK_VERSION="${RB_SDK_VERSION:-1.0.0-beta1}"
 
 # Which prebuilt SDK to fetch. The upstream release publishes one tarball per
 # host, and picking the wrong one installs a toolchain that cannot execute --
@@ -35,6 +34,21 @@ else
        linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64" ;;
   esac
 fi
+# The pinned v1.0.0-beta1 release publishes a ZERO-BYTE macos tarball -- the
+# asset exists and downloads 200 OK, so the failure is a silent empty extract
+# rather than a 404. v1.0.0 and later ship a real macOS build. Move macOS
+# forward rather than letting it install nothing, loudly, because it means the
+# Mac's toolchain is not the version Linux pins.
+case "${SDK_HOST}" in
+  macos-*)
+    if [ "${SDK_VERSION}" = "1.0.0-beta1" ] && [ -z "${RB_SDK_VERSION:-}" ]; then
+      SDK_VERSION="1.0.1"
+      echo "NOTE: zephyr-sdk 1.0.0-beta1 publishes an empty macOS tarball;" >&2
+      echo "      using ${SDK_VERSION} instead, which ships a real macOS build." >&2
+      echo "      Override with RB_SDK_VERSION if you need a specific one." >&2
+    fi ;;
+esac
+SDK_NAME="zephyr-sdk-${SDK_VERSION}"
 SDK_MINIMAL_TARBALL="${SDK_NAME}_${SDK_HOST}_minimal.tar.xz"
 SDK_URL="https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${SDK_VERSION}/${SDK_MINIMAL_TARBALL}"
 SDK_INSTALL_DIR="${TOOLS_MANUAL_DIR}/${SDK_NAME}"
