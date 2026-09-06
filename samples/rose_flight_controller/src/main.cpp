@@ -875,6 +875,37 @@ static void tof_thread_fn(void *a, void *b, void *c)
 #define TOF_THREADED 0
 #endif
 
+/* ---- Baro decoupling (blocker a): the blocking BMP388 fetch (~8 ms with osr) was
+ * inline in the control loop, stalling it on the shared i2c. Move it to its own
+ * thread; the loop consumes the latest cached pressure, seq-gated so each fetch is
+ * processed exactly once (preserves the reference-pressure cal average). Mirrors
+ * the down-ToF thread. */
+#if ROSE_BARO && HAVE_BARO
+K_MUTEX_DEFINE(baro_mtx);
+static float    g_baro_p_cached;
+static uint32_t g_baro_seq;
+K_THREAD_STACK_DEFINE(baro_stack, 2048);
+static struct k_thread baro_thread_data;
+static void baro_thread_fn(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	for (;;) {
+		if (sensor_sample_fetch(baro_dev) == 0) {
+			struct sensor_value pv;
+			sensor_channel_get(baro_dev, SENSOR_CHAN_PRESS, &pv);
+			float p = (float)sensor_value_to_double(&pv);
+			if (p > 0.0f) {
+				k_mutex_lock(&baro_mtx, K_FOREVER);
+				g_baro_p_cached = p;
+				g_baro_seq++;
+				k_mutex_unlock(&baro_mtx);
+			}
+		}
+		k_msleep(BARO_FETCH_PERIOD_MS);
+	}
+}
+#endif
+
 /* ---- optical-flow attitude compensation (ROSE_FLOW) --------------------------------------------
  * The PMW3901 measures the ground's ANGULAR velocity across its FOV, which mixes translation with
  * body rotation; the down-ToF gives a SLANT range, not vertical height. Both are attitude effects:
@@ -1111,29 +1142,29 @@ static bool read_sensor_frame(struct sensor_frame *f)
 #if ROSE_BARO
 #if HAVE_BARO
 	{
-		static int64_t baro_next_ms = 0;
-		static float   baro_last = 0.0f;  /* last relative altitude (m), zero-order held */
-		int64_t now_ms = k_uptime_get();
-		if (now_ms >= baro_next_ms) {
-			baro_next_ms = now_ms + BARO_FETCH_PERIOD_MS;
-			if (sensor_sample_fetch(baro_dev) == 0) {
-				struct sensor_value pv;
-				sensor_channel_get(baro_dev, SENSOR_CHAN_PRESS, &pv);
-				float p = (float)sensor_value_to_double(&pv);   /* kPa */
-				if (p > 0.0f) {
-					if (!g_gyro_cal_done) {
-						/* accumulate the reference pressure over the gyro-cal still window */
-						g_bcal_sum += p; g_bcal_n++;
-					} else {
-						if (!g_baro_have) {   /* cal just finished -> freeze the averaged reference */
-							g_baro_p0 = (g_bcal_n > 0) ? (float)(g_bcal_sum / g_bcal_n) : p;
-							g_baro_have = true;
-							printk("baro-cal: p0=%d.%03d kPa (%d samples) -- altitude referenced (fused with ToF)\n",
-							       (int)g_baro_p0, ((int)(g_baro_p0 * 1000.0f)) % 1000, g_bcal_n);
-						}
-						baro_last = baro_rel_altitude_m(p, g_baro_p0);
-					}
+		/* Non-blocking: consume the latest cached pressure from baro_thread_fn
+		 * (the blocking i2c fetch is off the control loop now). seq-gated so each
+		 * fetch is processed exactly once -> the reference-pressure cal average is
+		 * unchanged vs the old inline read. */
+		static uint32_t baro_last_seq = 0;
+		static float    baro_last = 0.0f;  /* last relative altitude (m), zero-order held */
+		float p = 0.0f; uint32_t seq;
+		k_mutex_lock(&baro_mtx, K_FOREVER);
+		p = g_baro_p_cached; seq = g_baro_seq;
+		k_mutex_unlock(&baro_mtx);
+		if (seq != baro_last_seq && p > 0.0f) {
+			baro_last_seq = seq;
+			if (!g_gyro_cal_done) {
+				/* accumulate the reference pressure over the gyro-cal still window */
+				g_bcal_sum += p; g_bcal_n++;
+			} else {
+				if (!g_baro_have) {   /* cal just finished -> freeze the averaged reference */
+					g_baro_p0 = (g_bcal_n > 0) ? (float)(g_bcal_sum / g_bcal_n) : p;
+					g_baro_have = true;
+					printk("baro-cal: p0=%d.%03d kPa (%d samples) -- altitude referenced (fused with ToF)\n",
+					       (int)g_baro_p0, ((int)(g_baro_p0 * 1000.0f)) % 1000, g_bcal_n);
 				}
+				baro_last = baro_rel_altitude_m(p, g_baro_p0);
 			}
 		}
 		f->baro_valid = g_baro_have;
@@ -1524,6 +1555,15 @@ int main(void)
 			tof_thread_fn, NULL, NULL, NULL, K_PRIO_PREEMPT(8), 0, K_NO_WAIT);
 	k_thread_name_set(&tof_thread_data, "tof");
 	printk("flight_controller: down-ToF on dedicated thread (control loop reads cached height)\n");
+#endif
+
+#if ROSE_BARO && HAVE_BARO
+	/* Start the BMP388 fetcher on its own thread (prio below the control loop) so the
+	 * blocking baro read is off the hot path; the loop reads the cached pressure. */
+	k_thread_create(&baro_thread_data, baro_stack, K_THREAD_STACK_SIZEOF(baro_stack),
+			baro_thread_fn, NULL, NULL, NULL, K_PRIO_PREEMPT(9), 0, K_NO_WAIT);
+	k_thread_name_set(&baro_thread_data, "baro");
+	printk("flight_controller: BMP388 baro on dedicated thread (control loop reads cached pressure)\n");
 #endif
 
 #if defined(CONFIG_WIFI)

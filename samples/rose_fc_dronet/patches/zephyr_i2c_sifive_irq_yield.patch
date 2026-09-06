@@ -23,7 +23,7 @@ index ad6a5d91b97..819945ca644 100644
 +	  NOTE: needs bench validation that the I2C PLIC interrupt actually fires
 +	  on this bitstream before relying on the early-wake path.
 diff --git a/drivers/i2c/i2c_sifive.c b/drivers/i2c/i2c_sifive.c
-index 000031a27d6..c8a93c85f86 100644
+index 000031a27d6..39ec1f4cd97 100644
 --- a/drivers/i2c/i2c_sifive.c
 +++ b/drivers/i2c/i2c_sifive.c
 @@ -64,6 +64,9 @@ struct i2c_sifive_cfg {
@@ -173,12 +173,17 @@ index 000031a27d6..c8a93c85f86 100644
  	for (int i = 0; i < num_msgs; i++) {
  		if (msgs[i].flags & I2C_MSG_READ) {
  			rc = i2c_sifive_read_msg(dev, &(msgs[i]), addr);
-@@ -326,6 +381,13 @@ static int i2c_sifive_init(const struct device *dev)
+@@ -326,6 +381,18 @@ static int i2c_sifive_init(const struct device *dev)
  
  	k_mutex_init(&data->bus_mutex);
  
 +#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
-+	k_sem_init(&data->xfer_done, 0, 1);
++	/* COUNTING sem (not binary): the completion ISR fires once per byte; if two
++	 * bytes complete before the busy-wait consumes a give, a binary sem (limit 1)
++	 * silently drops the second -> the next wait_hint blocks a full tick (lost
++	 * wakeup), which showed as intermittent 15 ms i2c reads. A counting sem
++	 * accumulates every give so each byte's completion is consumed exactly once. */
++	k_sem_init(&data->xfer_done, 0, K_SEM_MAX_LIMIT);
 +	if (config->irq_config != NULL) {
 +		config->irq_config();
 +	}
@@ -187,7 +192,7 @@ index 000031a27d6..c8a93c85f86 100644
  	dev_config = (I2C_MODE_CONTROLLER | i2c_map_dt_bitrate(config->f_bus));
  
  	rc = i2c_sifive_configure(dev, dev_config);
-@@ -347,11 +409,27 @@ static DEVICE_API(i2c, i2c_sifive_api) = {
+@@ -347,11 +414,27 @@ static DEVICE_API(i2c, i2c_sifive_api) = {
  
  /* Device instantiation */
  
