@@ -1,0 +1,19 @@
+# Application Kconfig for the integrated FC + DroNet harness.
+# Declares the project-local RISCV_V_KERNEL_ONLY symbol (same as
+# modelblaster/harness/Kconfig) then sources the standard Zephyr Kconfig.
+
+config RISCV_V_KERNEL_ONLY
+	bool "Restrict V codegen to kernel files only"
+	depends on RISCV_ISA_EXT_V
+	default n
+	help
+	  Restrict RISC-V Vector codegen to the generated DroNet kernels.c TU
+	  (which carries a per-source -march=rv64imac_zve64x override). Every
+	  other translation unit -- the flight controller, Zephyr, libc -- is
+	  built for a no-V march so GCC cannot auto-vectorize scalar code and a
+	  mid-vector preemption can never clobber scalar state. The DroNet thread
+	  is the only V user; the eager vector context switch
+	  (CONFIG_RISCV_ISA_EXT_V_LAZY=n) saves/restores its vector state when the
+	  PID loop preempts it.
+
+source "Kconfig.zephyr"
