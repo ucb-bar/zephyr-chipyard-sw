@@ -34,20 +34,11 @@ else
        linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64" ;;
   esac
 fi
-# The pinned v1.0.0-beta1 release publishes a ZERO-BYTE macos tarball -- the
-# asset exists and downloads 200 OK, so the failure is a silent empty extract
-# rather than a 404. v1.0.0 and later ship a real macOS build. Move macOS
-# forward rather than letting it install nothing, loudly, because it means the
-# Mac's toolchain is not the version Linux pins.
-case "${SDK_HOST}" in
-  macos-*)
-    if [ "${SDK_VERSION}" = "1.0.0-beta1" ] && [ -z "${RB_SDK_VERSION:-}" ]; then
-      SDK_VERSION="1.0.1"
-      echo "NOTE: zephyr-sdk 1.0.0-beta1 publishes an empty macOS tarball;" >&2
-      echo "      using ${SDK_VERSION} instead, which ships a real macOS build." >&2
-      echo "      Override with RB_SDK_VERSION if you need a specific one." >&2
-    fi ;;
-esac
+# Note on tarball sizes: the macOS "minimal" archives are a few KB where the
+# Linux ones are tens of MB. That is not a broken asset -- minimal means the
+# cmake scaffolding and setup.sh only, and `setup.sh -t ... -l -h` below
+# downloads the toolchains themselves. Do not "fix" it by moving macOS to a
+# different SDK version.
 SDK_NAME="zephyr-sdk-${SDK_VERSION}"
 SDK_MINIMAL_TARBALL="${SDK_NAME}_${SDK_HOST}_minimal.tar.xz"
 SDK_URL="https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${SDK_VERSION}/${SDK_MINIMAL_TARBALL}"
