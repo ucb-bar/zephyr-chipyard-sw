@@ -1,240 +1,78 @@
 /*
- * Production fp16 flight-controller kernels — RVV Zvfh VECTOR unit (ZERO scalar FP).
+ * fp16 flight-controller kernels -- VECTOR unit (Zvfh) of the compile-unit split.
  *
- * Built -march=rv64imafc_zve64d_zvfh -mabi=lp64. Contains ONLY vector-intrinsic kernels;
- * every scalar (control flow, fp32 accumulator glue, fp16<->fp32 boundary, runtime
- * constants, comparisons) lives in fp16_fc_glue.c (soft-float rv64imac). See fp16_fc_vec.h.
+ * Built with -march=rv64imac_zve64x_zvfh -mabi=lp64 -fno-tree-vectorize. Contains
+ * ONLY the fp16-vector algebra + int<->fp16 vfcvt (SEW=16) + integer-vector ops --
+ * ZERO scalar FP and ZERO blocked ops (no vfncvt.f.f.w / vfwcvt.f.f.v / fp32-vector),
+ * so it runs on the fp16-only At35 Saturn (misa.F=0). The scalar-float interface,
+ * scalar cascade, and int64 fixed-point accumulator bookkeeping live in the soft-float
+ * GLUE unit (fp16_fc_glue.c). Each ve_/vc_ helper is a VERBATIM relocation of a
+ * contiguous vector block from a1198297's single-file kernel @ ddcd5d3 (algebra and
+ * Q-scales unchanged); data crosses via memory arrays + uint16 fp16-bit constants.
  *
- * The kernels are verbatim relocations of the contiguous vector blocks of the original
- * kernel (same __riscv_* intrinsics / order -> bit-identical results). Runtime constants
- * arrive as integer bit-patterns and are splatted with vmv.v.x (never from a scalar float,
- * which would emit fcvt/fmv). The few spots that originally extracted an fp16 lane to a
- * scalar `_Float16` and rebuilt a small array (which emits flh/fsh) are re-expressed with
- * vse16(vl=1) / vslideup / indexed-load — same numeric values, no scalar-FP.
- *
- * ALGEBRA in fp16 vector (vfmul.vv/vfmacc.vv/vfredusum/vfsqrt.v); ACCUMULATORS in fp32
- * vector (vfLen=64 on this Saturn core); SATURATION clamps bound the mixer/force path.
+ * Two documented deviations, both bit-exact:
+ *   (1) hscale() multiplies by 2^m built as an INTEGER fp16 bit pattern (pow2h) rather
+ *       than (_Float16)(float)(1<<m); 2^m is exactly representable so the fp16 value --
+ *       hence the vfmul result -- is identical, but no runtime scalar float->fp16 cast.
+ *   (2) rotation-matrix elements are extracted with hlane0() (a vse16 of lane 0 to
+ *       _Float16) instead of (_Float16)h_get() whose (float)(_Float16) round-trip is an
+ *       identity for an fp16 value -- same bits, no scalar float.
  */
 #include "fp16_fc_kernels.h"
 #include "fp16_fc_vec.h"
+#include <stdint.h>
 #include <riscv_vector.h>
 
 typedef vfloat16m1_t vh;
-typedef vfloat32m1_t vf;
 
-/* ---- fp16 helpers: integer-bit constant splat, vse16 extract (never scalar fp16) ---- */
-static inline uint16_t hb(float c){ union{_Float16 h;uint16_t u;}x; x.h=(_Float16)c; return x.u; }
-static inline vh h_splat(float c,size_t vl){ return __riscv_vreinterpret_v_u16m1_f16m1(__riscv_vmv_v_x_u16m1(hb(c),vl)); }
-static inline vh h_splat_bits(uint16_t b,size_t vl){ return __riscv_vreinterpret_v_u16m1_f16m1(__riscv_vmv_v_x_u16m1(b,vl)); }
-static inline vh h_bcast_lane(vh v,int k,size_t vl){ return __riscv_vrgather_vx_f16m1(v,(size_t)k,vl); }
-static inline void h_store(_Float16*p,vh v,size_t vl){ __riscv_vse16_v_f16m1(p,v,vl); }
-static inline void h_st1(_Float16*p,vh v){ __riscv_vse16_v_f16m1(p,v,1); }   /* store lane0 via vector store (no scalar fp16) */
-static inline vh h_load(const _Float16*p,size_t vl){ return __riscv_vle16_v_f16m1(p,vl); }
-/* dot product (fp16) -> broadcast vector holding the sum in every lane (no scalar extract) */
-static inline vh h_dot_bcast(vh a,vh b,size_t n){
-    vh p=__riscv_vfmul_vv_f16m1(a,b,n);
-    vh r=__riscv_vfredusum_vs_f16m1_f16m1(p,h_splat(0.0f,n),n);   /* sum in lane0 */
-    return __riscv_vrgather_vx_f16m1(r,0,n);                       /* broadcast lane0 */
+/* ---- fp16 primitives (integer-bit splat; no scalar fp16; no .vf) ---- */
+static inline vh h_splat(float c, size_t vl){ return __riscv_vreinterpret_v_u16m1_f16m1(__riscv_vmv_v_x_u16m1(hb(c), vl)); } /* c COMPILE-TIME only */
+static inline vh h_splat_bits(uint16_t b, size_t vl){ return __riscv_vreinterpret_v_u16m1_f16m1(__riscv_vmv_v_x_u16m1(b, vl)); }
+static inline vh h_load(const _Float16 *p, size_t vl){ return __riscv_vle16_v_f16m1(p, vl); }
+static inline void h_store(_Float16 *p, vh v, size_t vl){ __riscv_vse16_v_f16m1(p, v, vl); }
+static inline void hstore1(_Float16 *p, vh v){ __riscv_vse16_v_f16m1(p, v, 1); }  /* store lane0, vector vse16 (no scalar flh/fsh) */
+static inline vh hmul(vh a, vh b, size_t vl){ return __riscv_vfmul_vv_f16m1(a, b, vl); }
+static inline vh hadd(vh a, vh b, size_t vl){ return __riscv_vfadd_vv_f16m1(a, b, vl); }
+static inline vh hsub(vh a, vh b, size_t vl){ return __riscv_vfsub_vv_f16m1(a, b, vl); }
+static inline vh hmulc(vh v, float c, size_t vl){ return __riscv_vfmul_vv_f16m1(v, h_splat(c, vl), vl); } /* c COMPILE-TIME */
+static inline vh haddc(vh v, float c, size_t vl){ return __riscv_vfadd_vv_f16m1(v, h_splat(c, vl), vl); }
+static inline vh hsubc(vh v, float c, size_t vl){ return __riscv_vfsub_vv_f16m1(v, h_splat(c, vl), vl); }
+static inline vh hmaxc(vh v, float c, size_t vl){ return __riscv_vfmax_vv_f16m1(v, h_splat(c, vl), vl); }
+static inline vh hminc(vh v, float c, size_t vl){ return __riscv_vfmin_vv_f16m1(v, h_splat(c, vl), vl); }
+static inline vh habs(vh v, size_t vl){ return __riscv_vfabs_v_f16m1(v, vl); }
+static inline vh hsqrt(vh v, size_t vl){ return __riscv_vfsqrt_v_f16m1(v, vl); }
+static inline vh hshuf(vh v, const uint16_t idx[], size_t vl){ return __riscv_vrgather_vv_f16m1(v, __riscv_vle16_v_u16m1(idx, vl), vl); }
+static inline vh h_bcast(vh v, int k, size_t vl){ return __riscv_vrgather_vx_f16m1(v, (size_t)k, vl); }
+static inline vh hrecip(vh v, size_t vl){ return __riscv_vfdiv_vv_f16m1(h_splat(1.0f, vl), v, vl); }
+static inline vh hfmacc(vh acc, vh a, vh b, size_t vl){ return __riscv_vfmacc_vv_f16m1(acc, a, b, vl); }
+static inline vh h_dot_bcast(vh a, vh b, size_t n){
+    vh r = __riscv_vfredusum_vs_f16m1_f16m1(__riscv_vfmul_vv_f16m1(a, b, n), h_splat(0.0f, n), n);
+    return __riscv_vrgather_vx_f16m1(r, 0, n);
 }
+/* int16<->fp16 via SEW=16 vfcvt (supported on At35 Saturn) */
+static inline void h_to_i16(int16_t *o, vh v, size_t vl){ __riscv_vse16_v_i16m1(o, __riscv_vfcvt_x_f_v_i16m1(v, vl), vl); }
+static inline vh i16_to_h(const int16_t *p, size_t vl){ return __riscv_vfcvt_f_x_v_f16m1(__riscv_vle16_v_i16m1(p, vl), vl); }
 
-/* ---- fp32 vector helpers (accumulators) ---- */
-static inline uint32_t fb(float c){ union{float f;uint32_t u;}x; x.f=c; return x.u; }
-static inline vf f_splat(float c,size_t vl){ return __riscv_vreinterpret_v_u32m1_f32m1(__riscv_vmv_v_x_u32m1(fb(c),vl)); }
-static inline vf f_splat_bits(uint32_t b,size_t vl){ return __riscv_vreinterpret_v_u32m1_f32m1(__riscv_vmv_v_x_u32m1(b,vl)); }
-static inline vf f_load(const float*p,size_t vl){ return __riscv_vle32_v_f32m1(p,vl); }
-static inline void f_store(float*p,vf v,size_t vl){ __riscv_vse32_v_f32m1(p,v,vl); }
-static inline vh f2h(vf v,size_t vl){ return __riscv_vlmul_ext_v_f16mf2_f16m1(__riscv_vfncvt_f_f_w_f16mf2(v,vl)); }
-static inline vf h2f(vh v,size_t vl){ return __riscv_vfwcvt_f_f_v_f32m1(__riscv_vlmul_trunc_v_f16m1_f16mf2(v),vl); }
-/* fp32 shuffle via gather (indices in a uint32 buffer): no scalar fp */
-static inline vf f_shuf(vf v,const uint32_t idx[4],size_t vl){ return __riscv_vrgather_vv_f32m1(v,__riscv_vle32_v_u32m1(idx,vl),vl); }
-static inline vh h_shuf(vh v,const uint16_t idx[4],size_t vl){ return __riscv_vrgather_vv_f16m1(v,__riscv_vle16_v_u16m1(idx,vl),vl); }
+/* 2^m as an fp16 bit pattern (integer; exact for -14<=m<=15). */
+static inline uint16_t pow2h(int m){ return (uint16_t)((unsigned)(15 + m) << 10); }
+/* scale by 2^m (exact power-of-2, split into 2^15 chunks when |m|>15). Works with a
+ * RUNTIME m without any scalar float (deviation (1)). Only m in [-14,+22] is used. */
+static vh hscale(vh v, int m, size_t vl){
+    while (m > 15){ v = hmul(v, h_splat_bits(pow2h(15), vl), vl); m -= 15; }   /* *2^15 */
+    while (m < -14){ v = hmul(v, h_splat_bits(pow2h(-14), vl), vl); m += 14; } /* *2^-14 (dead: min m=-14) */
+    if (m != 0) v = hmul(v, h_splat_bits(pow2h(m), vl), vl);
+    return v;
+}
+/* int64-fixed -> fp16 helper mirrors fixed_to_h's vector part: hscale(i16_to_h(hi), -Qm). */
+static inline vh fixed_h(const int16_t *hi, int negQm, size_t vl){ return hscale(i16_to_h(hi, vl), negQm, vl); }
 
-/* ---- vector-times-CONSTANT via .vv + integer-bit splat (compile-time c folds to vmv.v.x) ---- */
-static inline vh hmulc(vh v,float c,size_t vl){ return __riscv_vfmul_vv_f16m1(v,h_splat(c,vl),vl); }
-static inline vh haddc(vh v,float c,size_t vl){ return __riscv_vfadd_vv_f16m1(v,h_splat(c,vl),vl); }
-static inline vh hsubc(vh v,float c,size_t vl){ return __riscv_vfsub_vv_f16m1(v,h_splat(c,vl),vl); }
-static inline vh hminc(vh v,float c,size_t vl){ return __riscv_vfmin_vv_f16m1(v,h_splat(c,vl),vl); }
-static inline vh hrecip(vh v,size_t vl){ return __riscv_vfdiv_vv_f16m1(h_splat(1.0f,vl),v,vl); }
-static inline vf fmulc(vf v,float c,size_t vl){ return __riscv_vfmul_vv_f32m1(v,f_splat(c,vl),vl); }
-static inline vf faddc(vf v,float c,size_t vl){ return __riscv_vfadd_vv_f32m1(v,f_splat(c,vl),vl); }
-static inline vf fsubc(vf v,float c,size_t vl){ return __riscv_vfsub_vv_f32m1(v,f_splat(c,vl),vl); }
-static inline vf f_clamp(vf v,float lo,float hi,size_t vl){
-    return __riscv_vfmin_vv_f32m1(__riscv_vfmax_vv_f32m1(v,f_splat(lo,vl),vl),f_splat(hi,vl),vl); }
-
-#define GRAV 9.81f
-#define OFF_Y (-0.016f)
-#define ATAU 0.02f
-#define ZUPT 0.05f
-#define VMAXV 5.0f
+/* Q-scales + increment scales (validated in fc_i32.c) -- verbatim from the source. */
+#define Q_QUAT 30
+#define Q_VEL  28
+#define Q_RATE 25
+#define M_QUAT 18
+#define M_ALPHA 7
 #define KP 0.5f
-#define ZG 0.5f
-#define VZG 0.3f
-#ifndef LEAD
-#define LEAD 1.0f
-#endif
-#ifndef LEADA
-#define LEADA 0.5f
-#endif
-
-/* ================= estimator vector kernels ================= */
-
-/* alpha_f LP (fp32 vector): deriv=(g-wp)*invdt; alpha_f += k*(deriv-alpha_f). (orig lines 139-142) */
-void ve_af_lp(const float g_cur[3], const float w_prev[3], float alpha_f[3],
-              uint32_t k_bits, uint32_t invdt_bits){
-    size_t v3=3;
-    vf g32=f_load(g_cur,v3), wp=f_load(w_prev,v3), af=f_load(alpha_f,v3);
-    vf deriv=__riscv_vfmul_vv_f32m1(__riscv_vfsub_vv_f32m1(g32,wp,v3),f_splat_bits(invdt_bits,v3),v3);
-    af=__riscv_vfmacc_vv_f32m1(af,f_splat_bits(k_bits,v3),__riscv_vfsub_vv_f32m1(deriv,af,v3),v3);
-    f_store(alpha_f,af,v3);
-}
-
-/* |accel| (fp16) as a bit-pattern (orig lines 153,156-157) */
-uint16_t ve_amag(const float acc_corr[3]){
-    size_t v3=3;
-    vh av=f2h(f_load(acc_corr,v3),v3);
-    vh amagb=__riscv_vfsqrt_v_f16m1(h_dot_bcast(av,av,v3),v3);
-    union{_Float16 h;uint16_t u;}x; h_st1(&x.h,amagb); return x.u;
-}
-
-/* Mahony body-rate w3 = g_cur (+ KP*gate * (an x vu) when do_trim). (orig lines 153-182) */
-void ve_mahony_w3(const float acc_corr[3], const float q[4], const float g_cur[3],
-                  uint32_t kpgate_bits, int do_trim, float w3_out[3]){
-    size_t v3=3,v4=4;
-    vf w3=f_load(g_cur,v3);                                    /* body rate (fp32) for quat */
-    if (do_trim){
-        vh av=f2h(f_load(acc_corr,v3),v3);
-        vh amagb=__riscv_vfsqrt_v_f16m1(h_dot_bcast(av,av,v3),v3);
-        vh inv=hrecip(amagb,v3);
-        vh an=__riscv_vfmul_vv_f16m1(av,inv,v3);              /* normalized accel */
-        vh qh=f2h(f_load(q,v4),v4);                          /* [qw,qx,qy,qz] */
-        static const uint16_t iA[4]={1,2,1,0}, iB[4]={3,3,1,0};
-        static const uint16_t iC[4]={0,0,2,0}, iD[4]={2,1,2,0};
-        vh pA=__riscv_vfmul_vv_f16m1(h_shuf(qh,iA,v3),h_shuf(qh,iB,v3),v3); /* [qxqz,qyqz,qx^2] */
-        vh pC=__riscv_vfmul_vv_f16m1(h_shuf(qh,iC,v3),h_shuf(qh,iD,v3),v3); /* [qwqy,qwqx,qy^2] */
-        static const _Float16 sgn[4]={(_Float16)-1,(_Float16)1,(_Float16)1,0};
-        static const _Float16 mul[4]={(_Float16)2,(_Float16)2,(_Float16)-2,0};
-        static const _Float16 add[4]={(_Float16)0,(_Float16)0,(_Float16)1,0};
-        vh t=__riscv_vfmacc_vv_f16m1(pA,pC,h_load(sgn,v3),v3);            /* pA + sgn*pC */
-        vh vu=__riscv_vfmacc_vv_f16m1(h_load(add,v3),t,h_load(mul,v3),v3);/* t*mul + add */
-        static const uint16_t c1[4]={1,2,0,0}, c2[4]={2,0,1,0};
-        vh e=__riscv_vfsub_vv_f16m1(__riscv_vfmul_vv_f16m1(h_shuf(an,c1,v3),h_shuf(vu,c2,v3),v3),
-                                    __riscv_vfmul_vv_f16m1(h_shuf(an,c2,v3),h_shuf(vu,c1,v3),v3),v3);
-        w3=__riscv_vfmacc_vv_f32m1(w3,f_splat_bits(kpgate_bits,v3),h2f(e,v3),v3); /* w3 += KP*gate*e */
-    }
-    f_store(w3_out,w3,v3);
-}
-
-/* quaternion integrate + normalize (fp32 vector). step_bits = dt (or lead ha) as fp32 bits;
- * the 0.5 half-step is applied via a compile-time vector multiply. (orig lines 100-123) */
-void ve_quat_integrate(float q[4], const float w3_arr[3], uint32_t step_bits){
-    size_t v4=4,v3=3;
-    vf w3=f_load(w3_arr,v3);
-    vf vq=f_load(q,v4);
-    static const uint32_t p0[4]={1,0,3,2}; static const float s0[4]={-1,1,1,-1};
-    static const uint32_t p1[4]={2,3,0,1}; static const float s1[4]={-1,-1,1,1};
-    static const uint32_t p2[4]={3,2,1,0}; static const float s2[4]={-1,1,-1,1};
-    vf a0=__riscv_vfmul_vv_f32m1(f_shuf(vq,p0,v4),f_load(s0,v4),v4);
-    vf a1=__riscv_vfmul_vv_f32m1(f_shuf(vq,p1,v4),f_load(s1,v4),v4);
-    vf a2=__riscv_vfmul_vv_f32m1(f_shuf(vq,p2,v4),f_load(s2,v4),v4);
-    vf dq=__riscv_vfmul_vv_f32m1(a0,__riscv_vrgather_vx_f32m1(w3,0,v4),v4);
-    dq=__riscv_vfmacc_vv_f32m1(dq,a1,__riscv_vrgather_vx_f32m1(w3,1,v4),v4);
-    dq=__riscv_vfmacc_vv_f32m1(dq,a2,__riscv_vrgather_vx_f32m1(w3,2,v4),v4);
-    /* q += 0.5*step*dq : half = step*0.5 (single mul, == scalar 0.5*step) */
-    vf half=__riscv_vfmul_vv_f32m1(f_splat_bits(step_bits,v4),f_splat(0.5f,v4),v4);
-    vq=__riscv_vfmacc_vv_f32m1(vq,dq,half,v4);
-    vf sq=__riscv_vfmul_vv_f32m1(vq,vq,v4);
-    vf n2=__riscv_vfredusum_vs_f32m1_f32m1(sq,f_splat(0.0f,v4),v4);
-    vf inv=__riscv_vfdiv_vv_f32m1(f_splat(1.0f,1),__riscv_vfsqrt_v_f32m1(n2,1),1);
-    vf invb=__riscv_vrgather_vx_f32m1(inv,0,v4);
-    vq=__riscv_vfmul_vv_f32m1(vq,invb,v4);
-    f_store(q,vq,v4);
-}
-
-/* rotation matrix (fp16) + world accel (fp32) + body->world flow velocity (fp16).
- * (orig lines 185-224). R lane0 elements are stored via vse16(vl=1) into a stack array,
- * then the columns/2x2 block are gathered with indexed vector loads -> no scalar fp16. */
-void ve_rot_wa_flow(const float q[4], const float acc_corr[3], const _Float16 flow_f16[2],
-                    float aw_out[3], float vf01_out[2], uint16_t *r8_bits_out){
-    size_t v3=3,v4=4,v2=2;
-    vh q16=f2h(f_load(q,v4),v4);
-    vh qx_=h_bcast_lane(q16,1,v4), qy_=h_bcast_lane(q16,2,v4), qz_=h_bcast_lane(q16,3,v4), qw_=h_bcast_lane(q16,0,v4);
-    vh two=h_splat(2.0f,v4), one=h_splat(1.0f,v4);
-    vh qxx=__riscv_vfmul_vv_f16m1(qx_,qx_,v4), qyy=__riscv_vfmul_vv_f16m1(qy_,qy_,v4), qzz=__riscv_vfmul_vv_f16m1(qz_,qz_,v4);
-    _Float16 R[9];
-    h_st1(&R[0],__riscv_vfnmsac_vv_f16m1(one,two,__riscv_vfadd_vv_f16m1(qyy,qzz,v4),v4));
-    h_st1(&R[4],__riscv_vfnmsac_vv_f16m1(one,two,__riscv_vfadd_vv_f16m1(qxx,qzz,v4),v4));
-    h_st1(&R[8],__riscv_vfnmsac_vv_f16m1(one,two,__riscv_vfadd_vv_f16m1(qxx,qyy,v4),v4));
-    {
-      vh xy=__riscv_vfmul_vv_f16m1(qx_,qy_,v4), wz=__riscv_vfmul_vv_f16m1(qw_,qz_,v4);
-      vh xz=__riscv_vfmul_vv_f16m1(qx_,qz_,v4), wy=__riscv_vfmul_vv_f16m1(qw_,qy_,v4);
-      vh yz=__riscv_vfmul_vv_f16m1(qy_,qz_,v4), wx=__riscv_vfmul_vv_f16m1(qw_,qx_,v4);
-      h_st1(&R[1],__riscv_vfmul_vv_f16m1(two,__riscv_vfsub_vv_f16m1(xy,wz,v4),v4));
-      h_st1(&R[2],__riscv_vfmul_vv_f16m1(two,__riscv_vfadd_vv_f16m1(xz,wy,v4),v4));
-      h_st1(&R[3],__riscv_vfmul_vv_f16m1(two,__riscv_vfadd_vv_f16m1(xy,wz,v4),v4));
-      h_st1(&R[5],__riscv_vfmul_vv_f16m1(two,__riscv_vfsub_vv_f16m1(yz,wx,v4),v4));
-      h_st1(&R[6],__riscv_vfmul_vv_f16m1(two,__riscv_vfsub_vv_f16m1(xz,wy,v4),v4));
-      h_st1(&R[7],__riscv_vfmul_vv_f16m1(two,__riscv_vfadd_vv_f16m1(yz,wx,v4),v4));
-    }
-    { union{_Float16 h;uint16_t u;}x; x.h=R[8]; *r8_bits_out=x.u; }   /* fp16 load(lh)+store, integer -- no scalar fp */
-
-    /* world accel = R*a (columns via indexed load) - gravity, integrate large-large in fp32 */
-    vh av=f2h(f_load(acc_corr,v3),v3);
-    static const uint16_t iCol0[4]={0,6,12,0}, iCol1[4]={2,8,14,0}, iCol2[4]={4,10,16,0}; /* byte offsets of R cols */
-    vh Rc0=__riscv_vluxei16_v_f16m1(R,__riscv_vle16_v_u16m1(iCol0,v3),v3);
-    vh Rc1=__riscv_vluxei16_v_f16m1(R,__riscv_vle16_v_u16m1(iCol1,v3),v3);
-    vh Rc2=__riscv_vluxei16_v_f16m1(R,__riscv_vle16_v_u16m1(iCol2,v3),v3);
-    vh awv=__riscv_vfmul_vv_f16m1(Rc0,h_bcast_lane(av,0,v3),v3);
-    awv=__riscv_vfmacc_vv_f16m1(awv,Rc1,h_bcast_lane(av,1,v3),v3);
-    awv=__riscv_vfmacc_vv_f16m1(awv,Rc2,h_bcast_lane(av,2,v3),v3);
-    static const float gsub[4]={0.0f,0.0f,GRAV,0.0f};
-    vf aw32=__riscv_vfsub_vv_f32m1(h2f(awv,v3),f_load(gsub,v3),v3);
-    f_store(aw_out,aw32,v3);
-
-    /* body->world flow velocity: [dot([R0,R1],flow), dot([R3,R4],flow)] (fp16) -> fp32.
-     * f0=[R0,R1] bytes [0,2]; f1=[R3,R4] bytes [6,8]. Assemble [d0,d1] via slideup (no scalar). */
-    static const uint16_t if0[4]={0,2,0,0}, if1[4]={6,8,0,0};
-    vh fvv=h_load(flow_f16,v2);
-    vh f0=__riscv_vluxei16_v_f16m1(R,__riscv_vle16_v_u16m1(if0,v2),v2);
-    vh f1=__riscv_vluxei16_v_f16m1(R,__riscv_vle16_v_u16m1(if1,v2),v2);
-    vh d0=h_dot_bcast(f0,fvv,v2), d1=h_dot_bcast(f1,fvv,v2);
-    vh vf01=__riscv_vslideup_vx_f16m1(d0,d1,1,v2);              /* [d0, d1] */
-    f_store(vf01_out,h2f(vf01,v2),v2);
-}
-
-/* vvel = vel + aw*dt (fp32 vector FMA). (orig line 216) */
-void ve_vel_predict(const float vel[3], const float aw[3], uint32_t dt_bits, float vvel_out[3]){
-    size_t v3=3;
-    f_store(vvel_out,__riscv_vfmacc_vv_f32m1(f_load(vel,v3),f_load(aw,v3),f_splat_bits(dt_bits,v3),v3),v3);
-}
-
-/* horizontal-velocity backstop clamp (fp32 vector, +-VMAXV). (orig line 230) */
-void ve_clampV(float v[3]){ size_t v3=3; f_store(v,f_clamp(f_load(v,v3),-VMAXV,VMAXV,v3),v3); }
-
-/* pos += vvel*dt (fp32 vector FMA). (orig line 233) */
-void ve_pos_integrate(float pos[3], const float vvel[3], uint32_t dt_bits){
-    size_t v3=3;
-    f_store(pos,__riscv_vfmacc_vv_f32m1(f_load(pos,v3),f_load(vvel,v3),f_splat_bits(dt_bits,v3),v3),v3);
-}
-
-/* get_state lead (fp32 vector FMA): so_pos=pos+vel*hl ; so_vel=vel+aw*hl. (orig lines 244,246) */
-void ve_lead_out(const float pos[3], const float vel[3], const float aw[3],
-                 uint32_t hl_bits, float so_pos[3], float so_vel[3]){
-    size_t v3=3;
-    vf vhl=f_splat_bits(hl_bits,v3);
-    vf vel_v=f_load(vel,v3);
-    f_store(so_pos,__riscv_vfmacc_vv_f32m1(f_load(pos,v3),vel_v,vhl,v3),v3);
-    f_store(so_vel,__riscv_vfmacc_vv_f32m1(vel_v,f_load(aw,v3),vhl,v3),v3);
-}
-
-/* ================= controller vector kernels ================= */
-#define NF 2.0f
-#define VTC 0.5f
-#define VIM 2.0f
-#define VTM 0.26f
-#define TR 0.10f
-#define TY 0.25f
-#define TRR 0.025f
-#define TYR 0.05f
 #define J0 16e-6f
 #define J1 16e-6f
 #define J2 29e-6f
@@ -248,72 +86,166 @@ void ve_lead_out(const float pos[3], const float vel[3], const float aw[3],
 #ifndef FCLAMP
 #define FCLAMP 600.0f
 #endif
+#define TR 0.10f
+#define TY 0.25f
+#define TRR 0.025f
+#define TYR 0.05f
 
-/* cos via fp16 polynomial (vector): 1 - x^2/2 + x^4/24 for the two angles. (orig lines 283-290) */
-void vc_cos2(const _Float16 rp_f16[2], float cr_cp_out[2]){
-    size_t v2=2;
-    vh x=h_load(rp_f16,v2); vh x2=__riscv_vfmul_vv_f16m1(x,x,v2);
-    vh x4=__riscv_vfmul_vv_f16m1(x2,x2,v2);
-    vh c=__riscv_vfadd_vv_f16m1(__riscv_vfsub_vv_f16m1(h_splat(1.0f,v2),hmulc(x2,0.5f,v2),v2),
-                                hmulc(x4,1.0f/24.0f,v2),v2);
-    f_store(cr_cp_out,h2f(c,v2),v2);
+/* ================= estimate vector blocks ================= */
+
+void ve_alpha_inc(int16_t *inc_i16, const _Float16 *gv, const int16_t *wprev_i16,
+                  const int16_t *alpha_i16, uint16_t invdt_bits, uint16_t k_bits, int n){
+    size_t vl = (size_t)n;
+    vh g = h_load(gv, vl);
+    vh wp = fixed_h(wprev_i16, -10, vl);
+    vh af = fixed_h(alpha_i16, -10, vl);
+    vh deriv = hmul(hsub(g, wp, vl), h_splat_bits(invdt_bits, vl), vl);
+    vh inc = hmul(hsub(deriv, af, vl), h_splat_bits(k_bits, vl), vl);
+    h_to_i16(inc_i16, hscale(inc, M_ALPHA, vl), vl);
 }
 
-/* horizontal velocity loop (fp32 vector, length-2) + clamp + slew -> desRP. (orig lines 318-333) */
-void vc_velloop(const float desV[2], const float vv[2], float vel_int[2],
-                uint32_t kivdt_bits, int grounded, const float prev[2],
-                uint32_t dmax_bits, float desRP_out[2]){
-    size_t n2=2;
-    vf e=__riscv_vfsub_vv_f32m1(f_load(desV,n2),f_load(vv,n2),n2);            /* desVel - estVel */
-    vf viv = grounded ? f_splat(0.0f,n2)
-                      : f_clamp(__riscv_vfmacc_vv_f32m1(f_load(vel_int,n2),f_splat_bits(kivdt_bits,n2),e,n2),-VIM,VIM,n2);
-    f_store(vel_int,viv,n2);
-    vf desAcc=__riscv_vfmacc_vv_f32m1(viv,f_splat(1.0f/VTC,n2),e,n2);          /* (1/VTC)*e + vel_int */
-    static const uint32_t sw[4]={1,0,0,0}; static const float sc[2]={-1.0f/GRAV,1.0f/GRAV};
-    vf desRP=f_clamp(__riscv_vfmul_vv_f32m1(f_shuf(desAcc,sw,n2),f_load(sc,n2),n2),-VTM,VTM,n2); /* [-dA2,dA1]/g */
-    vf pv=f_load(prev,n2);
-    vf dmax=f_splat_bits(dmax_bits,n2);
-    desRP=__riscv_vfmin_vv_f32m1(__riscv_vfmax_vv_f32m1(desRP,__riscv_vfsub_vv_f32m1(pv,dmax,n2),n2),
-                                 __riscv_vfadd_vv_f32m1(pv,dmax,n2),n2);       /* slew */
-    f_store(desRP_out,desRP,n2);
+void ve_lever_pr(_Float16 *pr_out, _Float16 *al_out, const _Float16 *gv, const int16_t *alpha_i16){
+    size_t v3 = 3, v4 = 4;
+    static const uint16_t gi[4] = {0,1,2,2}, hi[4] = {1,2,0,2};   /* [gx,gy,gz,gz]*[gy,gz,gx,gz] */
+    vh g = h_load(gv, v4);                                        /* gv[3]==0 (glue pads) */
+    vh al = fixed_h(alpha_i16, -10, v3);
+    vh pr = hmul(hshuf(g, gi, v4), hshuf(g, hi, v4), v4);
+    h_store(pr_out, pr, v4);
+    h_store(al_out, al, v3);
 }
 
-/* mixer-output ctrl [c0..c3] (fp16) -> u_out[4] (perm + scale + force->duty incl vfsqrt + clamps).
- * (orig f2v4, lines 293-304) */
-static void f2v4(vh ctrl, float u_out[4]){
-    size_t v4=4;
-    static const uint16_t perm[4]={1,2,3,0};
-    static const _Float16 scl[4]={(_Float16)0.9f,(_Float16)0.9f,(_Float16)(0.9f*0.87f),(_Float16)(0.9f*0.87f)};
-    vh in=__riscv_vfmul_vv_f16m1(h_shuf(ctrl,perm,v4),h_load(scl,v4),v4);
-    in=__riscv_vfmax_vv_f16m1(in,h_splat(0.0f,v4),v4);                 /* force<0 -> 0 */
-    vh t=hminc(hmulc(in,GPN*MOT/PROP,v4),FCLAMP,v4);
-    vh disc=hminc(haddc(hmulc(t,4.0f*TA,v4),TB*TB,v4),60000.0f,v4);    /* fp16 overflow guard */
-    vh d=hmulc(hsubc(__riscv_vfsqrt_v_f16m1(disc,v4),TB,v4),1.0f/(2.0f*TA),v4);
-    d=__riscv_vfmax_vv_f16m1(__riscv_vfmin_vv_f16m1(d,h_splat(1.0f,v4),v4),h_splat(0.0f,v4),v4); /* duty in [0,1] */
-    f_store(u_out,h2f(hsubc(d,0.583f,v4),v4),v4);                      /* -0.583 -> normalized-thrust */
+void ve_av_sub(_Float16 *av_io, const _Float16 *cc, int n){
+    size_t vl = (size_t)n;
+    h_store(av_io, hsub(h_load(av_io, vl), h_load(cc, vl), vl), vl);
 }
 
-/* attitude + rate loops (3-lane fp16), 4x4 mixer, force->duty. (orig lines 336-361) */
-void vc_attitude(const float state[12], const float tgt3_f32[3], uint16_t u0_f16bits, float u_out[4]){
-    size_t v3n=3, v4=4;
-    vh est3=f2h(f_load(state+3,v3n),v3n);             /* [estRoll,estPitch,estYaw] */
-    vh tgt3=f2h(f_load(tgt3_f32,v3n),v3n);            /* [desRoll,desPitch,yawTgt] */
-    static const _Float16 tauA[4]={(_Float16)(-1.0f/TR),(_Float16)(-1.0f/TR),(_Float16)(-1.0f/TY),0};
-    static const _Float16 tauB[4]={(_Float16)(-1.0f/TRR),(_Float16)(-1.0f/TRR),(_Float16)(-1.0f/TYR),0};
-    vh ratetgt=__riscv_vfmul_vv_f16m1(__riscv_vfsub_vv_f16m1(est3,tgt3,v3n),h_load(tauA,v3n),v3n);
-    vh g3=f2h(f_load(state+9,v3n),v3n);
-    vh cmd=__riscv_vfmul_vv_f16m1(__riscv_vfsub_vv_f16m1(g3,ratetgt,v3n),h_load(tauB,v3n),v3n);
-    /* u = [desNorm*MASS, rc*J0, pc*J1, yc*J2]; prepend u0 to (cmd*J) via slideup (no scalar fp16) */
-    static const _Float16 Jv[4]={(_Float16)J0,(_Float16)J1,(_Float16)J2,0};
-    vh utv=__riscv_vfmul_vv_f16m1(cmd,h_load(Jv,v3n),v3n);
-    vh u=__riscv_vslideup_vx_f16m1(h_splat_bits(u0_f16bits,v4),utv,1,v4);   /* [u0, rc*J0, pc*J1, yc*J2] */
-    static const _Float16 Mc0[4]={(_Float16)0.25f,(_Float16)0.25f,(_Float16)0.25f,(_Float16)0.25f};
-    static const _Float16 Mc1[4]={(_Float16)(0.25f/LARM),(_Float16)(-0.25f/LARM),(_Float16)(-0.25f/LARM),(_Float16)(0.25f/LARM)};
-    static const _Float16 Mc2[4]={(_Float16)(-0.25f/LARM),(_Float16)(-0.25f/LARM),(_Float16)(0.25f/LARM),(_Float16)(0.25f/LARM)};
-    static const _Float16 Mc3[4]={(_Float16)(0.25f/KDRAG),(_Float16)(-0.25f/KDRAG),(_Float16)(0.25f/KDRAG),(_Float16)(-0.25f/KDRAG)};
-    vh ctrl=__riscv_vfmul_vv_f16m1(h_load(Mc0,v4),h_bcast_lane(u,0,v4),v4);
-    ctrl=__riscv_vfmacc_vv_f16m1(ctrl,h_load(Mc1,v4),h_bcast_lane(u,1,v4),v4);
-    ctrl=__riscv_vfmacc_vv_f16m1(ctrl,h_load(Mc2,v4),h_bcast_lane(u,2,v4),v4);
-    ctrl=__riscv_vfmacc_vv_f16m1(ctrl,h_load(Mc3,v4),h_bcast_lane(u,3,v4),v4);
-    f2v4(ctrl,u_out);
+void ve_mahony(_Float16 *w3_out, const _Float16 *av_p, const int16_t *q_i16, const _Float16 *gv, int n){
+    size_t v3 = (size_t)n, v4 = 4;
+    vh av = h_load(av_p, v3);
+    vh qh = fixed_h(q_i16, -14, v4);
+    vh w3 = h_load(gv, v3);
+    vh amag = hsqrt(h_dot_bcast(av, av, v3), v3);
+    vh d = habs(hsubc(amag, 9.81f, v3), v3);
+    vh gate = hmaxc(haddc(hmulc(d, -1.0f/(0.5f*9.81f), v3), 1.0f, v3), 0.0f, v3);
+    vh inv = hrecip(hmaxc(amag, 1e-3f, v3), v3);
+    vh an = hmul(av, inv, v3);
+    static const uint16_t iA[4] = {1,2,1,0}, iB[4] = {3,3,1,0}, iC[4] = {0,0,2,0}, iD[4] = {2,1,2,0};
+    vh pA = hmul(hshuf(qh, iA, v3), hshuf(qh, iB, v3), v3);
+    vh pC = hmul(hshuf(qh, iC, v3), hshuf(qh, iD, v3), v3);
+    static const _Float16 sg[4] = {(_Float16)-1,(_Float16)1,(_Float16)1,0};
+    static const _Float16 ml[4] = {(_Float16)2,(_Float16)2,(_Float16)-2,0};
+    static const _Float16 ad[4] = {(_Float16)0,(_Float16)0,(_Float16)1,0};
+    vh t = hfmacc(pA, pC, h_load(sg, v3), v3);
+    vh vu = hfmacc(h_load(ad, v3), t, h_load(ml, v3), v3);
+    static const uint16_t c1[4] = {1,2,0,0}, c2[4] = {2,0,1,0};
+    vh e = hsub(hmul(hshuf(an, c1, v3), hshuf(vu, c2, v3), v3), hmul(hshuf(an, c2, v3), hshuf(vu, c1, v3), v3), v3);
+    w3 = hfmacc(w3, hmulc(e, KP, v3), gate, v3);
+    h_store(w3_out, w3, v3);
+}
+
+void ve_quat_dq_i16(int16_t *dq_i16, const int16_t *q_i16, const _Float16 *w3p,
+                    uint16_t halfdt_bits, int n){
+    size_t v4 = (size_t)n;
+    vh qh = fixed_h(q_i16, -14, v4);
+    vh w3 = h_load(w3p, v4);                                      /* w3p[3]==0 (glue pads) */
+    static const uint16_t p0[4] = {1,0,3,2}, p1[4] = {2,3,0,1}, p2[4] = {3,2,1,0};
+    static const _Float16 s0[4] = {(_Float16)-1,(_Float16)1,(_Float16)1,(_Float16)-1};
+    static const _Float16 s1[4] = {(_Float16)-1,(_Float16)-1,(_Float16)1,(_Float16)1};
+    static const _Float16 s2[4] = {(_Float16)-1,(_Float16)1,(_Float16)-1,(_Float16)1};
+    vh a0 = hmul(hshuf(qh, p0, v4), h_load(s0, v4), v4);
+    vh a1 = hmul(hshuf(qh, p1, v4), h_load(s1, v4), v4);
+    vh a2 = hmul(hshuf(qh, p2, v4), h_load(s2, v4), v4);
+    vh dq = hmul(a0, h_bcast(w3, 0, v4), v4);
+    dq = hfmacc(dq, a1, h_bcast(w3, 1, v4), v4);
+    dq = hfmacc(dq, a2, h_bcast(w3, 2, v4), v4);
+    dq = hmul(dq, h_splat_bits(halfdt_bits, v4), v4);
+    h_to_i16(dq_i16, hscale(dq, M_QUAT, v4), v4);
+}
+
+void ve_quat_inv_i16(int16_t *invi, const int16_t *n16){
+    vh inv = hrecip(hsqrt(hscale(i16_to_h(n16, 1), -14, 1), 1), 1);
+    h_to_i16(invi, hscale(inv, 14, 1), 1);
+}
+
+void ve_rotmat(_Float16 *R, const int16_t *q_i16){
+    size_t v4 = 4;
+    vh q = fixed_h(q_i16, -14, v4);
+    vh qx_ = h_bcast(q, 1, v4), qy_ = h_bcast(q, 2, v4), qz_ = h_bcast(q, 3, v4), qw_ = h_bcast(q, 0, v4);
+    vh two = h_splat(2.0f, v4), one = h_splat(1.0f, v4);
+    vh qxx = hmul(qx_, qx_, v4), qyy = hmul(qy_, qy_, v4), qzz = hmul(qz_, qz_, v4);
+    hstore1(&R[0], __riscv_vfnmsac_vv_f16m1(one, two, hadd(qyy, qzz, v4), v4));
+    hstore1(&R[4], __riscv_vfnmsac_vv_f16m1(one, two, hadd(qxx, qzz, v4), v4));
+    hstore1(&R[8], __riscv_vfnmsac_vv_f16m1(one, two, hadd(qxx, qyy, v4), v4));
+    { vh xy = hmul(qx_, qy_, v4), wz = hmul(qw_, qz_, v4), xz = hmul(qx_, qz_, v4),
+         wy = hmul(qw_, qy_, v4), yz = hmul(qy_, qz_, v4), wx = hmul(qw_, qx_, v4);
+      hstore1(&R[1], hmul(two, hsub(xy, wz, v4), v4)); hstore1(&R[2], hmul(two, hadd(xz, wy, v4), v4));
+      hstore1(&R[3], hmul(two, hadd(xy, wz, v4), v4)); hstore1(&R[5], hmul(two, hsub(yz, wx, v4), v4));
+      hstore1(&R[6], hmul(two, hsub(xz, wy, v4), v4)); hstore1(&R[7], hmul(two, hadd(yz, wx, v4), v4)); }
+}
+
+void ve_h_scale_to_i16(int16_t *out, const _Float16 *in, int m, int n){
+    size_t i = 0, rem = (size_t)n;
+    while (rem > 0){ size_t vl = __riscv_vsetvl_e16m1(rem); h_to_i16(out + i, hscale(h_load(in + i, vl), m, vl), vl); i += vl; rem -= vl; }
+}
+
+void ve_rflow_i16(int16_t *out_i16, const _Float16 *rrow, const _Float16 *fv){
+    size_t v2 = 2;
+    h_to_i16(out_i16, hscale(h_dot_bcast(h_load(rrow, v2), h_load(fv, v2), v2), Q_VEL - 16, 1), 1);
+}
+
+/* ================= control vector blocks ================= */
+
+void vc_cos2(_Float16 *cr_cp, uint16_t roll_bits, uint16_t pitch_bits){
+    size_t v2 = 2;
+    uint16_t xbits[2] = { roll_bits, pitch_bits };   /* integer moves (no scalar flh/fsh) */
+    vh x = __riscv_vreinterpret_v_u16m1_f16m1(__riscv_vle16_v_u16m1(xbits, v2));
+    vh x2 = hmul(x, x, v2), x4 = hmul(x2, x2, v2);
+    vh cc = hadd(hsub(h_splat(1.0f, v2), hmulc(x2, 0.5f, v2), v2), hmulc(x4, 1.0f/24.0f, v2), v2);
+    h_store(cr_cp, cc, v2);
+}
+
+void vc_inc(int16_t *inc_i16, const uint16_t *a_bits, const uint16_t *b_bits, int m, int n){
+    /* a is a fp16 vector (n lanes) passed as bit patterns; b is a single splat constant. */
+    size_t vl = (size_t)n;
+    vh a = __riscv_vreinterpret_v_u16m1_f16m1(__riscv_vle16_v_u16m1(a_bits, vl));
+    vh inc = hmul(a, h_splat_bits(b_bits[0], vl), vl);
+    h_to_i16(inc_i16, hscale(inc, m, vl), vl);
+}
+
+void vc_attitude(_Float16 *cm_out, const _Float16 *est3, const _Float16 *tgt3, const _Float16 *g3){
+    size_t v3 = 3;
+    static const _Float16 tauA[4] = {(_Float16)(-1.0f/TR),(_Float16)(-1.0f/TR),(_Float16)(-1.0f/TY),0};
+    static const _Float16 tauB[4] = {(_Float16)(-1.0f/TRR),(_Float16)(-1.0f/TRR),(_Float16)(-1.0f/TYR),0};
+    vh ratetgt = hmul(hsub(h_load(est3, v3), h_load(tgt3, v3), v3), h_load(tauA, v3), v3);
+    vh cmd = hmul(hsub(h_load(g3, v3), ratetgt, v3), h_load(tauB, v3), v3);
+    h_store(cm_out, cmd, v3);
+}
+
+void vc_mixer_force(_Float16 *u_out, const _Float16 *cm_p, uint16_t desnormmass_bits){
+    size_t v3 = 3, v4 = 4;
+    vh cmd = h_load(cm_p, v3);
+    static const _Float16 Jv[4] = {(_Float16)J0,(_Float16)J1,(_Float16)J2,0};
+    /* ut = cm*J as uint16 bit patterns (vector store); ub built by integer moves -> u vector. */
+    uint16_t ut_bits[4], ub_bits[4];
+    __riscv_vse16_v_u16m1(ut_bits, __riscv_vreinterpret_v_f16m1_u16m1(hmul(cmd, h_load(Jv, v3), v3)), v3);
+    ub_bits[0] = desnormmass_bits; ub_bits[1] = ut_bits[0]; ub_bits[2] = ut_bits[1]; ub_bits[3] = ut_bits[2];
+    vh u = __riscv_vreinterpret_v_u16m1_f16m1(__riscv_vle16_v_u16m1(ub_bits, v4));
+    static const _Float16 Mc0[4] = {(_Float16)0.25f,(_Float16)0.25f,(_Float16)0.25f,(_Float16)0.25f};
+    static const _Float16 Mc1[4] = {(_Float16)(0.25f/LARM),(_Float16)(-0.25f/LARM),(_Float16)(-0.25f/LARM),(_Float16)(0.25f/LARM)};
+    static const _Float16 Mc2[4] = {(_Float16)(-0.25f/LARM),(_Float16)(-0.25f/LARM),(_Float16)(0.25f/LARM),(_Float16)(0.25f/LARM)};
+    static const _Float16 Mc3[4] = {(_Float16)(0.25f/KDRAG),(_Float16)(-0.25f/KDRAG),(_Float16)(0.25f/KDRAG),(_Float16)(-0.25f/KDRAG)};
+    vh ctrl = hmul(h_load(Mc0, v4), h_bcast(u, 0, v4), v4);
+    ctrl = hfmacc(ctrl, h_load(Mc1, v4), h_bcast(u, 1, v4), v4);
+    ctrl = hfmacc(ctrl, h_load(Mc2, v4), h_bcast(u, 2, v4), v4);
+    ctrl = hfmacc(ctrl, h_load(Mc3, v4), h_bcast(u, 3, v4), v4);
+    static const uint16_t perm[4] = {1,2,3,0};
+    static const _Float16 scl[4] = {(_Float16)0.9f,(_Float16)0.9f,(_Float16)(0.9f*0.87f),(_Float16)(0.9f*0.87f)};
+    vh in = hmul(hshuf(ctrl, perm, v4), h_load(scl, v4), v4);
+    in = __riscv_vfmax_vv_f16m1(in, h_splat(0.0f, v4), v4);
+    vh tt = hminc(hmulc(in, GPN*MOT/PROP, v4), FCLAMP, v4);
+    vh disc = hminc(haddc(hmulc(tt, 4.0f*TA, v4), TB*TB, v4), 60000.0f, v4);
+    vh dd = hmulc(hsubc(hsqrt(disc, v4), TB, v4), 1.0f/(2.0f*TA), v4);
+    dd = __riscv_vfmax_vv_f16m1(__riscv_vfmin_vv_f16m1(dd, h_splat(1.0f, v4), v4), h_splat(0.0f, v4), v4);
+    dd = hsubc(dd, 0.583f, v4);
+    h_store(u_out, dd, v4);
 }

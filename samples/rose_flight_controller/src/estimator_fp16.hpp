@@ -41,7 +41,7 @@ public:
 		for (int i = 0; i < EST_NSTATES; i++) state[i] = state_[i];
 	}
 
-	const char *name() const override { return "fp16(Zvfh)+fp32 complementary"; }
+	const char *name() const override { return "fp16(Zvfh)+int-accum complementary"; }
 
 private:
 	kfc_state k_;

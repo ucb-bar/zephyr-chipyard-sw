@@ -1,14 +1,12 @@
 /*
- * Production fp16 flight-controller kernels (RVV Zvfh).
+ * Production fp16 flight-controller kernels for the fp16-vector-ONLY Saturn (At35 bitstream).
  *
- * fp16 (Zvfh vector) for the instantaneous algebra; fp32 (native vector, vfLen=64 on this Saturn
- * core — confirmed) for the drift-sensitive accumulators. All floating math is VECTOR (fp16 or
- * fp32) or integer — NO scalar FP instruction is emitted, so it is safe on the misa.F=0 core
- * (scalar F/D trap; scalar float in C would only be soft-float libcalls). Saturation clamps guard
- * the fp16 mixer/force path against overflow->NaN.
+ * Instantaneous ALGEBRA in fp16 vector (Zvfh); drift-sensitive ACCUMULATORS in int fixed-point
+ * (int64) so they run on a core that has NO fp32-vector and NO fp16<->fp32 converts. The gravity
+ * chain (R*a - g -> vel -> pos) is entirely integer. fp16<->int crossings use only the SEW=16
+ * vfcvt.x.f / vfcvt.f.x converts. Precision validated in fc_i32.c (~fp32 quality). See fp16_fc_kernels.c.
  *
- * Same interface as the harness fc.h AND wrapped by the FC's IStateEstimator/IController classes,
- * so the identical kernels are validated off-board and deployed on-target.
+ * Same interface as the harness fc.h AND wrapped by the FC's IStateEstimator/IController classes.
  */
 #ifndef FP16_FC_KERNELS_H
 #define FP16_FC_KERNELS_H
@@ -17,20 +15,22 @@
 #define KEST_NSTATES 12
 #define KCTRL_NACTIONS 4
 
+/* int fixed-point accumulators (Q-scales in the .c): quat Q30, vel Q28, pos Q27, alpha Q25,
+ * alt_int Q29, vel_int Q30, tilt slew Q31, gyro-prev Q25. Transient carries (g_cur/aw/dt) are
+ * plain copies/loads (no fp arithmetic on them at the target). */
 typedef struct {
-    /* fp32 accumulators (drift-sensitive; kept out of fp16) */
-    float q[4];          /* Mahony quaternion (body->world) */
-    float vel[3];        /* world velocity */
-    float pos[3];        /* world position */
-    float alpha_f[3];    /* gyro-derivative LP (lever-arm) */
-    float w_prev[3];
-    float alt_int, vel_int_1, vel_int_2;
-    float desRoll_prev, desPitch_prev;
-    /* carried between estimate() and get_state within a tick */
-    float g_cur[3];      /* last gyro (body rates) */
-    float aw[3];         /* last world accel */
-    float dt_last;
-    int   have_wprev;
+    int64_t q[4];          /* quaternion, Q30 */
+    int64_t vel[3];        /* world velocity, Q28 */
+    int64_t pos[3];        /* world position, Q27 */
+    int64_t alpha[3];      /* gyro-derivative LP, Q25 */
+    int64_t wprev[3];      /* previous gyro, Q25 */
+    int64_t alt_int;       /* altitude integrator, Q29 */
+    int64_t vel_int[2];    /* velocity integrators, Q30 */
+    int64_t desprev[2];    /* tilt slew memory, Q31 */
+    float   g_cur[3];      /* last gyro (body rates) — copied to state_out */
+    float   aw[3];         /* last world accel (for the lead) */
+    float   dt_last;
+    int     have_wprev;
 } kfc_state;
 
 void kfc_init(kfc_state *s, float x0, float y0, float z0);

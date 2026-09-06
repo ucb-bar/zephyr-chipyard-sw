@@ -152,7 +152,12 @@ if(ROSE_USE_FP16)
   target_sources(app PRIVATE
     ${FC}/src/fp16_fc_kernels.c
     ${FC}/src/fp16_fc_glue.c)
-  set(FP16_VEC_CFLAGS "-march=rv64imac_zve64x_zvfh;-mabi=lp64")
+  # -fno-tree-vectorize is REQUIRED on the fp16 vector TU: without it gcc auto-
+  # vectorizes the scalar boundary/int<->fp16 converts into vfncvt.f.f.w / vfwcvt.f.f.v,
+  # which are BLOCKED (illegal-instr) on the fp16-only At35 Saturn. a1198297's int-accum
+  # kernel is hand-vectorized with only the At35-supported ops; this flag stops gcc from
+  # re-introducing the blocked ones (objdump-verified 0 blocked ops).
+  set(FP16_VEC_CFLAGS "-march=rv64imac_zve64x_zvfh;-mabi=lp64;-fno-tree-vectorize")
   set_source_files_properties(${FC}/src/fp16_fc_kernels.c PROPERTIES
     COMPILE_OPTIONS "${FP16_VEC_CFLAGS}")
   message(STATUS "rose_fc_dronet fp16_fc_kernels.c (Zvfh) cflags=${FP16_VEC_CFLAGS}")

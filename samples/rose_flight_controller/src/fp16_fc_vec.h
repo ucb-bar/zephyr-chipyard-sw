@@ -1,63 +1,56 @@
 /*
- * Copyright (c) 2026 UC Berkeley
- * SPDX-License-Identifier: Apache-2.0
+ * Internal interface between the fp16 flight-controller GLUE unit (fp16_fc_glue.c,
+ * soft-float rv64imac) and the VECTOR unit (fp16_fc_kernels.c, Zvfh). The compile-
+ * unit split exists because the fp16-only At35 Saturn (misa.F=0) traps on scalar
+ * float: the glue unit does the float interface + scalar-float cascade as soft-float
+ * libcalls, the vec unit does the fp16-vector algebra + int<->fp16 vfcvt with ZERO
+ * scalar FP. Data crosses via memory (fp16 as _Float16[], ints as int16/int32[]);
+ * runtime fp16 constants cross as uint16_t bit patterns (glue computes them soft-
+ * float; the vec unit splats them via vmv.v.x -- never a scalar float->fp16 convert).
  *
- * INTERNAL interface between the soft-float ORCHESTRATOR unit (fp16_fc_glue.c, built
- * -march=rv64imac -mabi=lp64 -> all scalar float is a soft-float libcall, no scalar-FP
- * trap on the misa.F=0 core) and the Zvfh VECTOR unit (fp16_fc_kernels.c, built
- * -march=rv64imafc_zve64d_zvfh -mabi=lp64 -> pure vector fp16/fp32, ZERO scalar FP).
- *
- * The two units MUST NOT be merged: any zve/zvfh -march makes gcc emit scalar-FP for a
- * plain `float` op (fadd.s/flw/fcvt.s.h ...), which traps on this core. So all scalar
- * float lives in the glue unit; the vector unit only touches vectors, and scalars cross
- * the boundary as MEMORY arrays (float[]/_Float16[]) or integer BIT-PATTERNS (uint16/32)
- * -- never as a scalar float in a register.
- *
- * The vector helpers are verbatim relocations of the contiguous vector-intrinsic blocks
- * of the original fp16_fc_kernels.c; the few places that originally extracted/rebuilt an
- * fp16 lane through a scalar `_Float16` (which would emit flh/fsh) are re-expressed with
- * vector ops (vse16 vl=1, vslideup, indexed load) that yield the identical value.
+ * Every vec helper is a VERBATIM relocation of a contiguous vector block from the
+ * original single-file kernel (a1198297 @ ddcd5d3); the algebra/Q-scales are unchanged.
  */
 #ifndef FP16_FC_VEC_H
 #define FP16_FC_VEC_H
 #include <stdint.h>
 
-/* --- estimator vector kernels (fp16_fc_kernels.c) --- */
-/* gyro-derivative low-pass (fp32 vector FMA): alpha_f += k*((g_cur-w_prev)/dt - alpha_f) */
-void ve_af_lp(const float g_cur[3], const float w_prev[3], float alpha_f[3],
-              uint32_t k_bits, uint32_t invdt_bits);
-/* |accel| (fp16) -> returned as an fp16 bit-pattern (widen in glue for the gate test) */
-uint16_t ve_amag(const float acc_corr[3]);
-/* Mahony body-rate: w3 = g_cur (+ KP*gate * (accel_norm x predicted_up) when do_trim) */
-void ve_mahony_w3(const float acc_corr[3], const float q[4], const float g_cur[3],
-                  uint32_t kpgate_bits, int do_trim, float w3_out[3]);
-/* quaternion integrate + normalize (fp32 vector): q += 0.5*step*Omega(w3)*q; q/=|q| */
-void ve_quat_integrate(float q[4], const float w3_arr[3], uint32_t step_bits);
-/* rotation matrix (fp16) + world accel (R*a - g, fp32) + body->world flow velocity (fp16).
- * Returns R[8] (the tilt cosine) as an fp16 bit-pattern; vf01 is valid iff the caller set
- * flow_f16 to a real sample (glue only consumes it when flow_valid). */
-void ve_rot_wa_flow(const float q[4], const float acc_corr[3], const _Float16 flow_f16[2],
-                    float aw_out[3], float vf01_out[2], uint16_t *r8_bits_out);
-/* velocity predict (fp32 vector FMA): vvel = vel + aw*dt */
-void ve_vel_predict(const float vel[3], const float aw[3], uint32_t dt_bits, float vvel_out[3]);
-/* horizontal-velocity backstop clamp (fp32 vector, +-VMAXV) */
-void ve_clampV(float v[3]);
-/* position integrate (fp32 vector FMA): pos += vvel*dt */
-void ve_pos_integrate(float pos[3], const float vvel[3], uint32_t dt_bits);
-/* get_state lead (fp32 vector FMA): so_pos = pos + vel*hl ; so_vel = vel + aw*hl */
-void ve_lead_out(const float pos[3], const float vel[3], const float aw[3],
-                 uint32_t hl_bits, float so_pos[3], float so_vel[3]);
+/* fp16-bit-pattern of a float. In the GLUE unit (soft-float) this lowers to a
+ * __truncsfhf2 libcall (safe); in the VEC unit it is only ever called with
+ * compile-time constants (h_splat), which fold -- never a runtime scalar convert. */
+static inline uint16_t hb(float c){ union { _Float16 h; uint16_t u; } x; x.h = (_Float16)c; return x.u; }
 
-/* --- controller vector kernels (fp16_fc_kernels.c) --- */
-/* cos polynomial (fp16 vector) for the two angles at once -> cr_cp[0..1] (fp32) */
-void vc_cos2(const _Float16 rp_f16[2], float cr_cp_out[2]);
-/* horizontal velocity->attitude loop (fp32 vector FMA + clamp + slew) -> desRP[0..1] */
-void vc_velloop(const float desV[2], const float vv[2], float vel_int[2],
-                uint32_t kivdt_bits, int grounded, const float prev[2],
-                uint32_t dmax_bits, float desRP_out[2]);
-/* attitude+rate loops, 4x4 mixer, force->duty (all fp16 vector) -> u_out[0..3] (fp32).
- * tgt3_f32 = [desRoll, desPitch, yawTgt]; u0_f16bits = fp16 bits of desNorm*MASS. */
-void vc_attitude(const float state[12], const float tgt3_f32[3], uint16_t u0_f16bits,
-                 float u_out[4]);
+/* ---- estimate ---- */
+/* lever-arm alpha LP increment: out int16 = h_to_i16(hscale((( gv-wp )*invdt - af)*k, M_ALPHA)),
+ * with wp/af = hscale(i16_to_h(wprev_i16/alpha_i16), -10). Glue does <<(Q_RATE-M_ALPHA)+accumulate. */
+void ve_alpha_inc(int16_t *inc_i16, const _Float16 *gv, const int16_t *wprev_i16,
+                  const int16_t *alpha_i16, uint16_t invdt_bits, uint16_t k_bits, int n);
+/* gyro products pr=[gxgy,gygz,gz2,gx2] (fp16) and al=fixed_to_h(alpha,Q_RATE,10) (fp16). */
+void ve_lever_pr(_Float16 *pr_out, _Float16 *al_out, const _Float16 *gv, const int16_t *alpha_i16);
+/* av -= cc  (fp16, 3-lane) */
+void ve_av_sub(_Float16 *av_io, const _Float16 *cc, int n);
+/* Mahony gravity-trim: w3_out = gv + KP*max(0,1-|(|a|-g)|/(0.5g)) * (an x vu). qh=fixed_to_h(q,Q_QUAT,14). */
+void ve_mahony(_Float16 *w3_out, const _Float16 *av, const int16_t *q_i16, const _Float16 *gv, int n);
+/* quaternion integrate: dq_i16 = h_to_i16(hscale(0.5*dt * Omega(w3)*qh, M_QUAT)); qh=fixed_to_h(q). */
+void ve_quat_dq_i16(int16_t *dq_i16, const int16_t *q_i16, const _Float16 *w3,
+                    uint16_t halfdt_bits, int n);
+/* normalize inverse: invi = h_to_i16(hscale(1/sqrt(i16_to_h(n16)*2^-14), 14)). */
+void ve_quat_inv_i16(int16_t *invi, const int16_t *n16);
+/* rotation matrix R[9] (fp16) from qh=fixed_to_h(q,Q_QUAT,14). */
+void ve_rotmat(_Float16 *R9, const int16_t *q_i16);
+/* h[n] -> int16[n] with hscale(.,m) then vfcvt.x.f (used for R*2^14, a*2^10). */
+void ve_h_scale_to_i16(int16_t *out, const _Float16 *in, int m, int n);
+/* one flow row dot: out_i16 = h_to_i16(hscale(dot(rrow,fv), Q_VEL-16)). */
+void ve_rflow_i16(int16_t *out_i16, const _Float16 *rrow, const _Float16 *fv);
+
+/* ---- control ---- */
+/* cos poly cr,cp = 1 - x^2/2 + x^4/24 for x=[roll,pitch] (fp16 bits in). */
+void vc_cos2(_Float16 *cr_cp, uint16_t roll_bits, uint16_t pitch_bits);
+/* integrator increment: inc_i16 = h_to_i16(hscale((a*b)[n], m)); a,b fp16 bit arrays. */
+void vc_inc(int16_t *inc_i16, const uint16_t *a_bits, const uint16_t *b_bits, int m, int n);
+/* attitude+rate: cm = ((g3 - tauA*(est3-tgt3)))*tauB   (fp16 3-lane). */
+void vc_attitude(_Float16 *cm_out, const _Float16 *est3, const _Float16 *tgt3, const _Float16 *g3);
+/* mixer (4x4) + force->duty (incl. vfsqrt) -> u_out[4] (fp16). u=[desNorm*MASS, cm*J]. */
+void vc_mixer_force(_Float16 *u_out, const _Float16 *cm, uint16_t desnormmass_bits);
 
 #endif /* FP16_FC_VEC_H */

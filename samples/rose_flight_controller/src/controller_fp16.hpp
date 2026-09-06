@@ -36,7 +36,7 @@ public:
 		kfc_control(&k_, state, setpoint, u_out, dt);
 	}
 
-	const char *name() const override { return "fp16(Zvfh)+fp32 hierarchical PID"; }
+	const char *name() const override { return "fp16(Zvfh)+int-accum hierarchical PID"; }
 
 private:
 	kfc_state k_;   /* carries alt_int / vel_int / slew memory (the PID accumulators) */
