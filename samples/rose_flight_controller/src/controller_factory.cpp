@@ -17,16 +17,24 @@
 #ifndef ROSE_USE_FP16
 #define ROSE_USE_FP16 0
 #endif
+#ifndef ROSE_USE_ROCC
+#define ROSE_USE_ROCC 0
+#endif
 
-#if ROSE_USE_FP16
+#if ROSE_USE_ROCC
+#include "controller_rocc.hpp"
+#elif ROSE_USE_FP16
 #include "controller_fp16.hpp"
 #endif
 
 /* File-scope (not function-local) static: avoids __cxa_guard_* which the minimal libcpp
- * config (CONFIG_REQUIRES_FULL_LIBCPP=n) does not provide.
- * -DROSE_USE_FP16=1 selects the fp16(Zvfh)+fp32-vector hierarchical PID (runs the mixer/
- * force/attitude algebra on the Saturn vector unit); it takes precedence over ROSE_USE_PID. */
-#if ROSE_USE_FP16
+ * config (CONFIG_REQUIRES_FULL_LIBCPP=n) does not provide. Precedence:
+ * -DROSE_USE_ROCC=1 -> the FcRoCC (custom-0, Q24.24 integer) hierarchical PID, no FPU/no V;
+ * -DROSE_USE_FP16=1 -> the fp16(Zvfh)+int-accum PID on the Saturn vector unit;
+ * else ROSE_USE_PID / TinyMPC. */
+#if ROSE_USE_ROCC
+static RoccController g_controller;
+#elif ROSE_USE_FP16
 static Fp16Controller g_controller;
 #elif ROSE_USE_PID
 static HierarchicalPidController g_controller;

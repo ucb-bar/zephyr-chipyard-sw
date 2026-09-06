@@ -87,6 +87,11 @@ set(ROSE_BARO 1 CACHE STRING "1=BMP388 baro altitude fusion")
 # soft-float SCALAR-glue unit (fp16_fc_glue.c, built with the default rv64imac soft-float
 # march) so no scalar-FP instruction is emitted (the At35 core is misa.F=0 -> scalar F traps).
 set(ROSE_USE_FP16 0 CACHE STRING "1=fp16(Zvfh)+fp32-vector estimator+PID, 0=scalar")
+# FcRoCC (custom-0) estimator+PID: runs the whole FC on the hardened RoCC accelerator
+# in Q24.24 integer (no FPU, no Saturn V). Selected in the factories; takes precedence
+# over FP16/EKF/PID. Only the float<->Q24.24 boundary is scalar soft-float. REQUIRES the
+# validated-core RoCC bitstream (assembled ROM+boot image) to actually compute.
+set(ROSE_USE_ROCC 0 CACHE STRING "1=FcRoCC(Q24.24) estimator+PID on the custom-0 accelerator, 0=off")
 
 # ---------------------------------------------------------------------------
 # Sources: the full FC + the DroNet model/kernels/runtime + the DroNet thread.
@@ -163,10 +168,22 @@ if(ROSE_USE_FP16)
   message(STATUS "rose_fc_dronet fp16_fc_kernels.c (Zvfh) cflags=${FP16_VEC_CFLAGS}")
 endif()
 
+# ---------------------------------------------------------------------------
+# FcRoCC FC firmware (-DROSE_USE_ROCC=1): the custom-0 driver + boot image.
+# Compiles on the default global rv64imac soft-float march -- the custom-0 ops are
+# .insn r 0x0B (no ISA extension needed); the Q24.24 boundary is soft-float. The
+# estimator_rocc.hpp/controller_rocc.hpp drop-ins are headers (no CMake entry).
+# ---------------------------------------------------------------------------
+if(ROSE_USE_ROCC)
+  target_sources(app PRIVATE ${FC}/src/fc_rocc_fw.c)
+  message(STATUS "rose_fc_dronet: FcRoCC FC firmware (ROSE_USE_ROCC=1)")
+endif()
+
 target_compile_definitions(app PRIVATE
   ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_USE_PID=${ROSE_USE_PID}
   ROSE_USE_FP16=${ROSE_USE_FP16}
+  ROSE_USE_ROCC=${ROSE_USE_ROCC}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
   ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW} ROSE_BARO=${ROSE_BARO}
