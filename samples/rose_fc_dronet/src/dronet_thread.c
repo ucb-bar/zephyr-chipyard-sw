@@ -64,6 +64,9 @@
 #ifndef DRONET_IRQ_GATE
 #define DRONET_IRQ_GATE 0
 #endif
+#ifndef DRONET_YIELD_DIV
+#define DRONET_YIELD_DIV 1   /* time-slice knob: k_yield every N ops (see dronet_run_once) */
+#endif
 /* Bit-exact-under-preemption set (measured on the At35). The poll+yield conv
  * (dronet_model_poll/kernels.c) handles the Gemmini convs; these SHORT RVV ops
  * are IRQ-masked whole (each << the >=200 Hz budget) because the Saturn
@@ -138,7 +141,12 @@ static unsigned long dronet_run_once(int steady, unsigned long *wall_ticks)
 			} else {
 				MODEL_DRONET_DISPATCH_FNS[i](&s);
 			}
-			k_yield();
+			/* Time-slice knob (loop-rate <-> DroNet-fps tradeoff): yield to the PID
+			 * loop every DRONET_YIELD_DIV ops. 1 = yield every op (max loop rate,
+			 * lowest DroNet fps -- the ops are tiny so the loop preempts often); larger
+			 * = DroNet runs more ops between yields (higher fps, lower loop rate);
+			 * DRONET_IRQ_GATE=1 = never yield = atomic (max fps, lowest loop rate). */
+			if ((i % DRONET_YIELD_DIV) == (DRONET_YIELD_DIV - 1)) k_yield();
 #endif
 		}
 	}
