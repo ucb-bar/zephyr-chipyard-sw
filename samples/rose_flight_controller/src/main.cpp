@@ -1970,6 +1970,28 @@ int main(void)
 			pf_est = pf_ctrl = pf_send = pf_flow = pf_iters = 0;
 		}
 #endif
+		/* ---- Flight-build periodic summary (build -DROSE_SUMMARY_MS=1000) ---------------------------
+		 * Compact once-per-interval status (measured loop Hz + altitude) so the control rate stays
+		 * visible WITHOUT the per-iteration ROSE_TELEM printk, whose blocking TX on a full console
+		 * buffer stalls the hot path and starves co-resident DroNet. Default 0 -> compiled out (no
+		 * change to tethered/bring-up builds); the flight + fp16 measurement builds set it to 1000. */
+#ifndef ROSE_SUMMARY_MS
+#define ROSE_SUMMARY_MS 0
+#endif
+#if ROSE_SUMMARY_MS > 0
+		{
+			static int64_t summ_next = 0, summ_t0 = 0; static uint32_t summ_iter0 = 0;
+			int64_t _sn = k_uptime_get();
+			if (summ_next == 0) { summ_next = _sn + ROSE_SUMMARY_MS; summ_t0 = _sn; summ_iter0 = iter; }
+			else if (_sn >= summ_next) {
+				uint32_t dq = (uint32_t)(iter - summ_iter0); int64_t dtm = _sn - summ_t0;
+				printk("SUMMARY: loop=%uHz iters=%u z=%s%d.%03d tofv=%d tofh=%s%d.%03d\n",
+				       (unsigned)(dtm > 0 ? (uint64_t)dq * 1000u / (uint64_t)dtm : 0u), iter,
+				       FP3(state[2]), (int)f.tof_valid, FP3(f.height));
+				summ_next = _sn + ROSE_SUMMARY_MS; summ_t0 = _sn; summ_iter0 = iter;
+			}
+		}
+#endif
 #if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
 		if (0) {   /* grid-validation build: suppress periodic telemetry so GRID lines own the console */
 #else

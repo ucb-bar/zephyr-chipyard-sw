@@ -80,6 +80,13 @@ set(ROSE_BUMPER 0 CACHE STRING "1=side-ToF wall bumper")
 set(ROSE_BUMPER_READDRESS_ONLY 0 CACHE STRING "1=re-address sides only")
 set(ROSE_FLOW 0 CACHE STRING "1=PMW3901 optical flow")
 set(ROSE_BARO 1 CACHE STRING "1=BMP388 baro altitude fusion")
+# fp16(Zvfh)+fp32-vector estimator+PID (runs the FC algebra on the Saturn vector unit to
+# free the scalar core for co-resident DroNet). Selected in the estimator/controller
+# factories; takes precedence over ROSE_USE_EKF/ROSE_USE_PID. The fp16 kernels are split
+# into a pure-VECTOR unit (fp16_fc_kernels.c, built with a Zvfh -march below) and a
+# soft-float SCALAR-glue unit (fp16_fc_glue.c, built with the default rv64imac soft-float
+# march) so no scalar-FP instruction is emitted (the At35 core is misa.F=0 -> scalar F traps).
+set(ROSE_USE_FP16 0 CACHE STRING "1=fp16(Zvfh)+fp32-vector estimator+PID, 0=scalar")
 
 # ---------------------------------------------------------------------------
 # Sources: the full FC + the DroNet model/kernels/runtime + the DroNet thread.
@@ -129,9 +136,32 @@ set_source_files_properties(${MODEL_DIR}/kernels.c PROPERTIES
   COMPILE_OPTIONS "${MODELBLASTER_KERNEL_CFLAGS}")
 message(STATUS "rose_fc_dronet kernels.c cflags=${MODELBLASTER_KERNEL_CFLAGS}")
 
+# ---------------------------------------------------------------------------
+# fp16(Zvfh) FC kernels (-DROSE_USE_FP16=1). Compile-unit split for misa.F=0:
+#   * fp16_fc_kernels.c -> the pure-VECTOR unit: built with the DroNet kernel march
+#     + zvfh (rv64imac_zve64x_zvfh). It contains ZERO scalar float (objdump-verified:
+#     0 scalar-FP, 127 vector-FP ops), so no scalar fadd.s/flw is emitted -> no trap.
+#     The Saturn vector unit (vfh=true) executes the vfh vector ops on misa.V. Using
+#     the zve64x base (no scalar 'f') matches kernels.c and avoids a hard-float ELF
+#     attribute at link. Also #includes the internal fp16_fc_vec.h (no CMake entry).
+#   * fp16_fc_glue.c   -> the SCALAR-glue unit: left on the default global
+#     rv64imac(_zicsr_zifencei) soft-float march, so its scalar float becomes
+#     soft-float libcalls (no scalar-FP instruction). No per-file override needed.
+# ---------------------------------------------------------------------------
+if(ROSE_USE_FP16)
+  target_sources(app PRIVATE
+    ${FC}/src/fp16_fc_kernels.c
+    ${FC}/src/fp16_fc_glue.c)
+  set(FP16_VEC_CFLAGS "-march=rv64imac_zve64x_zvfh;-mabi=lp64")
+  set_source_files_properties(${FC}/src/fp16_fc_kernels.c PROPERTIES
+    COMPILE_OPTIONS "${FP16_VEC_CFLAGS}")
+  message(STATUS "rose_fc_dronet fp16_fc_kernels.c (Zvfh) cflags=${FP16_VEC_CFLAGS}")
+endif()
+
 target_compile_definitions(app PRIVATE
   ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_USE_PID=${ROSE_USE_PID}
+  ROSE_USE_FP16=${ROSE_USE_FP16}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
   ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW} ROSE_BARO=${ROSE_BARO}
