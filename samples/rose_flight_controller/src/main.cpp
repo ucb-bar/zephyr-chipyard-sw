@@ -53,6 +53,20 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
 #define HAVE_FLOW DT_NODE_EXISTS(DT_ALIAS(flow))
 #define HAVE_TOF  DT_NODE_EXISTS(DT_ALIAS(tof))
 #define HAVE_BARO DT_NODE_EXISTS(DT_ALIAS(baro))   /* BMP388 (bosch,bmp388) -> `baro` alias */
+/*
+ * The D8 status LED hangs off the ADS7128 expander, but every helper it needs -- g_led_bus,
+ * ads7128_set_bit/clr_bit, STATUS_LED_CH, ADS7128_GPO_VALUE -- is defined inside the
+ * `#if DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)` block below, while the LED thread and its start-up
+ * call sit at top level. A board with the expander but no VL53L1X declared therefore fails to
+ * compile with "'g_led_bus' was not declared in this scope" -- which is what the RiskyBird FPGA
+ * carrier does while the down-ToF is still being brought up.
+ *
+ * Matching the existing condition rather than widening it keeps the ESP build byte-identical:
+ * there the VL53L1X is declared, so the LED compiles in exactly as before. Widening this to the
+ * expander's own presence is the right long-term fix, but it is a different change from making
+ * the file portable.
+ */
+#define HAVE_STATUS_LED DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
 #if HAVE_FLOW
 #include <rose/rose_sensor.h>   /* RoSE private optical-flow channels */
 #endif
@@ -82,6 +96,21 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
  * corrupting the estimator dt. Untethered we rely on the (non-blocking, background-thread) flightlog. */
 #ifndef ROSE_TELEM
 #define ROSE_TELEM 1
+#endif
+/*
+ * Print one telemetry line every ROSE_TELEM_DIV iterations.
+ *
+ * Was hardcoded to 10, which is ~100 lines/s at a 1 kHz loop. That is free on a USB console but
+ * not on a real UART: ~150 chars/line x 100 lines/s is ~150 kbps, more than a 115200 link can
+ * carry, so printk blocks and the control loop inherits the console's backlog -- the loop then
+ * measures its own dt as the UART's, not the controller's. The RiskyBird FPGA carrier's console
+ * is a 115200 FTDI link, so it needs roughly 200 here for a ~5 Hz line.
+ *
+ * A divisor rather than a faster console because losing the console loses all observability,
+ * while a slower telemetry line costs nothing during bring-up.
+ */
+#ifndef ROSE_TELEM_DIV
+#define ROSE_TELEM_DIV 10
 #endif
 
 /* ---- Battery voltage sense + thrust sag-compensation + low-voltage protection (1S LiPo) -------
@@ -1221,6 +1250,7 @@ static void keepalive_block(void *a, void *b, void *c)
 }
 #endif /* ROSE_THREADED: thread-block defs; the status LED below is compiled in all configs */
 
+#if HAVE_STATUS_LED
 /* ---- Status LED (D8 = ADS7128 GPIO7, active-low) --------------------------------------------
  * A low-priority thread renders a blink pattern DERIVED from the existing flight-state globals
  * (g_estop / g_gyro_cal_done / g_armed / g_arming / g_vbat) -- no scattered setters. It drives
@@ -1294,6 +1324,7 @@ static void status_led_thread(void *a, void *b, void *c)
 		k_msleep(LED_TICK_MS);
 	}
 }
+#endif /* HAVE_STATUS_LED */
 
 #if ROSE_THREADED
 static void io_block(void *a, void *b, void *c)
@@ -1518,6 +1549,7 @@ int main(void)
 
 	/* Status LED: start the state-derived pattern renderer (only if the ADS7128 LED config ACK'd
 	 * at board_sensor_init). Low priority + edge-only I2C writes -> negligible load on the loop. */
+#if HAVE_STATUS_LED
 	if (g_led_bus) {
 		k_thread_create(&led_t, led_stack, K_THREAD_STACK_SIZEOF(led_stack),
 				status_led_thread, NULL, NULL, NULL, PRIO_LED, 0, K_NO_WAIT);
@@ -1525,6 +1557,7 @@ int main(void)
 		printk("flight_controller: status LED up (ADS7128 GPIO%d, state-derived patterns)\n",
 		       STATUS_LED_CH);
 	}
+#endif
 
 #if ROSE_THREADED
 	printk("flight_controller: estimator=%s + controller=%s (%s), THREADED blocks "
@@ -1832,7 +1865,7 @@ int main(void)
 #if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
 		if (0) {   /* grid-validation build: suppress periodic telemetry so GRID lines own the console */
 #else
-		if (ROSE_TELEM && (iter % 10) == 0) {   /* ROSE_TELEM=0 (flight) -> compiled out, no printk stall */
+		if (ROSE_TELEM && (iter % ROSE_TELEM_DIV) == 0) {   /* ROSE_TELEM=0 (flight) -> compiled out, no printk stall */
 #endif
 #if defined(ROSE_IMU_DEBUG) && ROSE_IMU_DEBUG
 			/* Body-frame IMU dump for the axis/sign tilt test (see IMU_REMAP note). */

@@ -17,6 +17,27 @@
 #include <string.h>
 
 #define LOG_PARTITION   storage_partition
+
+/*
+ * Boards with no flash storage partition.
+ *
+ * This is the ONLY part of the flight controller that is tied to a specific
+ * SoC's flash layout: FIXED_PARTITION_ID(storage_partition) is resolved by the
+ * preprocessor, so a board whose device tree has no `storage_partition` node
+ * fails to build here even with ROSE_FLIGHTLOG off. The RiskyBird FPGA carrier
+ * has no such partition -- the shell presents DDR3 and no flash -- so on that
+ * target the log has to live in RAM instead, which is a separate change.
+ */
+#define HAVE_LOG_FLASH FIXED_PARTITION_EXISTS(LOG_PARTITION)
+
+#if !HAVE_LOG_FLASH
+
+int flightlog_init(void) { return -ENODEV; }
+void flightlog_write(const struct flight_rec *rec) { ARG_UNUSED(rec); }
+void flightlog_flush(void) { }
+int flightlog_dump(void) { return -ENODEV; }
+
+#else
 #define REC_SIZE        ((uint32_t)sizeof(struct flight_rec))   /* 20 (multiple of 4) */
 /* Flush chunk kept small so each flash write (a whole-CPU XIP stall on ESP32, ~1.5us/byte) is
  * short: 50 records = 1000 B ~= 1.5 ms, vs ~6 ms for a 4 KB page. At ~50 Hz logging that's one
@@ -208,3 +229,5 @@ int flightlog_dump(void)
 	flash_area_close(fa);
 	return n;
 }
+
+#endif /* HAVE_LOG_FLASH */

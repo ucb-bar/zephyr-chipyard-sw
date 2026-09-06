@@ -16,6 +16,57 @@
 #include <errno.h>
 #include <math.h>
 
+/*
+ * Which SPI controller the PMW3901 hangs off.
+ *
+ * This used to be a bare DT_NODELABEL(spi2) -- the ESP32-C6's controller -- resolved in the
+ * preprocessor. Any board without a node labelled exactly `spi2` therefore failed to BUILD the
+ * whole flight controller, even with the flow feature off, because CMakeLists compiles this file
+ * unconditionally. The RiskyBird FPGA carrier's flow sensor is on spi@10031000, labelled spi0.
+ *
+ * A board now points at its own controller with a `flow-spi` alias; boards that do not are
+ * unchanged, because the fallback is the original spi2 label. The ESP build therefore selects
+ * exactly the same node as before.
+ *
+ * NOTE this is deliberately NOT the `flow` alias. That alias means the RoSE *virtual* flow
+ * device and drives HAVE_FLOW in main.cpp (spike co-sim only); the real PMW3901 path is selected
+ * by the ROSE_FLOW CMake knob and talks to the bus directly, with no Zephyr driver and no `flow`
+ * node. The ESP flies with ROSE_FLOW=1 and no `flow` alias at all, so guarding this file on that
+ * alias would silently disable optical flow on the configuration that actually flew.
+ *
+ * The chip-select stays a plain pin number on a controller labelled `gpio0`, which is the label
+ * on both boards. Its pin differs -- ESP GPIO19, FPGA gpio0 pin 0 -- so override CS_GPIO_PIN
+ * per board (see hardware/zephyr/targets/fpga/workloads/pmw3901_test.overlay for the FPGA
+ * wiring this must agree with).
+ */
+#if DT_NODE_EXISTS(DT_ALIAS(flow_spi))
+#define FLOW_SPI_NODE   DT_ALIAS(flow_spi)
+#define HAVE_FLOW_HW    1
+#elif DT_NODE_EXISTS(DT_NODELABEL(spi2))
+#define FLOW_SPI_NODE   DT_NODELABEL(spi2)
+#define HAVE_FLOW_HW    1
+#else
+#define HAVE_FLOW_HW    0
+#endif
+
+#if !HAVE_FLOW_HW
+
+int flow_init(void)
+{
+	printk("flow: no flow-spi alias and no spi2 node -- optical flow unavailable\n");
+	return -ENODEV;
+}
+
+void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid)
+{
+	if (ang_x) { *ang_x = 0.0f; }
+	if (ang_y) { *ang_y = 0.0f; }
+	if (squal) { *squal = 0; }
+	if (valid) { *valid = false; }
+}
+
+#else
+
 /* --- tunables (override via -D) --- */
 #ifndef FLOW_RAD_PER_COUNT
 /* rad of ground-feature angle per PMW3901 motion count, taken from the Crazyflie flow deck (same
@@ -108,7 +159,7 @@ static void flow_thread_fn(void *a, void *b, void *c)
 
 int flow_init(void)
 {
-	const struct device *spi_dev  = DEVICE_DT_GET(DT_NODELABEL(spi2));
+	const struct device *spi_dev  = DEVICE_DT_GET(FLOW_SPI_NODE);
 	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 	if (!device_is_ready(spi_dev) || !device_is_ready(gpio_dev)) {
 		printk("flow: SPI/GPIO not ready -- flow disabled\n");
@@ -154,3 +205,5 @@ void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid)
 	*valid = g_squal_ok && fresh && (g_seq != 0);
 	k_mutex_unlock(&flow_mtx);
 }
+
+#endif /* HAVE_FLOW_HW */
