@@ -1,0 +1,30 @@
+diff --git a/arch/riscv/core/v.c b/arch/riscv/core/v.c
+index 80a777dc673..4db422f1c1a 100644
+--- a/arch/riscv/core/v.c
++++ b/arch/riscv/core/v.c
+@@ -153,6 +153,13 @@ void z_riscv_vstate_save_thread(struct k_thread *thread)
+ 			: "r"(save_to->vreg)
+ 			: "memory");
+ 	}
++#ifdef MB_V_SAVE_FENCE
++	/* Opt-in (bench candidate): full HW fence after the eager V save, in case the
++	 * decoupled Saturn vector store buffer hasn't drained the saved vregs to memory
++	 * before this thread is switched away -- a candidate cause of the mcause-5
++	 * vstate-restore corruption at high V-context-switch frequency. Default off. */
++	__asm volatile("fence rw, rw" ::: "memory");
++#endif
+ 	save_to->is_dirty = (mstatus_v != 0);
+ 
+ 	csr_clear(mstatus, MSTATUS_VS);
+@@ -199,6 +206,11 @@ void z_riscv_vstate_restore_thread(struct k_thread *thread)
+ 	 * to save its state. */
+ 	if (restore_from->is_dirty) {
+ 		unsigned long vl;
++#ifdef MB_V_SAVE_FENCE
++		/* Opt-in (bench candidate): pair of the save-side fence -- ensure this thread's
++		 * previously-saved vregs have landed in memory before the eager reload reads them. */
++		__asm volatile("fence rw, rw" ::: "memory");
++#endif
+ 		__asm volatile(
+ 			".option push\n\t"
+ 			".option arch, +v\n\t"
