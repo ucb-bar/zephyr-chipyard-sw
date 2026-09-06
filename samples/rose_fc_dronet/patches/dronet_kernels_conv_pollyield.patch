@@ -1,6 +1,6 @@
 --- /home/cobble/Tools/zephyr-chipyard-sw/modelblaster/examples/dronet/int8/generated_gray/hetero_tiled_rvvadd/kernels.c	2026-09-05 13:18:11.375136783 -0700
-+++ /home/cobble/Tools/zcs_fcdronet/samples/rose_fc_dronet/dronet_model_poll/kernels.c	2026-09-05 19:55:18.422012456 -0700
-@@ -9,6 +9,38 @@
++++ /home/cobble/Tools/zcs_fcdronet/samples/rose_fc_dronet/dronet_model_poll/kernels.c	2026-09-05 20:43:55.534795469 -0700
+@@ -9,6 +9,42 @@
  #include <riscv_vector.h>
  #include "kernels.h"
  
@@ -25,10 +25,14 @@
 +{
 +	static int _cfg;
 +	if (!_cfg) { counter_configure(MB_DRAIN_WDMA_SLOT, WDMA_BYTES_SENT); _cfg = 1; }
++	/* Only yield if IRQs are enabled: the atomic-baseline pass runs the whole
++	 * inference under an outer irq_lock, and k_yield() with IRQs locked faults. */
++	unsigned int _probe = irq_lock(); irq_unlock(_probe);
++	int _irqs_on = arch_irq_unlocked(_probe);
 +	uint32_t prev = counter_read(MB_DRAIN_WDMA_SLOT);
 +	int stable = 0;
 +	for (int i = 0; i < 2000000 && stable < 4; i++) {
-+		k_yield();
++		if (_irqs_on) { k_yield(); }
 +		uint32_t cur = counter_read(MB_DRAIN_WDMA_SLOT);
 +		stable = (cur == prev) ? (stable + 1) : 0;
 +		prev = cur;
@@ -39,7 +43,7 @@
  /* source: curated */
  /* algorithm: direct */
  /* accuracy_class: numeric_drift */
-@@ -627,8 +659,10 @@
+@@ -627,8 +663,10 @@
       * gemmini_fence — unlike tiled_matmul_outer_eigen.  Without this
       * explicit drain, the post-conv NHWC->NCHW read and the next op's
       * gemmini_flush race with in-flight mvout DMAs and corrupt memory
@@ -52,3 +56,30 @@
      gemmini_flush(0);
  
      MB_GEM_PH(mb_ph_t2);
+@@ -795,6 +833,12 @@
+ 
+     for (int n = 0; n < N; n++) {
+         for (int c = 0; c < C; c++) {
++            /* FC+DroNet: process each channel with IRQs masked so the strided
++             * vlse8 gather is never preempted mid-op (the Saturn mis-resumes
++             * vstart!=0 -> corruption), then yield between channels so the PID
++             * loop preempts at a clean boundary. ~0.8 ms/channel << the >=200 Hz
++             * budget, so no need to IRQ-mask the whole ~25 ms op. */
++            unsigned int _mpk = irq_lock();
+             const int8_t *in_nc = input + (size_t)(n*C + c)*IH*IW;
+             int8_t *out_nc = output + (size_t)(n*C + c)*OH*OW;
+ 
+@@ -865,6 +909,13 @@
+                     __riscv_vse8_v_i8m4(out_nc + (size_t)oh*OW + ow, vacc, vl);
+                 }
+             }
++            irq_unlock(_mpk);
++            /* Yield only if IRQs were actually enabled before this channel's lock
++             * -- during the atomic-baseline pass the whole inference runs under an
++             * outer irq_lock, and k_yield() with IRQs locked faults. */
++            if (arch_irq_unlocked(_mpk)) {
++                k_yield();
++            }
+         }
+     }
+ }

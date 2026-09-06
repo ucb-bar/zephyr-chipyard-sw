@@ -64,17 +64,15 @@
 #ifndef DRONET_IRQ_GATE
 #define DRONET_IRQ_GATE 0
 #endif
-/* PROVEN bit-exact-under-preemption set (measured on the At35, 2026-09-05):
- * with the fence-free poll+yield conv (dronet_model_poll/kernels.c) handling the
- * Gemmini convs, IRQ-masking these RVV ops gives err=3 (== the atomic baseline)
- * for every inference under PID preemption; leaving any of them preemptible
- * (e.g. maxpool) lets err drift to 10 -- the Saturn mis-resumes their
- * mid-execution strided vector memory ops at vstart!=0. NOTE maxpool2d_s8 is
- * ~25 ms, so masking it costs a >=200 Hz stall: the remaining >=200 Hz work is
- * to make maxpool preemption-safe (unit-stride RVV rewrite, or tile+WDMA-poll+
- * yield like the conv) instead of masking it. */
+/* Bit-exact-under-preemption set (measured on the At35). The poll+yield conv
+ * (dronet_model_poll/kernels.c) handles the Gemmini convs; these SHORT RVV ops
+ * are IRQ-masked whole (each << the >=200 Hz budget) because the Saturn
+ * mis-resumes their mid-execution strided vector memory ops at vstart!=0.
+ * maxpool2d_s8 is NOT here: its ~25 ms would stall the loop if masked whole, so
+ * its kernel self-protects PER CHANNEL (irq_lock a ~0.8 ms channel around the
+ * strided vlse8, k_yield between channels) -- >=200 Hz-friendly AND bit-exact. */
 #ifndef DRONET_MASK_OPS
-#define DRONET_MASK_OPS "maxpool", "batchnorm", "add_s8", "relu", "linear", "sigmoid"
+#define DRONET_MASK_OPS "batchnorm", "add_s8", "relu", "linear", "sigmoid"
 #endif
 
 static model_dronet_output_t dronet_out[MODEL_DRONET_OUTPUT_SIZE];
