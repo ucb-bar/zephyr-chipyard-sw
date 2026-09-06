@@ -23,6 +23,7 @@
 #define ROSE_CONTROLLER_FP16_HPP
 
 #include "controller.hpp"
+#include <zephyr/kernel.h>   /* irq_lock/irq_unlock */
 extern "C" {
 #include "fp16_fc_kernels.h"
 }
@@ -33,7 +34,11 @@ public:
 
 	void compute(const float state[CTRL_NSTATES], const float setpoint[CTRL_NSTATES],
 		     float u_out[CTRL_NACTIONS], float dt) override {
+		/* vstate-hazard mitigation #1 (see estimator_fp16.hpp): irq_lock the ~us fp16
+		 * V compute so an ISR can't preempt a strided vle/vse mid-op and mis-resume it. */
+		unsigned int _vk = irq_lock();
 		kfc_control(&k_, state, setpoint, u_out, dt);
+		irq_unlock(_vk);
 	}
 
 	const char *name() const override { return "fp16(Zvfh)+int-accum hierarchical PID"; }

@@ -15,6 +15,7 @@
 #define ROSE_ESTIMATOR_FP16_HPP
 
 #include "estimator.hpp"
+#include <zephyr/kernel.h>   /* irq_lock/irq_unlock */
 extern "C" {
 #include "fp16_fc_kernels.h"
 }
@@ -33,8 +34,14 @@ public:
 		    bool flow_valid, float height, bool tof_valid,
 		    float baro_rel, bool baro_valid, float dt) override {
 		(void)baro_rel; (void)baro_valid;   /* fp16 kernel is ToF-only complementary */
+		/* vstate-hazard mitigation #1: the fp16 kernel issues Saturn V ops from the
+		 * high-prio control loop; an ISR (timer/i2c) preempting mid-vector-op mis-resumes
+		 * the strided vle/vse (bench: mcause-7 wild store in ve_alpha_inc). irq_lock the
+		 * ~us V compute so no interrupt lands mid-op. Bounded jitter (a few us at 35 MHz). */
+		unsigned int _vk = irq_lock();
 		kfc_estimate(&k_, accel, gyro, flow, flow_valid ? 1 : 0, height,
 			     tof_valid ? 1 : 0, dt, state_);
+		irq_unlock(_vk);
 	}
 
 	void get_state(float state[EST_NSTATES]) const override {
