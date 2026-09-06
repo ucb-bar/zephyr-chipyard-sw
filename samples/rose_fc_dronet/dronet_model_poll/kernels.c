@@ -518,17 +518,6 @@ void kernel_conv2d_s8_dronet(const int8_t *input, const int8_t *weight,
         return;
     }
 
-    /* FC+DroNet vstate fix: make the Gemmini conv non-preemptible EXCEPT the
-     * mb_conv_drain_yield() below (the sole safe yield point, across the Gemmini
-     * DMA stall). The gated diagnostic (DRONET_IRQ_GATE=1) proved that preempting
-     * DroNet anywhere corrupts the scheduler on Saturn's eager V-context switch at
-     * the higher (spam-removed) rate; confining preemption to the drain keeps the
-     * loop rate while removing the hazard. irq_lock nests safely (returns the prior
-     * state): in the atomic baseline pass the outer state is already locked, so the
-     * unlock-before-drain keeps IRQs off and mb_conv_drain_yield() won't yield
-     * (its arch_irq_unlocked() check stays false) -- matching the atomic contract. */
-    unsigned int _cvk = irq_lock();
-
     /* Enable mstatus.XS=Dirty so RoCC custom-3 instructions don't trap. */
     asm volatile("csrs mstatus, %0" : : "r"(0x18000) : "memory");
 
@@ -677,9 +666,7 @@ void kernel_conv2d_s8_dronet(const int8_t *input, const int8_t *weight,
      * (FireSim Saturn: mcause=1, mepc=0).
      * FC+DroNet: fence-free preemptible drain (see mb_conv_drain_yield above) so a
      * PID-loop preemption can't land mid-drain and corrupt the output. */
-    irq_unlock(_cvk);          /* the ONE preemption point: FC loop runs here, mid-Gemmini-drain (safe) */
     mb_conv_drain_yield();
-    _cvk = irq_lock();         /* re-lock for the scalar output transpose + clamp below */
     gemmini_flush(0);
 
     MB_GEM_PH(mb_ph_t2);
@@ -737,7 +724,6 @@ void kernel_conv2d_s8_dronet(const int8_t *input, const int8_t *weight,
                 if (row[i] > activation_max) row[i] = (int8_t)activation_max;
         }
     }
-    irq_unlock(_cvk);   /* FC+DroNet vstate fix: end of the non-preemptible Gemmini conv */
 }
 
 /* source: curated */
