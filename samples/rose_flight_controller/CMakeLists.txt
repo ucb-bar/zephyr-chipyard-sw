@@ -29,21 +29,63 @@ include(${TINYMPC}/external/matlib/matlib_header.cmake)
 # which currently holds the ALTITUDE loop best (its explicit vz correction beats the EKF's
 # Kalman vz for control). The EKF is the robustness target (Q/R for noise) but its vz needs
 # a direct velocity measurement to match; both use model-based delay compensation.
-set(ROSE_USE_EKF 0 CACHE STRING "1=EKF, 0=complementary filter")
+set(ROSE_USE_EKF 1 CACHE STRING "1=EKF, 0=complementary filter")
+# Controller selection (modular IController; both are compiled, factory picks):
+#   -DROSE_USE_PID=0 -> TinyMPC constrained MPC (default)
+#   -DROSE_USE_PID=1 -> hierarchical PID cascade (ported from the old riskybird FreeRTOS firmware)
+set(ROSE_USE_PID 0 CACHE STRING "1=hierarchical PID, 0=TinyMPC")
 # Architecture knobs: ROSE_THREADED (1=modular threaded blocks, 0=single loop) and
 # ROSE_CTRL_DIV (control runs every Nth estimator tick -> control rate = estimation / N).
 set(ROSE_THREADED 0 CACHE STRING "1=threaded blocks, 0=single loop (default; see main.cpp note)")
 set(ROSE_CTRL_DIV 1 CACHE STRING "control every Nth estimator tick (multi-rate)")
+# Bench safety: stop driving motors this many ms after boot (0 = never). Real-HW bench
+# bring-up builds with 10000 so the props auto-stop 10 s after reset. Keep 0 for flight.
+set(ROSE_ACTUATE_TIMEOUT_MS 0 CACHE STRING "stop motor actuation N ms after boot (0=never)")
+# Control-loop iteration count. Default 5000 suits the RoSE co-sim; on real HW the loop runs
+# ~1 kHz, so raise this for a longer bench run (e.g. 120000 ~= 2 min).
+set(CTRL_ITERS 5000 CACHE STRING "control-loop iteration count")
+# Side-ToF wall "bumper": 1 = bring up the 4 VL53L5CX + apply bounded wall-repulsion lean.
+# Adds ~12 s to boot (4x firmware upload). 0 = skip entirely (side_tof.c compiled but idle).
+set(ROSE_BUMPER 0 CACHE STRING "1=enable side-ToF wall bumper, 0=disabled")
+# Fast-boot variant: with ROSE_BUMPER=1, re-address the 4 sides off 0x29 (keeps the I2C bus clear for
+# the down VL53L1X) but SKIP the ~84 KB-per-sensor ULD firmware upload + ranging. No wall data, but
+# boot is ~0.5 s instead of ~12 s. Use when the FC doesn't consume walls (it currently doesn't).
+set(ROSE_BUMPER_READDRESS_ONLY 0 CACHE STRING "1=re-address sides only (fast boot, no ranging)")
+# Optical flow: 1 = bring up the PMW3901 (SPI2) + feed body-frame velocity to the estimator.
+set(ROSE_FLOW 0 CACHE STRING "1=enable PMW3901 optical flow, 0=disabled")
+# Barometer altitude fusion: 1 = read the BMP388 (needs a `baro` DT alias + CONFIG_BMP388) and fuse
+# its smooth relative altitude with the down-ToF in the estimator (robust altitude under tilt /
+# obstacle step-jumps). 0 = ToF-only (unchanged). Fine-tuning knobs (BARO_Z_GAIN, BARO_VZ_GAIN,
+# BARO_BIAS_GAIN, BARO_TOF_STEP_M, R_BARO) are passed via -DEXTRA_CPPFLAGS like the flow knobs.
+set(ROSE_BARO 0 CACHE STRING "1=enable BMP388 barometer altitude fusion, 0=disabled")
 
 target_sources(app PRIVATE
   src/main.cpp
   src/estimator_complementary.cpp
   src/estimator_ekf.cpp
   src/estimator_factory.cpp
+  src/controller_tinympc.cpp
+  src/controller_pid.cpp
+  src/controller_factory.cpp
+  src/flightlog.c
+  src/side_tof.c
+  src/flow.c
+  src/pmw3901.c
   ${TINYMPC}/external/admm/src/admm_rvv.cpp)
 
+# WiFi SoftAP UDP telemetry downlink (docs/TELEMETRY_PLAN.md phase 2). Compiled ONLY when the
+# opt-in telem.conf enables CONFIG_WIFI, so the normal flight build never sees it and stays
+# byte-identical. All call sites in main.cpp are likewise `#if defined(CONFIG_WIFI)`.
+if(CONFIG_WIFI)
+  target_sources(app PRIVATE src/telem_wifi.c)
+endif()
+
 target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
-  ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV})
+  ROSE_USE_PID=${ROSE_USE_PID}
+  ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
+  ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
+  ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW} ROSE_BARO=${ROSE_BARO}
+  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include

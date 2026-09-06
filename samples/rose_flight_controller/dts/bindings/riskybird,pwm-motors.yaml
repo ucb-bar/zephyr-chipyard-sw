@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+description: |
+  RiskyBird 4-motor PWM output group. Exposes one PWM specifier per motor via a
+  flat 'pwms' phandle-array (indices 0..3 == flight-controller u[0..3]), consumed
+  with PWM_DT_SPEC_GET_BY_IDX(DT_ALIAS(motors), i).
+
+compatible: "riskybird,pwm-motors"
+
+include: base.yaml
+
+properties:
+  pwms:
+    type: phandle-array
+    required: true
+    description: One PWM specifier per motor (index 0..3).

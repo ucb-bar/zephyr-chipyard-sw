@@ -81,13 +81,14 @@ static int pmw3901_init_config(void)
     pmw3901_cfg.cs_gpio.pin = CS_GPIO_PIN;
     pmw3901_cfg.cs_gpio.dt_flags = GPIO_ACTIVE_LOW;
 
-    pmw3901_cfg.reset_gpio.port = gpio_dev;
-    pmw3901_cfg.reset_gpio.pin = RESET_GPIO_PIN;
-    pmw3901_cfg.reset_gpio.dt_flags = GPIO_ACTIVE_LOW;
-
-    pmw3901_cfg.led_gpio.port = gpio_dev;
-    pmw3901_cfg.led_gpio.pin = LED_GPIO_PIN;
-    pmw3901_cfg.led_gpio.dt_flags = GPIO_ACTIVE_LOW;
+    /* riskybird v3: the PMW3901 (IC1) NRESET is tied high through R37 (no GPIO reset), and its
+     * MOTION line goes to the FPGA SoM (JB2.73), not the ESP32-C6 -- so there is no reset/LED GPIO
+     * on this board. Leave both NULL; the driver guards on .port and does a SOFTWARE power-on-reset
+     * (reg 0x3A=0x5A) + polled reads, so the chip-ID connection test still works over SPI alone.
+     * SPI itself is a shared bus (ESP via 100R R63-66, FPGA via 47R R27-29/34) -- the FPGA must be
+     * off/high-Z for the ESP to master it (true during bring-up). */
+    pmw3901_cfg.reset_gpio.port = NULL;
+    pmw3901_cfg.led_gpio.port = NULL;
 
     return 0;
 }
@@ -120,14 +121,27 @@ int main(void)
 
     printf("SPI and GPIO devices ready\n\n");
 
-    /* Initialize the PMW3901 sensor */
-    printf("Initializing PMW3901...\n");
-    ret = pmw3901_init(PMW3901_DEV);
-    if (ret != 0) {
-        printf("ERROR: Failed to initialize PMW3901 (ret: %d)\n", ret);
-        return 1;
+    /* Initialize the PMW3901 sensor. Retry in a loop: pmw3901_init() prints the chip ID on every
+     * attempt (0x49/0xB6 = alive, 0xFF = open/not-wetted, 0x00 = MISO low), so the connection
+     * status is ALWAYS visible on the serial monitor no matter when it attaches -- no need to catch
+     * a one-shot boot print or fight the USB-JTAG reset. */
+    printf("Initializing PMW3901 (looping chip-ID probe until connected)...\n");
+    while (pmw3901_init(PMW3901_DEV) != 0) {
+        k_msleep(700);
     }
     printf("PMW3901 initialized successfully.\n\n");
+
+    /* --- throughput benchmark: time back-to-back motion-burst reads (SPI @ 2 MHz) --- */
+    {
+        const int N = 2000;
+        uint32_t c0 = k_cycle_get_32();
+        for (int i = 0; i < N; i++) {
+            pmw3901_read_motion_burst(PMW3901_DEV, &motion);
+        }
+        uint32_t us = k_cyc_to_us_floor32(k_cycle_get_32() - c0);
+        printf("BENCH: %d motion-burst reads in %u us -> %.2f us/read, %.0f Hz max (SPI 2MHz)\n\n",
+               N, us, (double)us / N, N * 1e6 / (double)us);
+    }
 
     /* Continuously read motion data */
     printf("Entering continuous motion read loop...\n");

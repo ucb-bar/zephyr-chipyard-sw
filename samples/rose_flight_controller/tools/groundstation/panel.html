@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>riskybird ground station</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3038; --ink:#e6edf3;
+    --dim:#8b949e; --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --arm:#ff7b00;
+    --mono:'SF Mono',ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;}
+  header{display:flex;align-items:center;gap:16px;padding:10px 18px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#111722,#0d1117);position:sticky;top:0;z-index:5}
+  header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.3px}
+  header .sub{color:var(--dim);font-size:12px}
+  .link{margin-left:auto;display:flex;align-items:center;gap:14px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--bad);box-shadow:0 0 8px var(--bad)}
+  .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .wrap{max-width:1180px;margin:0 auto;padding:16px;display:grid;gap:14px;
+    grid-template-columns:repeat(12,1fr)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .card h2{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);font-weight:600}
+  .c3{grid-column:span 3}.c4{grid-column:span 4}.c5{grid-column:span 5}
+  .c6{grid-column:span 6}.c7{grid-column:span 7}.c8{grid-column:span 8}.c12{grid-column:span 12}
+  @media(max-width:900px){.wrap{grid-template-columns:repeat(6,1fr)}.c3,.c4,.c5{grid-column:span 3}
+    .c6,.c7,.c8,.c12{grid-column:span 6}}
+  /* state banner */
+  #state{grid-column:span 12;border-radius:12px;padding:14px 18px;display:flex;align-items:center;gap:18px;
+    font-weight:700;font-size:22px;letter-spacing:.5px;border:1px solid var(--line);background:var(--panel)}
+  #state .badge{font-family:var(--mono);font-size:13px;font-weight:600;padding:4px 10px;border-radius:20px;
+    background:#0d1117;border:1px solid var(--line);color:var(--dim);letter-spacing:.5px}
+  #state.s-estop{background:rgba(248,81,73,.16);border-color:var(--bad);color:var(--bad);animation:pulse 1s infinite}
+  #state.s-armed{background:rgba(255,123,0,.14);border-color:var(--arm);color:var(--arm)}
+  #state.s-arming{background:rgba(210,153,34,.14);border-color:var(--warn);color:var(--warn)}
+  #state.s-ready{background:rgba(63,185,80,.12);border-color:var(--ok);color:var(--ok)}
+  #state.s-cal{background:rgba(88,166,255,.12);border-color:var(--accent);color:var(--accent)}
+  #state.s-nolink{color:var(--dim)}
+  @keyframes pulse{50%{opacity:.55}}
+  canvas{width:100%;display:block;border-radius:8px;background:#0a0e14}
+  .rows{display:flex;flex-direction:column;gap:8px}
+  .row{display:flex;justify-content:space-between;align-items:baseline;font-family:var(--mono);font-size:13px}
+  .row .k{color:var(--dim)} .row .v{font-weight:600}
+  .big{font-family:var(--mono);font-size:30px;font-weight:700;line-height:1}
+  .unit{font-size:13px;color:var(--dim);font-weight:400}
+  .bar{height:8px;border-radius:6px;background:#0a0e14;border:1px solid var(--line);overflow:hidden;margin-top:6px}
+  .bar>i{display:block;height:100%;background:var(--accent);width:0}
+  /* motors */
+  .motors{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .mot{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px;text-align:center}
+  .mot .lbl{font-size:10px;color:var(--dim);letter-spacing:1px}
+  .mot .mval{font-family:var(--mono);font-size:18px;font-weight:700;margin-top:2px}
+  .mbar{height:6px;border-radius:4px;background:#0a0e14;margin-top:6px;overflow:hidden}
+  .mbar>i{display:block;height:100%;width:0;background:var(--ok)}
+  /* commands */
+  #cmds{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  button{font:inherit;font-weight:650;border-radius:9px;border:1px solid var(--line);background:var(--panel2);
+    color:var(--ink);padding:11px 16px;cursor:pointer;transition:filter .1s}
+  button:hover{filter:brightness(1.18)} button:active{transform:translateY(1px)}
+  button.estop{background:var(--bad);border-color:#ff6b63;color:#fff;font-size:16px;padding:13px 26px;
+    box-shadow:0 0 0 1px rgba(248,81,73,.4)}
+  button.warn{background:#3a2d12;border-color:var(--warn);color:var(--warn)}
+  button.reset{background:#12233a;border-color:var(--accent);color:var(--accent)}
+  .hz{display:flex;align-items:center;gap:6px;font-family:var(--mono)}
+  #ack{font-family:var(--mono);font-size:12px;color:var(--dim);margin-left:auto}
+  .muted{color:var(--dim)}
+  #profile{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+  #profile label{display:flex;flex-direction:column;gap:4px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim)}
+  #profile input{width:96px;background:#0a0e14;border:1px solid var(--line);border-radius:6px;color:var(--ink);padding:8px;font-family:var(--mono);font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <h1>riskybird&nbsp;v3 <span class="sub">· ground station</span></h1>
+  <div class="link">
+    <span><span id="dot" class="dot"></span> <span id="linktxt">no link</span></span>
+    <span id="rate">-- Hz</span>
+    <span id="qual">--%</span>
+    <span id="pkts">0 pkts</span>
+  </div>
+</header>
+
+<div class="wrap">
+  <div id="state" class="s-nolink"><span id="statetxt">WAITING FOR TELEMETRY</span>
+    <span class="badge" id="calbadge">cal --</span>
+    <span class="badge" id="itbadge">it --</span>
+    <span class="badge" id="loopbadge">-- Hz loop</span>
+  </div>
+
+  <!-- 3D estimated state -->
+  <div class="card c12">
+    <h2>3D — estimated state <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">· drag to orbit · scroll to zoom · R to reset view</span></h2>
+    <canvas id="scene" width="1000" height="430" style="width:100%;height:auto;cursor:grab"></canvas>
+    <div class="rows" style="margin-top:8px;flex-direction:row;gap:26px;flex-wrap:wrap">
+      <div class="row" style="gap:8px"><span class="k">pos&nbsp;x,y,z</span><span class="v" id="pos3">-- , -- , --</span></div>
+      <div class="row" style="gap:8px"><span class="k">speed</span><span class="v" id="vel3">-- m/s</span></div>
+      <div class="row" style="gap:8px"><span class="k">drift&nbsp;from&nbsp;home</span><span class="v" id="drift3">-- m</span></div>
+    </div>
+  </div>
+
+  <!-- attitude -->
+  <div class="card c5">
+    <h2>Attitude</h2>
+    <canvas id="ah" width="440" height="300"></canvas>
+    <div class="rows" style="margin-top:10px">
+      <div class="row"><span class="k">roll</span><span class="v" id="roll">--°</span></div>
+      <div class="row"><span class="k">pitch</span><span class="v" id="pitch">--°</span></div>
+      <div class="row"><span class="k">yaw</span><span class="v" id="yaw">--°</span></div>
+    </div>
+  </div>
+
+  <!-- drift / velocity -->
+  <div class="card c4">
+    <h2>Horizontal drift &amp; velocity</h2>
+    <canvas id="drift" width="340" height="300"></canvas>
+    <div class="rows" style="margin-top:10px">
+      <div class="row"><span class="k">vx / vy</span><span class="v" id="vxy">-- , --</span></div>
+      <div class="row"><span class="k">speed</span><span class="v" id="spd">-- m/s</span></div>
+      <div class="row"><span class="k">vz (climb)</span><span class="v" id="vz">-- m/s</span></div>
+    </div>
+  </div>
+
+  <!-- altitude -->
+  <div class="card c3">
+    <h2>Altitude</h2>
+    <div><span class="big" id="zbig">--</span> <span class="unit">m est</span></div>
+    <div class="bar"><i id="zbar" style="background:var(--accent)"></i></div>
+    <div class="rows" style="margin-top:12px">
+      <div class="row"><span class="k">target zsp</span><span class="v" id="zsp">-- m</span></div>
+      <div class="row"><span class="k">raw ToF</span><span class="v" id="tofh">-- m</span></div>
+      <div class="row"><span class="k">ToF valid</span><span class="v" id="tofv">--</span></div>
+    </div>
+  </div>
+
+  <!-- motors -->
+  <div class="card c5">
+    <h2>Motor duty</h2>
+    <div class="motors">
+      <div class="mot"><div class="lbl">FL (m3)</div><div class="mval" id="m3">--</div><div class="mbar"><i id="m3b"></i></div></div>
+      <div class="mot"><div class="lbl">FR (m0)</div><div class="mval" id="m0">--</div><div class="mbar"><i id="m0b"></i></div></div>
+      <div class="mot"><div class="lbl">RL (m2)</div><div class="mval" id="m2">--</div><div class="mbar"><i id="m2b"></i></div></div>
+      <div class="mot"><div class="lbl">RR (m1)</div><div class="mval" id="m1">--</div><div class="mbar"><i id="m1b"></i></div></div>
+    </div>
+  </div>
+
+  <!-- battery + link -->
+  <div class="card c3">
+    <h2>Battery</h2>
+    <div><span class="big" id="vbat">--</span> <span class="unit">V</span></div>
+    <div class="bar"><i id="vbatbar"></i></div>
+    <div class="rows" style="margin-top:12px">
+      <div class="row"><span class="k">link age</span><span class="v" id="age">-- ms</span></div>
+      <div class="row"><span class="k">from</span><span class="v muted" id="src">--</span></div>
+    </div>
+  </div>
+
+  <div class="card c4">
+    <h2>Trend (drift &amp; altitude)</h2>
+    <canvas id="trend" width="340" height="150"></canvas>
+    <div class="rows" style="margin-top:8px">
+      <div class="row"><span class="k" style="color:var(--accent)">— vx</span><span class="k" style="color:var(--ok)">— vy</span><span class="k" style="color:var(--warn)">— z</span></div>
+    </div>
+  </div>
+
+  <!-- commands -->
+  <div class="card c12">
+    <h2>Commands &nbsp;<span class="muted" style="text-transform:none;letter-spacing:0">→ udp :14551</span></h2>
+    <div id="cmds">
+      <button class="estop" onclick="cmd('ESTOP')">⭘ ESTOP</button>
+      <button onclick="cmd('DISARM')">DISARM</button>
+      <button class="reset" onclick="cmd('RESET')" title="RESET / ARM-ENABLE: clears ESTOP, re-runs gyro cal, and ENABLES arming — the drone will NOT arm on power-up until you press this (no chip reset)">↺ RESET / ENABLE</button>
+      <span class="hz">
+        <button class="warn" onclick="hoverStep(-50)">− 50mm</button>
+        <span id="hz" style="font-family:var(--mono);min-width:70px;text-align:center">HOVER 300</span>
+        <button class="warn" onclick="hoverStep(50)">+ 50mm</button>
+        <button onclick="sendHover()">SET</button>
+      </span>
+      <button onclick="cmd('PING')">PING</button>
+      <span id="ack">ready</span>
+    </div>
+  </div>
+
+  <!-- flight profile -->
+  <div class="card c12">
+    <h2>Flight profile <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">· set on the ground; applies to the next flight</span></h2>
+    <div id="profile">
+      <label>climb ms<input id="p_climb" type="number" value="1500" step="250" oninput="updCap()"></label>
+      <label>hover ms<input id="p_hover" type="number" value="6000" step="500" oninput="updCap()"></label>
+      <label>descend ms<input id="p_descend" type="number" value="4000" step="500" oninput="updCap()"></label>
+      <label>cap ms<input id="p_max" type="number" value="13500" step="500"></label>
+      <label>hover alt mm<input id="p_hz" type="number" value="300" step="25"></label>
+      <button class="reset" onclick="sendProfile()">SET PROFILE</button>
+      <span id="pack" class="muted" style="font-family:var(--mono)">defaults</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const DEG = 180/Math.PI;
+const fmt = (x,n=2)=> (x==null? '--' : (x>=0?'':'') + x.toFixed(n));
+
+// ---- command uplink ----
+let hoverMM = 300;
+function setHzLabel(){ $('hz').textContent = 'HOVER ' + hoverMM; }
+function hoverStep(d){ hoverMM = Math.max(0, Math.min(600, hoverMM + d)); setHzLabel(); }
+async function cmd(text){
+  $('ack').textContent = '→ ' + text + ' ...';
+  try{
+    const r = await fetch('/cmd', {method:'POST', body:text});
+    const j = await r.json();
+    $('ack').textContent = (j.sent||text) + '  ⇒  ' + (j.ack||'(no reply)');
+  }catch(e){ $('ack').textContent = 'send failed: ' + e; }
+}
+function sendHover(){ cmd('HOVER_Z ' + hoverMM); }
+setHzLabel();
+
+// ---- flight profile ----
+function updCap(){
+  const c=+$('p_climb').value||0, h=+$('p_hover').value||0, d=+$('p_descend').value||0;
+  $('p_max').value = c + h + d + 2000;   // auto-suggest a cap that fits the profile (+2 s margin)
+}
+async function sendProfile(){
+  const c=+$('p_climb').value, h=+$('p_hover').value, d=+$('p_descend').value, m=+$('p_max').value, hz=+$('p_hz').value;
+  $('pack').textContent='setting…';
+  await cmd('PROFILE '+c+' '+h+' '+d+' '+m);
+  await cmd('HOVER_Z '+hz);
+  $('pack').textContent=`set: climb ${c} / hover ${h} / descend ${d} / cap ${m} ms, alt ${hz} mm`;
+}
+
+// ---- trend ring buffers ----
+const N = 160;
+const H = { vx:new Array(N).fill(null), vy:new Array(N).fill(null), z:new Array(N).fill(null) };
+function push(arr,v){ arr.push(v); if(arr.length>N) arr.shift(); }
+
+// ---- artificial horizon ----
+function drawAH(roll, pitch){
+  const c = $('ah'), ctx = c.getContext('2d');
+  const W=c.width, Hh=c.height, cx=W/2, cy=Hh/2, R=Math.min(W,Hh)/2-6;
+  ctx.clearRect(0,0,W,Hh);
+  ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,R,0,7); ctx.clip();
+  ctx.translate(cx,cy); ctx.rotate(-(roll||0));
+  const pxPerRad = 320; const off = (pitch||0)*pxPerRad;
+  // sky / ground
+  ctx.fillStyle='#1e5f8c'; ctx.fillRect(-W, -Hh*2+off, W*2, Hh*2);
+  ctx.fillStyle='#5a3d1e'; ctx.fillRect(-W, off, W*2, Hh*2);
+  ctx.strokeStyle='#e6edf3'; ctx.lineWidth=2; ctx.beginPath();
+  ctx.moveTo(-W, off); ctx.lineTo(W, off); ctx.stroke();
+  // pitch ladder
+  ctx.strokeStyle='rgba(230,237,243,.55)'; ctx.fillStyle='rgba(230,237,243,.7)';
+  ctx.lineWidth=1; ctx.font='10px monospace'; ctx.textAlign='center';
+  for(let d=-30; d<=30; d+=10){ if(d===0) continue;
+    const y = off - d/DEG*pxPerRad; const w = (d%20===0)?42:24;
+    ctx.beginPath(); ctx.moveTo(-w,y); ctx.lineTo(w,y); ctx.stroke();
+    ctx.fillText(d+'', w+14, y+3);
+  }
+  ctx.restore();
+  // fixed aircraft marker
+  ctx.strokeStyle='#ffcc33'; ctx.lineWidth=3; ctx.beginPath();
+  ctx.moveTo(cx-46,cy); ctx.lineTo(cx-16,cy); ctx.moveTo(cx+16,cy); ctx.lineTo(cx+46,cy);
+  ctx.moveTo(cx,cy-3); ctx.lineTo(cx,cy+3); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,3,0,7); ctx.fillStyle='#ffcc33'; ctx.fill();
+  // roll arc + ring
+  ctx.strokeStyle='rgba(230,237,243,.35)'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,7); ctx.stroke();
+  ctx.strokeStyle='#ffcc33'; ctx.save(); ctx.translate(cx,cy); ctx.rotate(-(roll||0));
+  ctx.beginPath(); ctx.moveTo(0,-R); ctx.lineTo(-6,-R+11); ctx.lineTo(6,-R+11); ctx.closePath();
+  ctx.fillStyle='#ffcc33'; ctx.fill(); ctx.restore();
+}
+
+// ---- drift indicator (top-down) ----
+function drawDrift(vx,vy){
+  const c=$('drift'), ctx=c.getContext('2d');
+  const W=c.width,Hh=c.height,cx=W/2,cy=Hh/2, R=Math.min(W,Hh)/2-10;
+  const MAX=1.0, sc=R/MAX; // rings at 0.2,0.5,1.0 m/s
+  ctx.clearRect(0,0,W,Hh);
+  ctx.strokeStyle='#232b36'; ctx.fillStyle='#6a7683'; ctx.font='9px monospace'; ctx.textAlign='center';
+  [0.2,0.5,1.0].forEach(r=>{ ctx.beginPath(); ctx.arc(cx,cy,r*sc,0,7); ctx.stroke();
+    ctx.fillText(r+'', cx, cy-r*sc+11); });
+  ctx.strokeStyle='#1b2230'; ctx.beginPath(); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy);
+  ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R); ctx.stroke();
+  ctx.fillStyle='#6a7683'; ctx.fillText('+x fwd', cx, cy-R-1); ctx.fillText('+y', cx+R-10, cy-4);
+  if(vx==null||vy==null){ return; }
+  // body frame: +x forward (up on screen), +y right (right on screen)
+  const px=cx + vy*sc, py=cy - vx*sc;
+  const spd=Math.hypot(vx,vy);
+  const col = spd<0.15? '#3fb950' : spd<0.4? '#d29922' : '#f85149';
+  ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(px,py); ctx.stroke();
+  ctx.fillStyle=col; ctx.beginPath(); ctx.arc(px,py,5,0,7); ctx.fill();
+}
+
+// ---- trend ----
+function drawTrend(){
+  const c=$('trend'), ctx=c.getContext('2d'); const W=c.width,Hh=c.height;
+  ctx.clearRect(0,0,W,Hh);
+  ctx.strokeStyle='#1b2230'; ctx.beginPath(); ctx.moveTo(0,Hh/2); ctx.lineTo(W,Hh/2); ctx.stroke();
+  const plot=(arr,color,lo,hi)=>{ ctx.strokeStyle=color; ctx.lineWidth=1.5; ctx.beginPath(); let started=false;
+    for(let i=0;i<arr.length;i++){ const v=arr[i]; if(v==null){started=false;continue;}
+      const x=i/(N-1)*W; const y=Hh-((v-lo)/(hi-lo))*Hh;
+      if(!started){ctx.moveTo(x,y);started=true;} else ctx.lineTo(x,y);} ctx.stroke(); };
+  plot(H.vx,'#58a6ff',-1,1); plot(H.vy,'#3fb950',-1,1); plot(H.z,'#d29922',0,0.7);
+}
+
+// ---- render ----
+function stateClass(t){
+  if(!t) return ['s-nolink','WAITING FOR TELEMETRY'];
+  if(t.estop) return ['s-estop','⛔ ESTOP — MOTORS CUT'];
+  if(t.armed) return ['s-armed','● ARMED — MOTORS LIVE'];
+  if(t.arming) return ['s-arming','◐ ARMING…'];
+  if(!t.caldone) return ['s-cal','CALIBRATING'];
+  return ['s-ready','READY — disarmed'];
+}
+function render(p){
+  const L=p.link, t=p.t;
+  $('dot').className='dot'+(L.connected?' on':'');
+  $('linktxt').textContent = L.connected? 'linked' : (L.age_ms==null?'no link':'stale');
+  $('rate').textContent = L.rate.toFixed(0)+' Hz';
+  $('qual').textContent = L.quality+'%';
+  $('pkts').textContent = L.count+' pkts';
+  const [cls,txt]=stateClass(t);
+  const sb=$('state'); sb.className=''; sb.classList.add(cls); $('statetxt').textContent=txt;
+  last3=t; try{ draw3d(t); }catch(err){}
+  if(!t){ return; }
+  $('calbadge').textContent = t.caldone?'cal ✓':'cal…';
+  $('itbadge').textContent = 'it '+t.it;
+  $('loopbadge').textContent = (t.dt_ms>0?Math.round(1000/t.dt_ms):0)+' Hz loop';
+  $('roll').textContent=(t.roll*DEG).toFixed(1)+'°';
+  $('pitch').textContent=(t.pitch*DEG).toFixed(1)+'°';
+  $('yaw').textContent=(t.yaw*DEG).toFixed(1)+'°';
+  drawAH(t.roll,t.pitch);
+  $('vxy').textContent=fmt(t.vx)+' , '+fmt(t.vy);
+  $('spd').textContent=(t.vx==null?'--':Math.hypot(t.vx,t.vy).toFixed(2))+' m/s';
+  $('vz').textContent=fmt(t.vz)+' m/s';
+  drawDrift(t.vx,t.vy);
+  $('zbig').textContent=t.z.toFixed(2);
+  $('zbar').style.width=Math.max(0,Math.min(100,t.z/0.6*100))+'%';
+  $('zsp').textContent=(t.zsp==null?'--':t.zsp.toFixed(2))+' m';
+  $('tofh').textContent=t.tofh.toFixed(2)+' m';
+  $('tofv').innerHTML = t.tofv? '<span style="color:var(--ok)">yes</span>':'<span style="color:var(--bad)">no</span>';
+  const mids=['m0','m1','m2','m3'];
+  for(let i=0;i<4;i++){ const v=t.u[i]; $(mids[i]).textContent=v.toFixed(3);
+    const b=$(mids[i]+'b'); b.style.width=Math.max(0,Math.min(100,v*100))+'%';
+    b.style.background = v<0.4?'#3fb950':v<0.75?'#d29922':'#f85149'; }
+  if(t.vbat!=null && t.vbat>=1){ $('vbat').textContent=t.vbat.toFixed(2);
+    $('vbatbar').style.width=Math.max(0,Math.min(100,(t.vbat-3.2)/(4.2-3.2)*100))+'%';
+    $('vbatbar').style.background=t.vbat<3.4?'#f85149':t.vbat<3.7?'#d29922':'#3fb950';
+  } else { $('vbat').textContent='--'; $('vbatbar').style.width='0'; }
+  $('age').textContent=(L.age_ms==null?'--':L.age_ms)+' ms';
+  $('src').textContent = p.src||'—';
+  push(H.vx,t.vx); push(H.vy,t.vy); push(H.z,t.z); drawTrend();
+}
+
+// ================= 3D estimated-state view =================
+const scene = document.getElementById('scene');
+const g3 = scene.getContext('2d');
+const CAM0 = { az:-2.2, el:0.42, dist:3.6, tz:0.25 };
+const cam = { ...CAM0, tx:0, ty:0 };
+let last3 = null;
+
+const v_sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const v_add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+const v_dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const v_cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const v_norm=a=>{const m=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/m,a[1]/m,a[2]/m];};
+
+// body -> world rotation (aerospace ZYX: yaw then pitch then roll)
+function rotBW(b, roll, pitch, yaw){
+  const cr=Math.cos(roll),sr=Math.sin(roll),cp=Math.cos(pitch),sp=Math.sin(pitch),cy=Math.cos(yaw),sy=Math.sin(yaw);
+  return [ (cp*cy)*b[0] + (sr*sp*cy-cr*sy)*b[1] + (cr*sp*cy+sr*sy)*b[2],
+           (cp*sy)*b[0] + (sr*sp*sy+cr*cy)*b[1] + (cr*sp*sy-sr*cy)*b[2],
+           (-sp)*b[0]   + (sr*cp)*b[1]          + (cr*cp)*b[2] ];
+}
+// body -> world rotation by a unit quaternion (singularity-free; used when the panel supplies qw..qz)
+function rotQ(b, qw,qx,qy,qz){
+  const xx=qx*qx,yy=qy*qy,zz=qz*qz,xy=qx*qy,xz=qx*qz,yz=qy*qz,wx=qw*qx,wy=qw*qy,wz=qw*qz;
+  return [ (1-2*(yy+zz))*b[0] + 2*(xy-wz)*b[1]   + 2*(xz+wy)*b[2],
+           2*(xy+wz)*b[0]   + (1-2*(xx+zz))*b[1] + 2*(yz-wx)*b[2],
+           2*(xz-wy)*b[0]   + 2*(yz+wx)*b[1]     + (1-2*(xx+yy))*b[2] ];
+}
+function project(p){
+  const ce=Math.cos(cam.el), se=Math.sin(cam.el), ca=Math.cos(cam.az), sa=Math.sin(cam.az);
+  const cp=[cam.tx+cam.dist*ce*ca, cam.ty+cam.dist*ce*sa, cam.tz+cam.dist*se];
+  const T=[cam.tx,cam.ty,cam.tz];
+  const fwd=v_norm(v_sub(T,cp)), right=v_norm(v_cross(fwd,[0,0,1])), up=v_cross(right,fwd);
+  const v=v_sub(p,cp), zc=v_dot(v,fwd);
+  if(zc<=0.05) return null;
+  const f=scene.height*0.95;
+  return {x: scene.width/2 + f*v_dot(v,right)/zc, y: scene.height/2 - f*v_dot(v,up)/zc, z:zc};
+}
+function seg3(a,b,col,w){ const pa=project(a),pb=project(b); if(!pa||!pb)return; g3.strokeStyle=col; g3.lineWidth=w; g3.beginPath(); g3.moveTo(pa.x,pa.y); g3.lineTo(pb.x,pb.y); g3.stroke(); }
+function draw3d(t){
+  const W=scene.width, H=scene.height;
+  const grd=g3.createLinearGradient(0,0,0,H); grd.addColorStop(0,'#0a0f18'); grd.addColorStop(1,'#0d141d');
+  g3.fillStyle=grd; g3.fillRect(0,0,W,H);
+  // checkerboard ground on z=0, painter's algorithm (far cells first)
+  const G=6, C=0.25, cells=[];
+  for(let i=-G;i<G;i++) for(let j=-G;j<G;j++){
+    const cs=[[i*C,j*C,0],[(i+1)*C,j*C,0],[(i+1)*C,(j+1)*C,0],[i*C,(j+1)*C,0]].map(project);
+    if(cs.some(c=>!c)) continue;
+    cells.push({cs, depth:(cs[0].z+cs[2].z)*0.5, even:((i+j)&1)===0});
+  }
+  cells.sort((a,b)=>b.depth-a.depth);
+  for(const c of cells){
+    g3.beginPath(); g3.moveTo(c.cs[0].x,c.cs[0].y);
+    for(let k=1;k<4;k++) g3.lineTo(c.cs[k].x,c.cs[k].y); g3.closePath();
+    g3.fillStyle=c.even?'#22334d':'#151f2d'; g3.fill();
+    g3.strokeStyle='rgba(255,255,255,.04)'; g3.lineWidth=1; g3.stroke();
+  }
+  seg3([-0.16,0,0],[0.16,0,0],'#40506b',1); seg3([0,-0.16,0],[0,0.16,0],'#40506b',1);   // home crosshair
+  if(!t || t.x==null){ g3.fillStyle='#6a7683'; g3.font='13px sans-serif'; g3.textAlign='center';
+    g3.fillText('waiting for position telemetry…', W/2, H*0.5); return; }
+  const P=[t.x,t.y,t.z], base=[t.x,t.y,0];
+  seg3(P,base,'rgba(88,166,255,.4)',1);                                                   // drop line
+  const pb=project(base); if(pb){ g3.beginPath(); g3.ellipse(pb.x,pb.y,11,4,0,0,7); g3.fillStyle='rgba(0,0,0,.4)'; g3.fill(); }
+  const A=0.11;
+  // prefer the reconstructed quaternion (correct at all attitudes); fall back to Euler if absent
+  const rb = (t.qw!=null) ? (v)=>rotQ(v,t.qw,t.qx,t.qy,t.qz) : (v)=>rotBW(v,t.roll,t.pitch,t.yaw);
+  const arms=[[A,A,0],[-A,A,0],[-A,-A,0],[A,-A,0]];   // FR RR RL FL  (x fwd, y right)
+  const mCol=v=>v<0.4?'#3fb950':v<0.75?'#d29922':'#f85149';
+  for(let m=0;m<4;m++){ const w=v_add(P,rb(arms[m])); seg3(P,w,'#8b98a8',2);
+    const s=project(w); if(s){ g3.beginPath(); g3.arc(s.x,s.y,7,0,7); g3.fillStyle=mCol(t.u[m]); g3.fill(); g3.strokeStyle='#0d1117'; g3.lineWidth=1; g3.stroke(); } }
+  seg3(P, v_add(P,rb([A*1.7,0,0])), '#ffcc33', 2.5);                             // nose/heading
+  const vs=0.6, spd=Math.hypot(t.vx||0,t.vy||0,t.vz||0);
+  seg3(P,[t.x+(t.vx||0)*vs,t.y+(t.vy||0)*vs,t.z+(t.vz||0)*vs], spd<0.15?'#3fb950':spd<0.4?'#d29922':'#f85149',2.5);
+  const pe=project([t.x+(t.vx||0)*vs,t.y+(t.vy||0)*vs,t.z+(t.vz||0)*vs]);
+  if(pe){ g3.fillStyle=spd<0.15?'#3fb950':spd<0.4?'#d29922':'#f85149'; g3.beginPath(); g3.arc(pe.x,pe.y,4,0,7); g3.fill(); }
+  $('pos3').textContent=`${t.x.toFixed(2)} , ${t.y.toFixed(2)} , ${t.z.toFixed(2)}`;
+  $('vel3').textContent=`${spd.toFixed(2)} m/s`;
+  $('drift3').textContent=`${Math.hypot(t.x,t.y).toFixed(2)} m`;
+}
+// camera controls
+let drag=null;
+scene.addEventListener('mousedown',e=>{drag={x:e.clientX,y:e.clientY}; scene.style.cursor='grabbing';});
+window.addEventListener('mouseup',()=>{ if(drag){drag=null; scene.style.cursor='grab';}});
+window.addEventListener('mousemove',e=>{ if(!drag)return; cam.az-=(e.clientX-drag.x)*0.01;
+  cam.el=Math.max(0.05,Math.min(1.45,cam.el+(e.clientY-drag.y)*0.008)); drag={x:e.clientX,y:e.clientY}; draw3d(last3); });
+scene.addEventListener('wheel',e=>{e.preventDefault(); cam.dist=Math.max(1.2,Math.min(9,cam.dist*(1+Math.sign(e.deltaY)*0.1))); draw3d(last3);},{passive:false});
+window.addEventListener('keydown',e=>{ if(e.key==='r'||e.key==='R'){ Object.assign(cam,CAM0); draw3d(last3);} });
+draw3d(null);
+
+const es = new EventSource('/stream');
+es.onmessage = e => { try{ render(JSON.parse(e.data)); }catch(err){} };
+es.onerror = () => { $('dot').className='dot'; $('linktxt').textContent='reconnecting…'; };
+// keyboard: E = estop
+window.addEventListener('keydown', e=>{ if(e.key==='e'||e.key==='E') cmd('ESTOP'); });
+</script>
+</body>
+</html>

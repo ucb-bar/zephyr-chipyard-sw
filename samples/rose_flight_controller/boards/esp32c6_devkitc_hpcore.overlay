@@ -13,9 +13,24 @@
  *   - ToF: the st,vl53l1x driver needs the ST HAL module (hal_st, not installed here), so
  *     no `tof` alias -> the app compiles with ToF disabled (HAVE_TOF guard). Add hal_st +
  *     a vl53l1x@29 node + `tof` alias to enable it (see riskybird sensor_bringup).
- *   - motors: actuator parity is future work; with no `motors` alias the app's output is
- *     a no-op stub. Add a PWM `motors` node here to drive real ESC/motors.
+ *   - motors: 4 brushed motors on low-side SI2302 FETs, driven by LEDC PWM below
+ *     (`motors` alias). send_control() HARD-CAPS duty to MOTOR_MAX_DUTY (10%) for
+ *     early bench bring-up -- enough to observe response, NOT to fly. Raise for flight.
  */
+
+/* Route console + shell to the ESP32-C6 built-in USB Serial/JTAG so boot/telemetry appears on the
+ * riskybird USB-C port (/dev/ttyACM*). The hpcore board defaults the console to UART0 physical pins
+ * which are not broken out here, so without this the flight-controller logs go nowhere reachable. */
+/ {
+	chosen {
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
 
 &pinctrl {
 	i2c0_default: i2c0_default {
@@ -26,6 +41,35 @@
 			output-high;
 		};
 	};
+
+	/* Motor PWM (low-side SI2302 gates): M1=GPIO21/CH0 M2=GPIO20/CH1
+	 * M3=GPIO23/CH2 M4=GPIO22/CH3 (mirrors samples/riskybird/actuator_bringup). */
+	ledc0_default: ledc0_default {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO21>, <LEDC_CH1_GPIO20>,
+				 <LEDC_CH2_GPIO23>, <LEDC_CH3_GPIO22>;
+			output-enable;
+		};
+	};
+
+	/* PMW3901 optical-flow SPI (ROSE_FLOW): SCLK GPIO6, MOSI GPIO7, MISO GPIO18; software CS on
+	 * GPIO19 (driven by flow.c). CSEL_GPIO10 is a dummy hardware CS (unused). Does NOT conflict
+	 * with I2C0 (GPIO14/15). */
+	spim2_flow: spim2_flow {
+		group1 {
+			pinmux = <SPIM2_MISO_GPIO18>, <SPIM2_SCLK_GPIO6>, <SPIM2_CSEL_GPIO10>;
+		};
+		group2 {
+			pinmux = <SPIM2_MOSI_GPIO7>;
+			output-low;
+		};
+	};
+};
+
+&spi2 {
+	status = "okay";
+	pinctrl-0 = <&spim2_flow>;
+	pinctrl-names = "default";
 };
 
 &i2c0 {
@@ -50,21 +94,92 @@
 		status = "okay";
 	};
 
-	/* VL53L1X down-ToF @0x29 (power-on address; the 4x VL53L5CX that would collide at 0x29 are
-	 * not populated, so no readdress needed). Powered via the ADS7128 GPIO6 XSHUT by the
-	 * board_sensor_init() SYS_INIT hook (main.cpp) before this driver inits. hal_st is now
-	 * vendored (west workspace), so CONFIG_VL53L1X builds. */
-	vl53l1x: vl53l1x@29 {
+	/* VL53L1X down-ToF. Powers on at 0x29 (like all VL53Lx), but main.cpp's vl53l1x_readdress_down()
+	 * moves it to 0x30 at boot so it never shares 0x29 with the 4 side VL53L5CX as they power up +
+	 * readdress to 0x31-0x34 (else the down gets clobbered -> stuck 0mm). reg MUST match
+	 * VL53L1X_DOWN_ADDR. Powered via the ADS7128 GPIO6 XSHUT by the board_sensor_init() SYS_INIT hook
+	 * (main.cpp) before this driver inits; the deferred ST init runs in main via vl53l1x_reinit().
+	 * hal_st is vendored (west workspace), so CONFIG_VL53L1X builds. */
+	vl53l1x: vl53l1x@30 {
 		compatible = "st,vl53l1x";
-		reg = <0x29>;
+		reg = <0x30>;
 		status = "okay";
+	};
+
+	/* BMP388 barometer (U5 @0x76; ADR/SDO tied low). Bosch "drone" preset: ODR 50 Hz, pressure
+	 * oversampling x8 (19-bit, ~0.33 Pa), IIR filter 3. Fused with the down-ToF for altitude
+	 * (ROSE_BARO=1): the ToF is the absolute floor anchor, the baro fills tilt/step gaps and is
+	 * bias-calibrated by the ToF in the estimator. `baro` alias -> HAVE_BARO. */
+	bmp388: bmp388@76 {
+		compatible = "bosch,bmp388";
+		reg = <0x76>;
+		odr = "50";
+		osr-press = <8>;
+		osr-temp = <1>;
+		iir-filter = <3>;
+		status = "okay";
+	};
+
+	/* 4 side-facing VL53L5CX wall sensors (bumper). All default to 0x29; side_tof.c enables each
+	 * via ADS7128 GPIO1-4 and readdresses to 0x31-0x34 at runtime, so the DT reg is the FINAL
+	 * address. Map: 0x31=GPIO1=J9=back, 0x32=GPIO2=J2=front, 0x33=GPIO3=J11=right, 0x34=GPIO4=J10=left. */
+	side_back: vl53l5cx@31 {
+		compatible = "st,vl53l5cx";
+		reg = <0x31>;
+	};
+	side_front: vl53l5cx@32 {
+		compatible = "st,vl53l5cx";
+		reg = <0x32>;
+	};
+	side_right: vl53l5cx@33 {
+		compatible = "st,vl53l5cx";
+		reg = <0x33>;
+	};
+	side_left: vl53l5cx@34 {
+		compatible = "st,vl53l5cx";
+		reg = <0x34>;
 	};
 };
 
 / {
 	aliases {
+		side-back = &side_back;
+		side-front = &side_front;
+		side-right = &side_right;
+		side-left = &side_left;
+	};
+};
+
+&ledc0 {
+	status = "okay";
+	pinctrl-0 = <&ledc0_default>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel0@0 { reg = <0x0>; timer = <0>; };
+	channel1@1 { reg = <0x1>; timer = <0>; };
+	channel2@2 { reg = <0x2>; timer = <0>; };
+	channel3@3 { reg = <0x3>; timer = <0>; };
+};
+
+/ {
+	/* 4 motor PWM outputs for the flight controller's `motors` alias.
+	 * Index maps: u[0]->M1(GPIO21) u[1]->M2(GPIO20) u[2]->M3(GPIO23) u[3]->M4(GPIO22).
+	 * 20 kHz (50000 ns); app maps thrust->duty and HARD-CAPS it in send_control(). */
+	pwm_motors: pwm_motors {
+		compatible = "riskybird,pwm-motors";
+		pwms = <&ledc0 0 50000 0>,
+		       <&ledc0 1 50000 0>,
+		       <&ledc0 2 50000 0>,
+		       <&ledc0 3 50000 0>;
+	};
+
+	aliases {
 		bmi088-accel = &bmi088_accel;
 		bmi088-gyro  = &bmi088_gyro;
 		tof = &vl53l1x;
+		baro = &bmp388;
+		motors = &pwm_motors;
 	};
 };
