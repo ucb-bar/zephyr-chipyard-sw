@@ -67,6 +67,22 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
  * the file portable.
  */
 #define HAVE_STATUS_LED DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)
+
+/*
+ * Selecting the flow HARDWARE without selecting the flow FEATURE is silent
+ * otherwise.
+ *
+ * A board that names a `flow-spi` alias plainly intends to use the PMW3901, but
+ * the real flow path is gated on the ROSE_FLOW CMake knob, not on the alias --
+ * so a build that declares the sensor and forgets the knob compiles flow.c,
+ * links it, and never calls it. The image looks right and the estimator gets a
+ * forced-zero horizontal velocity.
+ *
+ * Costs nothing when the two agree, and names the missing flag when they do not.
+ */
+#if DT_NODE_EXISTS(DT_ALIAS(flow_spi)) && !(defined(ROSE_FLOW) && ROSE_FLOW)
+#pragma message("flow-spi alias present but ROSE_FLOW=0: optical flow is NOT compiled in. Add -DROSE_FLOW=1 to enable it.")
+#endif
 #if HAVE_FLOW
 #include <rose/rose_sensor.h>   /* RoSE private optical-flow channels */
 #endif
