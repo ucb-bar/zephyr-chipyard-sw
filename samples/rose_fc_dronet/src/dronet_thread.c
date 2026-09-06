@@ -68,11 +68,19 @@
  * (dronet_model_poll/kernels.c) handles the Gemmini convs; these SHORT RVV ops
  * are IRQ-masked whole (each << the >=200 Hz budget) because the Saturn
  * mis-resumes their mid-execution strided vector memory ops at vstart!=0.
- * maxpool2d_s8 is NOT here: its ~25 ms would stall the loop if masked whole, so
- * its kernel self-protects PER CHANNEL (irq_lock a ~0.8 ms channel around the
- * strided vlse8, k_yield between channels) -- >=200 Hz-friendly AND bit-exact. */
+ *
+ * maxpool2d_s8: FLIGHT DEFAULT is the fault-free WHOLE-OP mask (in the list
+ * below) -- zero preemption window, guaranteed no Saturn strided mis-resume.
+ * COST: the maxpool runs ~25 ms IRQ-off, so the control loop sees ONE ~25 ms
+ * gap per DroNet frame (bench: FC+DroNet mean 166 Hz, worst-case jitter 43 ms).
+ * The maxpool2d_s8 kernel ALSO self-protects PER CHANNEL (irq_lock a ~0.8 ms
+ * channel around the strided vlse8, k_yield between channels); to trade the
+ * safety margin for a tighter loop, build with a DRONET_MASK_OPS that OMITS
+ * "maxpool" -- the per-channel self-protect then keeps the loop running
+ * (bench: mean 168 Hz, worst-case jitter 18 ms, still err=3/no-fault across the
+ * runs measured, but leaves a small per-channel preemption window). */
 #ifndef DRONET_MASK_OPS
-#define DRONET_MASK_OPS "batchnorm", "add_s8", "relu", "linear", "sigmoid"
+#define DRONET_MASK_OPS "batchnorm", "add_s8", "relu", "linear", "sigmoid", "maxpool"
 #endif
 
 static model_dronet_output_t dronet_out[MODEL_DRONET_OUTPUT_SIZE];
