@@ -1,0 +1,54 @@
+--- /home/cobble/Tools/zephyr-chipyard-sw/modelblaster/examples/dronet/int8/generated_gray/hetero_tiled_rvvadd/kernels.c	2026-09-05 13:18:11.375136783 -0700
++++ /home/cobble/Tools/zcs_fcdronet/samples/rose_fc_dronet/dronet_model_poll/kernels.c	2026-09-05 19:55:18.422012456 -0700
+@@ -9,6 +9,38 @@
+ #include <riscv_vector.h>
+ #include "kernels.h"
+ 
++/* FC+DroNet co-residency (riskybird-fc-dronet): fence-free, preemptible mvout-DMA
++ * drain that replaces the terminal gemmini_fence() after every conv's
++ * tiled_conv_auto. A hart-stalling `fence` with an outstanding RoCC write-DMA is
++ * the hazard that corrupted DroNet output (err=10) when the PID loop preempted
++ * mid-drain -- the trap/context-switch (whose eager V save issues vse8.v) landed
++ * during the stalled fence. Instead poll the WDMA_BYTES_SENT counter, k_yield()ing
++ * while the array drains, so context switches only happen at clean instruction
++ * boundaries; the final (now-instant) fence guarantees ordering. Poll-until-quiescent
++ * (no fixed byte target -- HW bytes don't map 1:1 to OC*OH*OW) with the final fence
++ * as the backstop. Same mechanism as a28efeb's conv2d_pool_loadonce GOP_TILES_POLL,
++ * generalized to every conv (all 9 dispatch this one kernel). yield during the drain
++ * is measured bit-exact (a28efeb: errYA=0). Also fixes the fence-block that stalled
++ * the >=200 Hz control loop 16-24 ms per conv. */
++#include <zephyr/kernel.h>            /* k_yield */
++#ifndef MB_DRAIN_WDMA_SLOT
++#define MB_DRAIN_WDMA_SLOT 4
++#endif
++static inline void mb_conv_drain_yield(void)
++{
++	static int _cfg;
++	if (!_cfg) { counter_configure(MB_DRAIN_WDMA_SLOT, WDMA_BYTES_SENT); _cfg = 1; }
++	uint32_t prev = counter_read(MB_DRAIN_WDMA_SLOT);
++	int stable = 0;
++	for (int i = 0; i < 2000000 && stable < 4; i++) {
++		k_yield();
++		uint32_t cur = counter_read(MB_DRAIN_WDMA_SLOT);
++		stable = (cur == prev) ? (stable + 1) : 0;
++		prev = cur;
++	}
++	gemmini_fence();   /* safety: instant now (DMA drained), no interrupt-during-stall */
++}
++
+ /* source: curated */
+ /* algorithm: direct */
+ /* accuracy_class: numeric_drift */
+@@ -627,8 +659,10 @@
+      * gemmini_fence — unlike tiled_matmul_outer_eigen.  Without this
+      * explicit drain, the post-conv NHWC->NCHW read and the next op's
+      * gemmini_flush race with in-flight mvout DMAs and corrupt memory
+-     * (FireSim Saturn: mcause=1, mepc=0). */
+-    gemmini_fence();
++     * (FireSim Saturn: mcause=1, mepc=0).
++     * FC+DroNet: fence-free preemptible drain (see mb_conv_drain_yield above) so a
++     * PID-loop preemption can't land mid-drain and corrupt the output. */
++    mb_conv_drain_yield();
+     gemmini_flush(0);
+ 
+     MB_GEM_PH(mb_ph_t2);
