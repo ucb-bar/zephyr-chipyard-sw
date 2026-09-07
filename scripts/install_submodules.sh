@@ -269,10 +269,14 @@ main() {
   fi
   
   echo ""
-  echo "NOTE: If you need USB/serial device access, you may need to add your user"
-  echo "      to the plugdev and dialout groups:"
-  echo "      sudo usermod -aG plugdev,dialout \"\$USER\""
-  echo "      (You'll need to log out and back in for this to take effect)"
+  # usermod does not exist on macOS, and no group membership is needed there:
+  # the FTDI devices are reachable without one.
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "NOTE: If you need USB/serial device access, you may need to add your user"
+    echo "      to the plugdev and dialout groups:"
+    echo "      sudo usermod -aG plugdev,dialout \"\$USER\""
+    echo "      (You'll need to log out and back in for this to take effect)"
+  fi
   
   if [[ ${#WARNINGS[@]} -gt 0 ]]; then
     echo "=== Installation completed with warnings at $(date) ===" >> "${LOG_FILE}"
