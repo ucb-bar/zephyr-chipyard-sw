@@ -1,0 +1,51 @@
+V-race #2 ATOMIC-side fix (firmware-only, NO bitstream rebuild): initialize
+saved_v_context.is_dirty on every fresh thread. Orthogonal to 6f53ddc6c (RTL,
+preemptible) and to the vstart/fence v.c patch -- applies cleanly alongside both
+and on the combined bit.
+
+ROOT CAUSE (atomic boot/first-switch mcause-2 illegal on vle8.v v24@m8, and
+mcause-5 wild-store; entry_vstart=0): arch_new_thread never initializes
+thread->arch.saved_v_context.is_dirty. The only V init there lives under
+CONFIG_FPU, which the int-only/noFP (misaVfix) build does NOT set (confirmed:
+CONFIG_FPU absent from build_rocc_*/.config). So is_dirty is garbage on a fresh
+thread; z_riscv_vstate_restore_thread gates the bulk vle8.v reload AND the V-CSR
+restore on is_dirty, so a garbage-true value does a reload + vsetvl/csrw from an
+UNINITIALISED context on the first switch -> garbage vtype/vstart/vregs. The strict
+int-only Saturn faults that as mcause-2 (vle8.v@m8 illegal) or mcause-5 (garbage
+config -> wild store -> scheduler corruption -> wild load). This ALSO explains the
+noFP "regression": the -1's full Saturn silently TOLERATED the same garbage; the
+int-only Saturn rejects it. Probabilistic (2/6) because it depends on whether the
+fresh thread struct memory happened to be zero.
+
+FIX: force is_dirty=false for every fresh thread under CONFIG_RISCV_ISA_EXT_V (NOT
+gated on CONFIG_FPU), so the first restore is a no-op until the thread has actually
+saved V state (matching the existing sticky-is_dirty design).
+
+APPLY: cd <zephyr>; git apply zephyr_v_isdirty_init_guard.patch  (or patch -p1)
+TEST: rebuild FIRMWARE only, multi-run ATOMIC (build_rocc_gated xN). Fixed = N/N
+clean boots (was 2/6). Independent of the combined-bit P&R -- testable on the
+CURRENT misaVfix bit now.
+
+diff --git a/arch/riscv/core/thread.c b/arch/riscv/core/thread.c
+index c34450005b4..7c49ce0a154 100644
+--- a/arch/riscv/core/thread.c
++++ b/arch/riscv/core/thread.c
+@@ -78,6 +78,18 @@ void arch_new_thread(struct k_thread *thread, k_thread_stack_t *stack,
+ #endif
+ #endif
+ 
++#ifdef CONFIG_RISCV_ISA_EXT_V
++	/* V-race #2 (atomic boot/first-switch fault): the eager-V restore gates the
++	 * bulk vle8.v reload AND the V-CSR restore on saved_v_context.is_dirty. On a
++	 * fresh thread this field is otherwise UNINITIALISED -- the only V init above
++	 * lives under CONFIG_FPU, which the int-only/noFP build does NOT set -- so a
++	 * garbage is_dirty triggers a bulk reload + V-CSR restore from an uninitialised
++	 * context on the first switch (garbage vtype/vstart/vregs), which the strict
++	 * int-only Saturn faults as mcause-2 illegal (vle8.v@m8) / mcause-5 wild-store.
++	 * Force clean so the first restore is a no-op until the thread has really saved V. */
++	thread->arch.saved_v_context.is_dirty = false;
++#endif
++
+ #if defined(CONFIG_USERSPACE)
+ 	/* Clear user thread context */
+ 	z_riscv_pmp_usermode_init(thread);
