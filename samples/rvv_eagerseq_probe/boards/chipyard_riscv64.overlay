@@ -1,0 +1,18 @@
+/*
+ * Minimal overlay for the fp16 vector-op probe: just the console UART @ 35 MHz +
+ * RAM. No FC sensors/pwm-motors (avoids needing the riskybird bindings on DTS_ROOT).
+ * Matches the At35 combined bitstream (RocketArty200TDroneGemminiSaturnFp16At35Config).
+ */
+/ {
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,sram = &ram0;
+	};
+};
+
+&{/cpus/cpu@0} { clock-frequency = <35000000>; };
+
+&ram0 { reg = <0x80000000 0x40000000>; status = "okay"; };
+
+&uart0 { status = "okay"; current-speed = <115200>; interrupts = <10 1>; };
