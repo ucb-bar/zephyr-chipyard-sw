@@ -882,15 +882,57 @@ static struct k_thread tof_thread_data;
 static void tof_thread_fn(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	/* Both return codes are reported, because a silent `!= 0` here is
+	 * indistinguishable from a sensor that is simply never ranging: tofv stays 0
+	 * and the estimator dead-reckons altitude off accel with nothing on the
+	 * console to say why. The errno is what separates the candidates -- -EIO is
+	 * the bus, -EBUSY/-ETIMEDOUT a ranging budget that never completed, -ENOTSUP
+	 * the driver wanting the data-ready pin this board does not wire (see the
+	 * block comment above).
+	 *
+	 * Rate-limited: on a fetch that fails every iteration the back-off is 5 ms,
+	 * so an unguarded print is 200 lines/s into a 115200 console, which both
+	 * drowns the telemetry and changes the timing being measured. First failure
+	 * prints immediately, then only on a CHANGE of code or once a second. */
+	int last_rc = 1;            /* not a plausible rc, so the first failure always prints */
+	uint32_t fails = 0;
+	int64_t next_report = 0;
 	for (;;) {
-		if (sensor_sample_fetch(tof_dev) == 0) {   /* blocks ~1 ranging budget on this thread */
+		int rc = sensor_sample_fetch(tof_dev);   /* blocks ~1 ranging budget on this thread */
+		if (rc == 0) {
 			struct sensor_value h;
-			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
+			int grc = sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
+
+			if (grc != 0) {
+				/* A fetch that succeeds and a get that does not is a different
+				 * fault from a fetch that fails, and the old code merged the two
+				 * by ignoring this rc and publishing whatever was in `h`. */
+				if (grc != last_rc || k_uptime_get() >= next_report) {
+					printk("flight_controller: down-ToF channel_get rc=%d\n", grc);
+					last_rc = grc;
+					next_report = k_uptime_get() + 1000;
+				}
+				k_msleep(5);
+				continue;
+			}
+			if (fails != 0U) {
+				printk("flight_controller: down-ToF recovered after %u failed fetches\n",
+				       fails);
+				fails = 0;
+				last_rc = 1;
+			}
 			float hv = (float)sensor_value_to_double(&h);
 			k_mutex_lock(&tof_mtx, K_FOREVER);
 			g_tof_h = hv; g_tof_valid = true;
 			k_mutex_unlock(&tof_mtx);
 		} else {
+			fails++;
+			if (rc != last_rc || k_uptime_get() >= next_report) {
+				printk("flight_controller: down-ToF sample_fetch rc=%d (%u consecutive)\n",
+				       rc, fails);
+				last_rc = rc;
+				next_report = k_uptime_get() + 1000;
+			}
 			k_msleep(5);   /* back off on error so a failing ToF can't spin the I2C bus */
 		}
 	}
