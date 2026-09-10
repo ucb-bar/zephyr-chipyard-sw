@@ -33,11 +33,6 @@
  * by the ROSE_FLOW CMake knob and talks to the bus directly, with no Zephyr driver and no `flow`
  * node. The ESP flies with ROSE_FLOW=1 and no `flow` alias at all, so guarding this file on that
  * alias would silently disable optical flow on the configuration that actually flew.
- *
- * The chip-select stays a plain pin number on a controller labelled `gpio0`, which is the label
- * on both boards. Its pin differs -- ESP GPIO19, FPGA gpio0 pin 0 -- so override CS_GPIO_PIN
- * per board (see hardware/zephyr/targets/fpga/workloads/pmw3901_test.overlay for the FPGA
- * wiring this must agree with).
  */
 #if DT_NODE_EXISTS(DT_ALIAS(flow_spi))
 #define FLOW_SPI_NODE   DT_ALIAS(flow_spi)

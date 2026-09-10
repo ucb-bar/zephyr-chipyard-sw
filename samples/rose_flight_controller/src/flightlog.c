@@ -21,8 +21,8 @@
 /*
  * Boards with no flash storage partition.
  *
- * This is the ONLY part of the flight controller that is tied to a specific
- * SoC's flash layout: FIXED_PARTITION_ID(storage_partition) is resolved by the
+ * This is the ONLY part of the flight controller tied to a specific SoC's flash
+ * layout: FIXED_PARTITION_ID(storage_partition) is resolved by the
  * preprocessor, so a board whose device tree has no `storage_partition` node
  * fails to build here even with ROSE_FLIGHTLOG off. The RiskyBird FPGA carrier
  * has no such partition -- the shell presents DDR3 and no flash -- so on that

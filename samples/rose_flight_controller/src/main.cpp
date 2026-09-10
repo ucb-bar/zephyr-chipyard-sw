@@ -1564,7 +1564,12 @@ int main(void)
 #endif
 
 	/* Status LED: start the state-derived pattern renderer (only if the ADS7128 LED config ACK'd
-	 * at board_sensor_init). Low priority + edge-only I2C writes -> negligible load on the loop. */
+	 * at board_sensor_init). Low priority + edge-only I2C writes -> negligible load on the loop.
+	 *
+	 * Guarded to match the definitions above: g_led_bus, led_t, led_stack,
+	 * status_led_thread, PRIO_LED and STATUS_LED_CH all live inside the same
+	 * HAVE_STATUS_LED block, so a board with the expander but no VL53L1X
+	 * declared fails to compile here otherwise. */
 #if HAVE_STATUS_LED
 	if (g_led_bus) {
 		k_thread_create(&led_t, led_stack, K_THREAD_STACK_SIZEOF(led_stack),
@@ -1573,7 +1578,7 @@ int main(void)
 		printk("flight_controller: status LED up (ADS7128 GPIO%d, state-derived patterns)\n",
 		       STATUS_LED_CH);
 	}
-#endif
+#endif /* HAVE_STATUS_LED */
 
 #if ROSE_THREADED
 	printk("flight_controller: estimator=%s + controller=%s (%s), THREADED blocks "
