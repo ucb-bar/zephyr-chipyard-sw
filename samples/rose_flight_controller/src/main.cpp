@@ -1220,7 +1220,26 @@ static bool read_sensor_frame(struct sensor_frame *f)
  * REAL measured loop period (s) -- pass the same value used for est.update so time bases match. */
 static void solve_control(const float *state, float *u, float dt)
 {
+#if defined(ROSE_ESTIMATOR_ONLY) && ROSE_ESTIMATOR_ONLY
+	/*
+	 * Estimator-only build: the controller is never asked for a command.
+	 *
+	 * This exists so the estimator can be judged on its own. With the
+	 * controller in the loop on a bench-stationary drone, a starved
+	 * altitude estimate (down-ToF invalid -> z dead-reckons off accel)
+	 * makes the controller wind up chasing it, and the telemetry line then
+	 * shows a ramping u[] on top of a drifting z -- two symptoms of one
+	 * cause, which reads like a controller fault and is not. Forcing u to
+	 * zero here leaves exactly one thing under test.
+	 *
+	 * Actuation is separately impossible in this build: main only drives
+	 * PWM when the `motors` alias exists, and it does not here.
+	 */
+	(void)state; (void)dt;
+	for (int i = 0; i < NACTIONS; i++) { u[i] = 0.0f; }
+#else
 	ctrl.compute(state, g_setpoint, u, dt);
+#endif
 }
 
 #if ROSE_THREADED
