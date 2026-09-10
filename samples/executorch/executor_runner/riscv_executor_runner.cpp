@@ -19,6 +19,7 @@
 #if defined(__ZEPHYR__)
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/arch/cpu.h>   /* arch_curr_cpu() -> hart id */
 #endif
 
 struct _reent * _impure_ptr = nullptr;
@@ -29,6 +30,32 @@ void *__dso_handle = nullptr;
 #include "models_pte.h"   /* registry of N baked .pte models (batched run) */
 #else
 #include "model_pte.h"
+#endif
+
+/* --- Heterogeneous-bitstream support (f2_quad_hetero_norose_tacit_q31_60mhz)
+ *
+ * On the quad hetero SoC the tiles are NOT interchangeable: harts 0,1 are
+ * Rocket+Gemmini elaborated as rv64imafdc (NO vector unit) and harts 2,3 are
+ * Rocket+Saturn V256/D128 (rv64imafdcv, no Gemmini). XNNPACK's RVV
+ * micro-kernels therefore take an illegal-instruction trap anywhere except
+ * harts 2/3, and Zephyr starts main() on hart 0.
+ *
+ * Two things are needed, and BOTH are needed:
+ *   MB_ET_PIN_HART=<n>  run the whole ExecuTorch region on a thread pinned to
+ *                       hart n (k_thread_cpu_pin on a not-yet-started thread;
+ *                       calling it on the running thread is a silent no-op --
+ *                       see modelblaster/harness_tacit/src/main.c).
+ *   MB_ET_THREADS=<n>   clamp the ExecuTorch/XNNPACK pthreadpool. It is sized
+ *                       from sysconf(_SC_NPROCESSORS_ONLN) (= MP_MAX_NUM_CPUS,
+ *                       4 here), and pthreadpool's workers carry no affinity,
+ *                       so a parallelized op would hand vector work to hart 0.
+ *                       n=1 makes every parallelize_* run INLINE on the pinned
+ *                       caller -- which is also the known-good ET config
+ *                       (2-core was ~175x slower on LeNet and faulted in
+ *                       XNNPACK weight packing on MobileNetV2).
+ */
+#if defined(MB_ET_THREADS)
+#include <executorch/extension/threadpool/threadpool.h>
 #endif
 
 /* Opt-in TACIT / L-Trace of just the model execute() (the final, warm
@@ -217,7 +244,10 @@ Result<BufferCleanup> prepare_input_tensors(Method &method, MemoryAllocator &all
 		inputs[num_allocated++] = data_ptr;
 
 		Error err = Error::Ok;
-		if (input_buffers.size() > 0)
+		/* `i < size` rather than `size > 0`: .at() would throw past the end,
+		 * and a model whose baked-input count disagrees with its method
+		 * signature must fail loudly, not by unwinding on bare metal. */
+		if (i < input_buffers.size())
 		{
 			auto [buffer, buffer_size] = input_buffers.at(i);
 			if (buffer_size != tensor_meta->nbytes())
@@ -289,9 +319,23 @@ Result<BufferCleanup> prepare_input_tensors(Method &method, MemoryAllocator &all
 // an output checksum. All allocators are constructed fresh on entry, so they
 // reset the shared static pools — a multi-model loop reuses one pool
 // sequentially (only one model's activations are live at a time).
+/* Baked real inputs for the model about to run (set by the MB_MULTI_MODEL loop).
+ * NULL => fall back to the historical all-ones fill. Feeding the SAME input the
+ * PyTorch/ModelBlaster golden was computed from is what makes the on-hardware
+ * output comparable to that golden at all. */
+static const void *const *g_in_data = nullptr;
+static const unsigned int *g_in_size = nullptr;
+static unsigned int g_n_inputs = 0;
+
 static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_size, const char *_mb_tag)
 {
 	std::vector<std::pair<char *, size_t>> input_buffers;
+	for (unsigned int _k = 0; _k < g_n_inputs; ++_k)
+		input_buffers.emplace_back(
+			const_cast<char *>(static_cast<const char *>(g_in_data[_k])),
+			(size_t)g_in_size[_k]);
+	if (g_n_inputs)
+		printf("MB_INPUT_BAKED=%s n=%u bytes0=%u\n", _mb_tag, g_n_inputs, g_in_size[0]);
 	size_t pte_size = model_pte_size;
 
 	ET_LOG(Info, "Model in %p %c", model_pte, model_pte[0]);
@@ -562,9 +606,41 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 	return 0; /* end run_one_pte — locals (method/program/allocators) destruct here */
 }
 
-int main()
+/* The whole ExecuTorch region, factored out of main() so it can be run on a
+ * hart-pinned thread (see the MB_ET_PIN_HART note at the top). */
+static void mb_et_region(void)
 {
 	executorch::runtime::runtime_init();
+
+#if defined(MB_ET_THREADS)
+	{
+		auto *tp = ::executorch::extension::threadpool::get_threadpool();
+		unsigned before = (unsigned)tp->get_thread_count();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+		bool ok = tp->_unsafe_reset_threadpool((uint32_t)(MB_ET_THREADS));
+#pragma GCC diagnostic pop
+		unsigned after = (unsigned)tp->get_thread_count();
+		printf("MB_ET_THREADPOOL from=%u to=%u ok=%d\n", before, after, (int)ok);
+		fflush(stdout);
+		/* Loud, not silent: with more than one pool thread on the hetero
+		 * bitstream a parallelized XNNPACK op runs vector code on a
+		 * Gemmini-only hart and traps mid-model. */
+		if (after != (unsigned)(MB_ET_THREADS)) {
+			printf("FATAL: threadpool clamp to %d failed (got %u)\n",
+			       (int)(MB_ET_THREADS), after);
+			fflush(stdout);
+#if defined(__ZEPHYR__)
+			k_panic();
+#endif
+		}
+	}
+#endif
+
+#if defined(__ZEPHYR__) && defined(CONFIG_SMP)
+	printf("MB_ET_HART=%d\n", (int)arch_curr_cpu()->id); fflush(stdout);
+#endif
+
 #ifdef MB_MULTI_MODEL
 	// Batched: run every baked model sequentially under ONE boot (and, on
 	// FireSim, ONE infrasetup). Every model's io lives in rodata; only the
@@ -572,11 +648,57 @@ int main()
 	// per call reset it), so N models cost N*io of RAM + one activation set.
 	for (unsigned _mi = 0; _mi < mb_num_models; ++_mi) {
 		printf("MB_MODEL_BEGIN=%s\n", mb_models[_mi].name); fflush(stdout);
+		g_n_inputs = mb_models[_mi].n_inputs;
+		static const void *_in_d[8]; static unsigned int _in_s[8];
+		if (g_n_inputs > 8) g_n_inputs = 8;
+		for (unsigned _k = 0; _k < g_n_inputs; ++_k) {
+			_in_d[_k] = (const void *)mb_models[_mi].inputs[_k].data;
+			_in_s[_k] = mb_models[_mi].inputs[_k].size;
+		}
+		g_in_data = _in_d; g_in_size = _in_s;
 		run_one_pte(mb_models[_mi].data, mb_models[_mi].size, mb_models[_mi].name);
+		g_n_inputs = 0; g_in_data = nullptr; g_in_size = nullptr;
 		printf("MB_MODEL_END=%s\n", mb_models[_mi].name); fflush(stdout);
 	}
 #else
 	run_one_pte(model_pte, model_pte_size, "model");
+#endif
+}
+
+#if defined(MB_ET_PIN_HART) && defined(__ZEPHYR__) && defined(CONFIG_SMP)
+/* 512 KB: the ET setup path (XNNPACK weight packing) is stack-hungry, and this
+ * thread replaces main(), whose stack CONFIG_MAIN_STACK_SIZE sized. */
+#ifndef MB_ET_PIN_STACK
+#define MB_ET_PIN_STACK 524288
+#endif
+K_THREAD_STACK_DEFINE(mb_et_stack, MB_ET_PIN_STACK);
+static struct k_thread mb_et_thread;
+static void mb_et_entry(void *a, void *b, void *c) { (void)a;(void)b;(void)c; mb_et_region(); }
+#endif
+
+int main()
+{
+#if defined(MB_ET_PIN_HART) && defined(__ZEPHYR__) && defined(CONFIG_SMP)
+	/* k_thread_cpu_pin() on the RUNNING thread is a silent no-op
+	 * (kernel/cpu_mask.c only sets the mask when the thread is prevented from
+	 * running), so create with K_FOREVER, pin, then start. Fail loudly: the
+	 * wrong hart is an illegal-instruction trap deep inside a micro-kernel,
+	 * which reads like a bitstream fault and is not. */
+	k_tid_t t = k_thread_create(&mb_et_thread, mb_et_stack,
+				    K_THREAD_STACK_SIZEOF(mb_et_stack),
+				    mb_et_entry, NULL, NULL, NULL,
+				    K_PRIO_PREEMPT(0), 0, K_FOREVER);
+	int rc = k_thread_cpu_pin(t, MB_ET_PIN_HART);
+	if (rc != 0) {
+		printf("FATAL: k_thread_cpu_pin(hart=%d) failed: %d\n",
+		       (int)(MB_ET_PIN_HART), rc);
+		fflush(stdout);
+		k_panic();
+	}
+	k_thread_start(t);
+	k_thread_join(t, K_FOREVER);
+#else
+	mb_et_region();
 #endif
 	ET_LOG(Info, "Program complete, exiting.");
 	ET_LOG(Info, "\04");

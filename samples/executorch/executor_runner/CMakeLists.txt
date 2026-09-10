@@ -29,6 +29,18 @@ set(EXECUTORCH_BUILD_GFLAGS OFF CACHE BOOL "")
 
 set(EXECUTORCH_BUILD_HOST_TARGETS OFF CACHE BOOL "")
 
+# VLENB at build time instead of XNNPACK's runtime `vsetvli` probe. On a
+# HETEROGENEOUS bitstream this is mandatory, not an optimisation: ExecuTorch
+# constructs XnnpackBackend in a C++ static initializer, so xnn_initialize()
+# (and hence the probe) runs before main() on the BOOT hart -- hart 0 of
+# f2_quad_hetero_norose_tacit_q31_60mhz, a Gemmini tile with NO vector unit.
+# The probe traps there (mcause 2) before any code can pin to a Saturn hart.
+# 32 = Saturn VLEN 256 bits / 8. Leave unset on a uniform-RVV target.
+if(DEFINED MB_XNN_VLENB)
+  add_compile_definitions(XNN_RISCV_VLENB=${MB_XNN_VLENB})
+  message(STATUS "executor_runner: XNNPACK VLENB fixed at ${MB_XNN_VLENB} (no runtime vsetvli probe)")
+endif()
+
 set(EXECUTORCH_BUILD_XNNPACK ON CACHE BOOL "")
 set(XNNPACK_ENABLE_RISCV_GEMMINI ON CACHE BOOL "Build XNNPACK with RISC-V Gemmini micro-kernels")
 set(XNNPACK_ENABLE_RISCV_VECTOR ON CACHE BOOL "Build XNNPACK with RISC-V Vector micro-kernels")
@@ -149,6 +161,27 @@ if(MB_MULTI_MODEL)
     message(STATUS "modelblaster ET runner: MB_MULTI_MODEL (batched multi-.pte)")
 else()
     target_sources(app PRIVATE riscv_executor_runner.cpp model_pte.c)
+endif()
+
+# --- Heterogeneous-bitstream placement (f2_quad_hetero_norose_tacit_q31_60mhz)
+# On the quad hetero SoC harts 0,1 are Rocket+Gemmini (rv64imafdc, NO vector)
+# and harts 2,3 are Rocket+Saturn (rv64imafdcv). Zephyr starts main() on hart 0,
+# so an unpinned ExecuTorch run traps the first time an XNNPACK RVV micro-kernel
+# issues a vector instruction. Pass BOTH of these for that bitstream:
+#   -DMB_ET_PIN_HART=2   run the ET region on a thread pinned to a Saturn hart
+#   -DMB_ET_THREADS=1    clamp the XNNPACK pthreadpool (sized from
+#                        sysconf(_SC_NPROCESSORS_ONLN)=MP_MAX_NUM_CPUS) so no
+#                        unpinned worker executes vector code on hart 0/1.
+if(DEFINED MB_ET_PIN_HART)
+    target_compile_definitions(app PRIVATE MB_ET_PIN_HART=${MB_ET_PIN_HART})
+    message(STATUS "modelblaster ET runner: pinning ET region to hart ${MB_ET_PIN_HART}")
+endif()
+if(DEFINED MB_ET_THREADS)
+    target_compile_definitions(app PRIVATE MB_ET_THREADS=${MB_ET_THREADS})
+    message(STATUS "modelblaster ET runner: threadpool clamped to ${MB_ET_THREADS}")
+endif()
+if(DEFINED MB_ET_TEMP_MB)
+    target_compile_definitions(app PRIVATE MB_ET_TEMP_MB=${MB_ET_TEMP_MB})
 endif()
 
 # ET method_allocation_pool size (MiB). Default 96; bump for the 256MB-io
