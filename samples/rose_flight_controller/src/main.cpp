@@ -561,6 +561,11 @@ static void motors_startup_pulse(void) { /* no motors on the RoSE target */ }
 static void motors_boot_chirp(void) { /* no motors on the RoSE target */ }
 #else /* real target: drive 4 PWM motors (thrust ~ duty). Actuator parity is future work. */
 #include <zephyr/drivers/pwm.h>
+/* Last duty actually written per motor, and the last return code from writing
+ * it. Both exist because one motor of four failing is invisible in u. */
+static volatile float g_last_duty[NACTIONS];
+static volatile int   g_last_pwm_rc[NACTIONS];
+
 #define MOTORS_NODE DT_ALIAS(motors)
 #if DT_NODE_EXISTS(MOTORS_NODE)
 static const struct pwm_dt_spec motors[NACTIONS] = {
@@ -599,6 +604,10 @@ static void send_control(const float *u)
 	if (g_estop || !g_armed) {
 		for (int i = 0; i < NACTIONS; i++) {
 			pwm_set_pulse_dt(&motors[i], 0);
+			/* Report what is actually on the pins. Leaving the last
+			 * flying values here made an estop look, in telemetry,
+			 * exactly like a drone still under power. */
+			g_last_duty[i] = 0.0f;
 		}
 		return;
 	}
@@ -650,13 +659,43 @@ static void send_control(const float *u)
 	}
 	for (int i = 0; i < NACTIONS; i++) {
 		if (duty[i] < 0.0f) duty[i] = 0.0f;
-		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * duty[i]));
+		int prc = pwm_set_pulse_dt(&motors[i],
+					   (uint32_t)(motors[i].period * duty[i]));
+
+		/* What was actually asked of the pin, kept for telemetry. The loop
+		 * prints u, which is the CONTROLLER's normalized thrust -- it does
+		 * not survive the sag scale, the [0,1] clamp, the collective
+		 * anti-saturation cut or the floor below zero. A motor sitting at
+		 * exactly 0 duty while its u reads 1.3 is a state the old telemetry
+		 * could not show, and it is the first thing worth ruling out when
+		 * one motor of four does not spin. */
+		g_last_duty[i] = duty[i];
+
+		/* pwm_set_pulse_dt's return was discarded here. motor4 is the only
+		 * output on pwm1 rather than pwm0, so it is the one channel whose
+		 * write can fail on its own -- and a silent failure looks exactly
+		 * like a dead ESC or a broken wire from outside. */
+		if (prc != 0 && g_last_pwm_rc[i] != prc) {
+			printk("send_control: motor%d pwm_set rc=%d\n", i + 1, prc);
+		}
+		g_last_pwm_rc[i] = prc;
 	}
 #else
 	for (int i = 0; i < NACTIONS; i++) {
 		float d = duty[i] * MOTOR_MAX_DUTY;                /* bench: scale [0,1] -> [0, cap] */
 		if (d > MOTOR_MAX_DUTY) d = MOTOR_MAX_DUTY;
-		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * d));
+		int prc = pwm_set_pulse_dt(&motors[i],
+					   (uint32_t)(motors[i].period * d));
+
+		/* Recorded on this path too. Without it the telemetry's duty[]
+		 * reads 0.000 in every mode that is not autoflight, which is
+		 * indistinguishable from a motor genuinely commanded to zero --
+		 * the exact confusion the field was added to remove. */
+		g_last_duty[i] = d;
+		if (prc != 0 && g_last_pwm_rc[i] != prc) {
+			printk("send_control: motor%d pwm_set rc=%d\n", i + 1, prc);
+		}
+		g_last_pwm_rc[i] = prc;
 	}
 #endif
 }
@@ -1959,11 +1998,14 @@ int main(void)
 			/* Attitude + ALL 4 motor commands, so the restoring differential is visible: a
 			 * pitch tilt should split the fore/aft motor pair, a roll tilt the left/right pair. */
 			printk("flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d "
-			       "z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]\n",
+			       "z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] "
+			       "duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]\n",
 			       iter, (int)(dt * 1000.0f + 0.5f),
 			       FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
 			       (int)f.tof_valid, FP3(f.height),
-			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]));
+			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]),
+			       FP3(g_last_duty[0]), FP3(g_last_duty[1]),
+			       FP3(g_last_duty[2]), FP3(g_last_duty[3]));
 #endif
 #if defined(ROSE_BUMPER) && ROSE_BUMPER
 			/* Wall distances (mm; -1 = no target/no wall) so bring-up + facing can be verified on

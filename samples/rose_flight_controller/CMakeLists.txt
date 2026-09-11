@@ -62,6 +62,47 @@ set(ROSE_FLOW 0 CACHE STRING "1=enable PMW3901 optical flow, 0=disabled")
 # BARO_BIAS_GAIN, BARO_TOF_STEP_M, R_BARO) are passed via -DEXTRA_CPPFLAGS like the flow knobs.
 set(ROSE_BARO 0 CACHE STRING "1=enable BMP388 barometer altitude fusion, 0=disabled")
 
+# Flight knobs. These existed in main.cpp with #ifndef defaults but were absent
+# from target_compile_definitions below, so -DROSE_AUTOFLIGHT=1 set a cache
+# variable that nothing read: the build silently kept the bench path and the
+# arming gate was never compiled in. Verified by symbol table -- rose_cmd_reset
+# and g_arm_enabled were both absent from an image built with the flag set.
+# That is the failure FLIGHT_BUILD.md warns about, so the knobs are declared
+# here where they are visibly wired to the definitions.
+#
+# Defaults match main.cpp's #ifndef values exactly, so adding them changes no
+# existing build.
+set(ROSE_AUTOFLIGHT 0 CACHE STRING "1=lift-and-place arm gate + autonomous altitude profile")
+set(ROSE_BATT_SENSE 0 CACHE STRING "1=battery ADC: arm gate, in-flight cutoff, thrust sag comp")
+set(ROSE_FLIGHTLOG  0 CACHE STRING "1=background flight log to RAM, flushed at flight end")
+set(ROSE_TELEM      1 CACHE STRING "1=in-loop console telemetry (MUST be 0 untethered)")
+set(ROSE_TELEM_DIV  10 CACHE STRING "print one telemetry line every Nth iteration")
+# Bench escape hatch: auto-arm after ARM_SETTLE_MS of level+still, with no
+# lift-and-place gesture AND no on-ground check. main.cpp already names the
+# reason -- "near-field ToF validity when sitting flush is unreliable, and it
+# was the likely arm blocker". Measured on riskybird v3: a drone set down reads
+# 190-310 mm on the down-ToF against an ARM_MAX_HEIGHT_M of 20 mm, so `ground`
+# is never true and the gesture can never complete.
+#
+# Deliberately NOT part of any mode. It removes the interlock that makes a
+# glitch-reboot safe, so it has to be an explicit choice at the command line
+# rather than something a mode name quietly implies:
+#   RB_CMAKE_ARGS="-DROSE_ARM_NO_GESTURE=1" ./rb debug flight_controller ...
+set(ROSE_ARM_NO_GESTURE 0 CACHE STRING "1=auto-arm on level+still, no gesture, no ground check")
+
+# Flight envelope. All three are already #ifndef-guarded in main.cpp but were
+# not reachable from the build, so tuning them meant editing the source -- the
+# one thing you cannot do safely between two attempts on a bench.
+#
+# ARM_MAX_HEIGHT_M especially: at 0.020 it is tighter than the hardware's own
+# resting reading. Measured on riskybird v3, drone flat on the bench, the
+# down-ToF reports 0.022 m -- an honest number, the sensor sits about that far
+# above the surface -- so the "on the ground" test failed by 2 mm and the
+# lift-and-place gesture could never complete.
+set(ARM_MAX_HEIGHT_M    0.020f CACHE STRING "on-ground height below which arming is allowed (m)")
+set(HOVER_Z_M           0.30f  CACHE STRING "autoflight hover altitude target (m)")
+set(AUTOFLIGHT_MAX_DUTY 0.45f  CACHE STRING "per-motor duty ceiling in flight (hover ~0.15)")
+
 target_sources(app PRIVATE
   src/main.cpp
   src/estimator_complementary.cpp
@@ -89,7 +130,13 @@ target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
   ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW} ROSE_BARO=${ROSE_BARO}
   ROSE_ESTIMATOR_ONLY=${ROSE_ESTIMATOR_ONLY}
-  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY})
+  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY}
+  ROSE_AUTOFLIGHT=${ROSE_AUTOFLIGHT} ROSE_BATT_SENSE=${ROSE_BATT_SENSE}
+  ROSE_FLIGHTLOG=${ROSE_FLIGHTLOG}
+  ROSE_TELEM=${ROSE_TELEM} ROSE_TELEM_DIV=${ROSE_TELEM_DIV}
+  ROSE_ARM_NO_GESTURE=${ROSE_ARM_NO_GESTURE}
+  ARM_MAX_HEIGHT_M=${ARM_MAX_HEIGHT_M} HOVER_Z_M=${HOVER_Z_M}
+  AUTOFLIGHT_MAX_DUTY=${AUTOFLIGHT_MAX_DUTY})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include
