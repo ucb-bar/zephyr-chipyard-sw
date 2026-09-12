@@ -103,6 +103,17 @@ set(ARM_MAX_HEIGHT_M    0.020f CACHE STRING "on-ground height below which arming
 set(HOVER_Z_M           0.30f  CACHE STRING "autoflight hover altitude target (m)")
 set(AUTOFLIGHT_MAX_DUTY 0.45f  CACHE STRING "per-motor duty ceiling in flight (hover ~0.15)")
 
+# Airframe property, measured per drone -- see the note in main.cpp. Driving a
+# motor below its break-away duty stalls it, and the ESC then latches until the
+# battery is pulled, so this is not a comfort setting.
+set(MOTOR_BREAKAWAY_DUTY 0.15f CACHE STRING "lowest duty at which every motor reliably starts")
+set(MOTOR_CHIRP_MS       400   CACHE STRING "chirp pulse length, ms")
+# NOTE: the bench cap below defaults to 0.10, which on this airframe is BELOW
+# break-away -- so `--mode motors` cannot start motor 4 at the default. Raise it
+# to at least MOTOR_BREAKAWAY_DUTY to drive motors in that mode. Left alone here
+# rather than raised silently, because it is a thrust-limiting safety cap.
+set(MOTOR_MAX_DUTY       0.10f CACHE STRING "bench-mode duty ceiling (non-autoflight)")
+
 target_sources(app PRIVATE
   src/main.cpp
   src/estimator_complementary.cpp
@@ -136,7 +147,9 @@ target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_TELEM=${ROSE_TELEM} ROSE_TELEM_DIV=${ROSE_TELEM_DIV}
   ROSE_ARM_NO_GESTURE=${ROSE_ARM_NO_GESTURE}
   ARM_MAX_HEIGHT_M=${ARM_MAX_HEIGHT_M} HOVER_Z_M=${HOVER_Z_M}
-  AUTOFLIGHT_MAX_DUTY=${AUTOFLIGHT_MAX_DUTY})
+  AUTOFLIGHT_MAX_DUTY=${AUTOFLIGHT_MAX_DUTY}
+  MOTOR_BREAKAWAY_DUTY=${MOTOR_BREAKAWAY_DUTY} MOTOR_CHIRP_MS=${MOTOR_CHIRP_MS}
+  MOTOR_MAX_DUTY=${MOTOR_MAX_DUTY})
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include

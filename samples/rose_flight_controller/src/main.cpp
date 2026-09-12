@@ -580,7 +580,34 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
  * controller can respond and be observed, but CANNOT produce flight thrust.
  * Raise deliberately only for actual flight testing. */
 #ifndef MOTOR_MAX_DUTY
+#ifndef MOTOR_MAX_DUTY
 #define MOTOR_MAX_DUTY 0.10f
+#endif
+
+/* ---- Break-away duty -------------------------------------------------------
+ * The lowest duty at which EVERY motor on this airframe reliably starts.
+ *
+ * Measured on riskybird v3, driving one motor at a time: 15% starts all four,
+ * 10% starts three. Motor 4 does not break away at 10% -- it sits stalled, and
+ * its ESC then latches locked-rotor protection. That latch survives an ELF
+ * reload AND a full FPGA reconfigure; only removing power clears it. So a
+ * single 250 ms chirp below this threshold disables a motor for the rest of the
+ * session, and every later test at a perfectly good duty then fails for a
+ * reason that has nothing to do with the duty being asked for.
+ *
+ * This is a property of the airframe, not of the code. Re-measure it after any
+ * motor or ESC change: drive each motor alone, step the duty up, and take the
+ * highest value at which any of them first turns -- then leave margin.
+ */
+#ifndef MOTOR_BREAKAWAY_DUTY
+#define MOTOR_BREAKAWAY_DUTY 0.15f
+#endif
+/* Long enough for a stationary rotor to actually spin up. 250 ms was the old
+ * value and is marginal: a motor that has not broken away by the time the pulse
+ * ends has spent the whole pulse stalled. */
+#ifndef MOTOR_CHIRP_MS
+#define MOTOR_CHIRP_MS 400
+#endif
 #endif
 /* HARD MOTOR CUT (telemetry / bench-safety builds). When ROSE_MOTORS_INHIBIT=1 the actuator layer
  * NEVER drives the PWM channels above 0 -- send_control() forces all four to 0 and the boot / ready /
@@ -728,8 +755,12 @@ static void motors_boot_chirp(void)
 	return;   /* motors hard-inhibited */
 #endif
 	for (int i = 0; i < NACTIONS; i++) {
-		pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * 0.10f));
-		k_msleep(250);
+		/* At or above break-away, never below: a chirp that stalls a motor
+		 * is worse than no chirp, because the ESC latches and the motor is
+		 * gone until the battery is pulled. */
+		pwm_set_pulse_dt(&motors[i],
+				 (uint32_t)(motors[i].period * MOTOR_BREAKAWAY_DUTY));
+		k_msleep(MOTOR_CHIRP_MS);
 		pwm_set_pulse_dt(&motors[i], 0);
 		k_msleep(100);
 	}
@@ -744,9 +775,14 @@ static void motors_ready_chirp(void)
 #endif
 	for (int k = 0; k < 2; k++) {
 		for (int i = 0; i < NACTIONS; i++) {
-			pwm_set_pulse_dt(&motors[i], (uint32_t)(motors[i].period * 0.10f));
+			pwm_set_pulse_dt(&motors[i],
+					 (uint32_t)(motors[i].period *
+						    MOTOR_BREAKAWAY_DUTY));
 		}
-		k_msleep(150);
+		/* 150 ms was shorter than the boot chirp's 250 and drove all four
+		 * at once, so this was the more likely of the two to leave a motor
+		 * stalled rather than spinning. */
+		k_msleep(MOTOR_CHIRP_MS);
 		for (int i = 0; i < NACTIONS; i++) {
 			pwm_set_pulse_dt(&motors[i], 0);
 		}
