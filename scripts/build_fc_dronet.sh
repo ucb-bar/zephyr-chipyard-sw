@@ -18,6 +18,10 @@ MB_REPO="${MB_REPO:-${MAIN}/modelblaster}"
 MODEL_DIR="${MODEL_DIR:-${MB_REPO}/examples/dronet/int8/generated_gray/hetero_tiled_rvvadd}"
 BUILDDIR="${BUILDDIR:-${WT}/build_fc_dronet}"
 IRQ_GATE="${IRQ_GATE:-0}"
+# ROSE_TELEM=0 quiets the FC per-iter it= console spam so the DRONET lines + PROFILE
+# loop timing come through the 115200 console cleanly; DRONET_REPORT_EVERY=1 prints
+# every inference. Override EXTRA_CPP to change.
+EXTRA_CPP="${EXTRA_CPP:--DROSE_MOTORS_INHIBIT=1 -DROSE_PROFILE=1 -DROSE_TELEM=0 -DDRONET_REPORT_EVERY=1 -DDRONET_IRQ_GATE=${IRQ_GATE}}"
 
 # Toolchain + west workspace come from the main checkout (a valid west workspace
 # whose Zephyr submodule is the same riskybirdv3-bringup tip, bfd185f, with the
@@ -45,7 +49,7 @@ west build -p -b chipyard_riscv64 "${WT}/samples/rose_fc_dronet" --build-dir "${
   -DMB_REPO="${MB_REPO}" \
   -DMODEL_DIR="${MODEL_DIR}" \
   -DMODELBLASTER_KERNEL_CFLAGS="${KCFLAGS}" \
-  -DEXTRA_CPPFLAGS="-DROSE_MOTORS_INHIBIT=1 -DROSE_PROFILE=1 -DDRONET_IRQ_GATE=${IRQ_GATE}"
+  -DEXTRA_CPPFLAGS="${EXTRA_CPP}"
 rc=$?
 echo "=== BUILD EXIT ${rc} ==="
 ls -la "${BUILDDIR}/zephyr/zephyr.elf" 2>&1

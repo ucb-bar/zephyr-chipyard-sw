@@ -1,0 +1,69 @@
+V-race #2 RESIDUAL guard (firmware-only, NO rebuild): validate the k_thread pointer
+in the eager V save/restore; skip + record if WILD. Prevents the residual atomic
+mcause-5 wild vse8.v STORE at its source (wild save_to) and the wild vle8.v LOAD
+(observed at z_riscv_vstate_restore_thread+0x7e, a0 = clobbered switch_handle).
+Applies ON TOP of the is_dirty init-guard + the vstart/fence v.c patch. Orthogonal
+to 6f53ddc6c/backend-gate (RTL). Diagnostic globals z_riscv_v_dbg_wild_{save,restore}
+[_ptr] capture the wild pointer + which path -- KEY to locating the upstream source:
+if wild_save fires -> the wild store source is a save with a clobbered thread ptr;
+if only wild_restore fires -> the switch_handle was clobbered by something else.
+Valid k_thread range = [CONFIG_SRAM_BASE_ADDRESS, +CONFIG_SRAM_SIZE KiB) =
+[0x80000000, 0xC0000000) for the drone. APPLY: git apply; rebuild firmware; multi-run
+ATOMIC build_rocc_gated xN -> N/N clean = wild store/load prevented (and read the
+dbg_wild_* globals to see the culprit). Interim/diagnostic: a wild a0 still means a
+lost thread, so also validate a0 in z_riscv_switch if a hard fix is needed.
+
+--- a/arch/riscv/core/v.c
++++ b/arch/riscv/core/v.c
+@@ -147,12 +147,37 @@
+ 	} while (vs != 0 && ++n < 8);
+ }
+ 
++/* V-race #2 residual (atomic mcause-5): a valid k_thread lives in
++ * [CONFIG_SRAM_BASE_ADDRESS, +CONFIG_SRAM_SIZE KiB). The residual fault is an
++ * eager V save/restore invoked with a WILD thread pointer (a scheduler
++ * switch_handle clobbered upstream by a wild vector store): a wild save_to makes
++ * the bulk vse8.v itself a WILD STORE (propagating the corruption), and a wild
++ * restore_from makes the bulk vle8.v a wild load (the observed mcause-5 at
++ * z_riscv_vstate_restore_thread+0x7e). Validate the thread pointer and, if wild,
++ * RECORD it and SKIP -- preventing the wild store at its source and capturing the
++ * culprit for diagnosis. Inspect z_riscv_v_dbg_wild_{save,restore}[_ptr]. */
++volatile unsigned long z_riscv_v_dbg_wild_save, z_riscv_v_dbg_wild_save_ptr;
++volatile unsigned long z_riscv_v_dbg_wild_restore, z_riscv_v_dbg_wild_restore_ptr;
++static inline bool z_riscv_v_thread_in_ram(const struct k_thread *t)
++{
++	uintptr_t p = (uintptr_t)t;
++	return (p >= (uintptr_t)CONFIG_SRAM_BASE_ADDRESS) &&
++	       (p <  (uintptr_t)CONFIG_SRAM_BASE_ADDRESS + ((uintptr_t)CONFIG_SRAM_SIZE << 10)) &&
++	       ((p & 7UL) == 0UL);
++}
++
+ void z_riscv_vstate_save_thread(struct k_thread *thread)
+ {
+ 	if (!HAS_V()) {
+ 		return;
+ 	}
+ 
++	if (!z_riscv_v_thread_in_ram(thread)) {
++		z_riscv_v_dbg_wild_save++;
++		z_riscv_v_dbg_wild_save_ptr = (unsigned long)thread;
++		return;	/* V-race #2: wild save_to -> skip to prevent a wild vse8.v store */
++	}
++
+ 	struct z_riscv_v_context *save_to = &thread->arch.saved_v_context;
+ 	unsigned long mstatus_v = csr_read(mstatus) & MSTATUS_VS;
+ 
+@@ -210,6 +235,13 @@
+ 	if (!HAS_V()) {
+ 		return;
+ 	}
++
++	if (!z_riscv_v_thread_in_ram(thread)) {
++		z_riscv_v_dbg_wild_restore++;
++		z_riscv_v_dbg_wild_restore_ptr = (unsigned long)thread;
++		return;	/* V-race #2: wild restore_from -> skip to avoid a wild vle8.v load */
++	}
++
+ 	struct z_riscv_v_context *restore_from = &thread->arch.saved_v_context;
+ 
+ 	/* Enable V access — csr_set only ORs bits, lifting VS from

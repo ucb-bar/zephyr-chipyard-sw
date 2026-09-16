@@ -35,7 +35,13 @@
 static inline void fcr_push(uint32_t idx, int64_t val){ FCR_SS(0, (uint64_t)idx, (uint64_t)val); }
 static inline void fcr_cfg (uint32_t idx, int64_t val){ FCR_SS(3, (uint64_t)idx, (uint64_t)val); }
 static inline int64_t fcr_pop(uint32_t idx){ uint64_t r; FCR_DS(r, 2, (uint64_t)idx); return (int64_t)(r<<16)>>16; /* sign-extend 48->64 */ }
-static inline void fcr_run(uint32_t start){ uint64_t d; FCR_DS(d, 1, (uint64_t)start); (void)d; /* blocks until HALT */ }
+static inline void fcr_run(uint32_t start){ uint64_t d; FCR_DS(d, 1, (uint64_t)start);
+    /* V-RACE FW SELF-DRAIN FIX: RAW-read the decoupled DONE token so the ID scoreboard hazard
+     * stalls until the RoCC resp lands -> the token drains in THIS thread's context, before any
+     * cooperative yield/switch can strand it onto a reused caller-saved GPR during the eager-V
+     * restore. (fcr_pop already RAW-drains via its <<16>>16; fcr_run did not -> the strander.) */
+    __asm__ volatile("add %0, %0, zero" : "+r"(d));
+    (void)d; /* blocks until HALT */ }
 
 /* boot: load consts + initial state into the RoCC regfile (once, at startup). */
 void fcr_boot(void){

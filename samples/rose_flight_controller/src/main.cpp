@@ -162,6 +162,16 @@ static inline bool batt_ok_to_arm(void)
 #define FP3(x) ((x) < 0 ? "-" : ""), (int)fabsf(x), ((int)(fabsf(x) * 1000.0f)) % 1000
 
 /* ---- Sensor devices (Zephyr sensor API; bound per board overlay) ---- */
+#ifdef ROSE_SIM_STUB
+/* Layout pin: ROSE_SIM_STUB drops ~0x1800 of sensor-driver .bss, shifting the
+ * k_thread cluster down. Compensate so main@0x80085e00 / switch_handle@0x80085f28
+ * stays put (the fixed corruption target must match the non-stub build). Tune
+ * ROSE_SIM_PAD if the map moves. */
+#ifndef ROSE_SIM_PAD
+#define ROSE_SIM_PAD 0x1800
+#endif
+static volatile char rose_sim_layout_pad[ROSE_SIM_PAD] __attribute__((used));
+#endif
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
 static const struct device *gyro_dev  = DEVICE_DT_GET(DT_ALIAS(bmi088_gyro));
 
@@ -281,6 +291,9 @@ static void battery_poll(void)
  * guarantee a clean boot regardless of prior state. */
 static int board_sensor_init(void)
 {
+#ifdef ROSE_SIM_STUB
+	return 0;   /* sim: no i2c bus -> skip ToF power-up / status-LED / battery front-end */
+#endif
 	const struct device *bus = DEVICE_DT_GET(DT_BUS(DT_INST(0, st_vl53l1x)));
 	if (!device_is_ready(bus)) {
 		printk("board_sensor_init: I2C bus not ready — ToF stays unpowered\n");
@@ -842,7 +855,11 @@ static void tof_thread_fn(void *a, void *b, void *c)
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	uint32_t dbg_n = 0, dbg_ok = 0; int dbg_last = 123;
 	for (;;) {
+#ifdef ROSE_SIM_STUB
+		int rc = -1;   /* sim: no i2c ToF; skip the blocking fetch, height stays invalid */
+#else
 		int rc = sensor_sample_fetch(tof_dev);   /* blocks ~1 ranging budget on this thread */
+#endif
 		dbg_n++; dbg_last = rc; if (rc == 0) { dbg_ok++; }
 #if defined(ROSE_TOF_DBG) && ROSE_TOF_DBG
 		if ((dbg_n % 50) == 0) {
@@ -1020,6 +1037,26 @@ static float baro_rel_altitude_m(float p_kpa, float p0_kpa)
 static bool read_sensor_frame(struct sensor_frame *f)
 {
 	uint32_t _pf = PF_NOW();
+	float araw[3], graw[3];
+#ifdef ROSE_SIM_STUB
+	/* sim faithfulness stub: canned IMU (gravity + zero rate), NO i2c. Only the
+	 * sensor front-end is canned so boot doesn't stall on the absent i2c on the
+	 * robotMpc sim; the co-residency compute + preemption path downstream is
+	 * byte-for-byte identical (same estimator/RoCC + DroNet + poll-yield).
+	 * DELAY-MATCH: the real BMI088 i2c read is ~640us and DOMINATES the ~1kHz FC
+	 * loop cadence (profiling: 640us read vs 186us compute). Busy-wait that long
+	 * (NOT an i2c txn) so the FC loop cadence -- hence the timer preempt-phase
+	 * alignment vs the DroNet Gemmini-DMA window that carries the race -- stays
+	 * faithful, keeping stubbed NEGATIVES trustworthy on the faithfulness gate. */
+#ifndef ROSE_SIM_IMU_US
+#define ROSE_SIM_IMU_US 640
+#endif
+	k_busy_wait(ROSE_SIM_IMU_US);
+	araw[0] = 0.0f; araw[1] = 0.0f; araw[2] = 9.81f;
+	graw[0] = 0.0f; graw[1] = 0.0f; graw[2] = 0.0f;
+	PF_ACC(pf_imu_fetch, _pf);
+	f->tof_valid = false;
+#else
 	int rc_a = sensor_sample_fetch(accel_dev);
 	int rc_g = sensor_sample_fetch(gyro_dev);
 #if HAVE_FLOW
@@ -1034,11 +1071,11 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	struct sensor_value av[3], gv[3];
 	sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, av);
 	sensor_channel_get(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gv);
-	float araw[3], graw[3];
 	for (int i = 0; i < 3; i++) {
 		araw[i] = (float)sensor_value_to_double(&av[i]);
 		graw[i] = (float)sensor_value_to_double(&gv[i]);
 	}
+#endif
 	IMU_REMAP(f->accel, araw);   /* sensor -> drone body frame (no-op on RoSE) */
 	IMU_REMAP(f->gyro,  graw);
 	/* Startup gyro-bias cal: average the (should-be-zero) gyro while still, then subtract it from
@@ -1473,6 +1510,14 @@ int main(void)
 	printk("flight_controller: FLIGHTLOG DUMP MODE\n");
 	flightlog_dump();
 	return 0;
+#endif
+#ifdef ROSE_FC_DISABLE
+	/* E3 (co-residency cut): NO flight controller. The DroNet thread (auto-started
+	 * via K_THREAD_DEFINE) runs alone; main idles so the only context switches are
+	 * DroNet <-> idle (timer self-preemption), exercising the eager-V switch with a
+	 * single real V-using thread + idle. No FC, no aux (tof/baro/camera) threads. */
+	printk("flight_controller: FC DISABLED (E3: DroNet-alone + timer self-preempt)\n");
+	for (;;) { k_msleep(1000); }
 #endif
 	if (!device_is_ready(accel_dev) || !device_is_ready(gyro_dev)) {
 		printk("flight_controller: FAIL (IMU not ready)\n");
