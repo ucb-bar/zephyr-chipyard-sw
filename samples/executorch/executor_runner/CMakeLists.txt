@@ -102,9 +102,26 @@ target_link_libraries(pthreadpool PUBLIC compile_commands)
 # uses. Default OFF = vanilla pthreadpool (the baseline to compare against).
 option(MB_XNNPACK_SPIN_THREADPOOL
        "Use spin-wait pthreadpool (modelblaster-style, no condvar/tick sleep)" OFF)
+# Where the ModelBlaster checkout is. It used to be a submodule of this repo, at
+# <backend>/modelblaster; it is now a backend in its own right, a sibling of this
+# one (riskybird's backends/modelblaster). The default below finds it in that
+# layout, and MODELBLASTER_DIR overrides it for any other -- including a
+# standalone clone of this backend, where it is simply absent.
+set(MODELBLASTER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../modelblaster"
+    CACHE PATH "ModelBlaster checkout, for the spin-wait pthreadpool override")
 if(MB_XNNPACK_SPIN_THREADPOOL)
-  target_compile_options(pthreadpool PRIVATE
-    -include "${CMAKE_CURRENT_SOURCE_DIR}/../../../modelblaster/microbench/threadpool/spin_overrides/spin_inject.h")
+  set(_MB_SPIN_INJECT
+      "${MODELBLASTER_DIR}/microbench/threadpool/spin_overrides/spin_inject.h")
+  # Checked rather than assumed: -include on a path that does not exist fails at
+  # the first compile with a message about a header nobody asked for, which is a
+  # poor way to learn that a checkout moved.
+  if(NOT EXISTS "${_MB_SPIN_INJECT}")
+    message(FATAL_ERROR
+      "MB_XNNPACK_SPIN_THREADPOOL is ON but ${_MB_SPIN_INJECT} does not exist. "
+      "Point -DMODELBLASTER_DIR= at a ModelBlaster checkout, or leave the "
+      "option OFF for vanilla pthreadpool.")
+  endif()
+  target_compile_options(pthreadpool PRIVATE -include "${_MB_SPIN_INJECT}")
   message(STATUS "executor_runner: pthreadpool variant = SPIN (modelblaster-style)")
 else()
   message(STATUS "executor_runner: pthreadpool variant = vanilla (condvar/tick fallback)")
