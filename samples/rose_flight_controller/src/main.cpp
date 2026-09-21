@@ -53,6 +53,32 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
 #define HAVE_FLOW DT_NODE_EXISTS(DT_ALIAS(flow))
 #define HAVE_TOF  DT_NODE_EXISTS(DT_ALIAS(tof))
 #define HAVE_BARO DT_NODE_EXISTS(DT_ALIAS(baro))   /* BMP388 (bosch,bmp388) -> `baro` alias */
+#define HAVE_ESP_UART DT_NODE_EXISTS(DT_ALIAS(esp_uart))
+#if HAVE_ESP_UART
+/* The FPGA full-drone shell exposes the ESP link as `esp-uart`. Keep the
+ * shared ESP32-C6 build byte-for-byte unchanged: it has no alias, so neither
+ * the UART dependency nor this writer exists there. If the ESP UART is already
+ * the console (`--mode telem`), printk emits the line and a second copy would
+ * exceed the rate budget. */
+#define ESP_UART_IS_CONSOLE DT_SAME_NODE(DT_ALIAS(esp_uart), DT_CHOSEN(zephyr_console))
+#if !ESP_UART_IS_CONSOLE
+#include <zephyr/drivers/uart.h>
+#include <stdio.h>
+
+static const struct device *const esp_uart_dev = DEVICE_DT_GET(DT_ALIAS(esp_uart));
+
+static void esp_uart_write_line(const char *line, size_t length)
+{
+	if (!device_is_ready(esp_uart_dev)) {
+		return;
+	}
+
+	for (size_t i = 0; i < length; ++i) {
+		uart_poll_out(esp_uart_dev, line[i]);
+	}
+}
+#endif /* !ESP_UART_IS_CONSOLE */
+#endif /* HAVE_ESP_UART */
 /*
  * The D8 status LED hangs off the ADS7128 expander, but every helper it needs -- g_led_bus,
  * ads7128_set_bit/clr_bit, STATUS_LED_CH, ADS7128_GPO_VALUE -- is defined inside the
@@ -202,6 +228,47 @@ static inline bool batt_ok_to_arm(void)
  * builds with printf FP support off). Expands to the sign string + magnitude int + 3-digit frac. */
 #include <math.h>
 #define FP3(x) ((x) < 0 ? "-" : ""), (int)fabsf(x), ((int)(fabsf(x) * 1000.0f)) % 1000
+
+/*
+ * The v1.1 telemetry tail -- position, velocity, setpoint, battery and state.
+ *
+ * The ground station renders its state banner, 3D position view, drift arrow
+ * and battery gauge from these; riskybird_panel.py parses them with TAIL_RE
+ * (vx vy vz zsp vbat st, in that order) and POS_RE (x y). Without them the
+ * dashboard has attitude and altitude and nothing else, which is what the FPGA
+ * build showed.
+ *
+ * Every value here is ALREADY computed each iteration -- the CONFIG_WIFI block
+ * below packs exactly these into a telem_snapshot. On the FPGA that block is
+ * compiled out (the radio is a UART away, not on-chip) and telem_wifi.c is not
+ * in this checkout at all, so the values were being computed and discarded.
+ * This only prints what the loop already knows; it adds no estimation work.
+ *
+ * Defined once and used by both the printk and the esp-uart mirror below, so
+ * the tethered console and the radio cannot drift into different formats.
+ */
+#define TELEM_TAIL_FMT \
+	" x=%s%d.%03d y=%s%d.%03d vx=%s%d.%03d vy=%s%d.%03d vz=%s%d.%03d " \
+	"zsp=%s%d.%03d vbat=%s%d.%03d st=%u"
+
+/*
+ * Flag bits, matching riskybird_panel.py's FLAG_ARMED/ESTOP/ARMING/CALDONE.
+ * Spelled out rather than taken from telem_wifi.h, which this checkout does
+ * not have -- the same reason the CONFIG_WIFI path cannot be relied on here.
+ */
+#define ROSE_TELEM_FLAG_ARMED   1u
+#define ROSE_TELEM_FLAG_ESTOP   2u
+#define ROSE_TELEM_FLAG_ARMING  4u
+#define ROSE_TELEM_FLAG_CALDONE 8u
+
+#define TELEM_TAIL_ARGS \
+	FP3(state[0]), FP3(state[1]), \
+	FP3(state[6]), FP3(state[7]), FP3(state[8]), \
+	FP3(g_setpoint[2]), FP3(g_vbat), \
+	(unsigned int)((g_armed         ? ROSE_TELEM_FLAG_ARMED   : 0u) | \
+		       (g_estop         ? ROSE_TELEM_FLAG_ESTOP   : 0u) | \
+		       (g_arming        ? ROSE_TELEM_FLAG_ARMING  : 0u) | \
+		       (g_gyro_cal_done ? ROSE_TELEM_FLAG_CALDONE : 0u))
 
 /* ---- Sensor devices (Zephyr sensor API; bound per board overlay) ---- */
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
@@ -580,7 +647,6 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
  * controller can respond and be observed, but CANNOT produce flight thrust.
  * Raise deliberately only for actual flight testing. */
 #ifndef MOTOR_MAX_DUTY
-#ifndef MOTOR_MAX_DUTY
 #define MOTOR_MAX_DUTY 0.10f
 #endif
 
@@ -607,7 +673,6 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
  * ends has spent the whole pulse stalled. */
 #ifndef MOTOR_CHIRP_MS
 #define MOTOR_CHIRP_MS 400
-#endif
 #endif
 /* HARD MOTOR CUT (telemetry / bench-safety builds). When ROSE_MOTORS_INHIBIT=1 the actuator layer
  * NEVER drives the PWM channels above 0 -- send_control() forces all four to 0 and the boot / ready /
@@ -2035,13 +2100,41 @@ int main(void)
 			 * pitch tilt should split the fore/aft motor pair, a roll tilt the left/right pair. */
 			printk("flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d "
 			       "z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] "
-			       "duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]\n",
+			       "duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]"
+			       TELEM_TAIL_FMT "\n",
 			       iter, (int)(dt * 1000.0f + 0.5f),
 			       FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
 			       (int)f.tof_valid, FP3(f.height),
 			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]),
 			       FP3(g_last_duty[0]), FP3(g_last_duty[1]),
-			       FP3(g_last_duty[2]), FP3(g_last_duty[3]));
+			       FP3(g_last_duty[2]), FP3(g_last_duty[3]),
+			       TELEM_TAIL_ARGS);
+#if HAVE_ESP_UART
+#if !ESP_UART_IS_CONSOLE
+			/* Mirror the normal telemetry line to the radio while printk keeps the
+			 * tethered console. Static storage avoids adding a large control-loop
+			 * stack frame; uart_poll_out is intentionally used for this small,
+			 * rate-limited path. */
+			static char esp_line[256];
+			int esp_len = snprintf(
+				esp_line, sizeof(esp_line),
+				"flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d "
+				"z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] "
+				"duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]"
+				TELEM_TAIL_FMT "\n",
+				iter, (int)(dt * 1000.0f + 0.5f),
+				FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
+				(int)f.tof_valid, FP3(f.height),
+				FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]),
+				FP3(g_last_duty[0]), FP3(g_last_duty[1]),
+				FP3(g_last_duty[2]), FP3(g_last_duty[3]),
+				TELEM_TAIL_ARGS);
+			if (esp_len > 0) {
+				size_t length = MIN((size_t)esp_len, sizeof(esp_line) - 1U);
+				esp_uart_write_line(esp_line, length);
+			}
+#endif /* !ESP_UART_IS_CONSOLE */
+#endif /* HAVE_ESP_UART */
 #endif
 #if defined(ROSE_BUMPER) && ROSE_BUMPER
 			/* Wall distances (mm; -1 = no target/no wall) so bring-up + facing can be verified on
