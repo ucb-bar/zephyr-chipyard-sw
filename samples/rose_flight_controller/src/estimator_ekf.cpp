@@ -74,7 +74,26 @@ void EkfEstimator::init(float x0, float y0, float z0)
 	 * Instead the flow input is clamped to a physical bound (main.cpp) and the velocity state is
 	 * clamped below, so the flow is ALWAYS allowed to pull velocity back. ToF gate kept (position). */
 	flow_gate = 0.0f;
-	tof_gate  = 25.0f;
+	/* ToF position gate DISABLED (0), for exactly the reason the flow gate above is.
+	 *
+	 * The same latching divergence was measured on this bench in ALTITUDE: sitting
+	 * motionless, z ran 0 -> +4177 m at ~80 m/s and accelerating while the ToF read a
+	 * steady 0.006-0.008 m and reported valid the whole time (and -11287 m on a longer
+	 * run). Once accel bias walks z past the gate, the good 0.007 m reading has a huge
+	 * residual against the diverged state, is rejected as an outlier, and every
+	 * subsequent good reading is rejected too -- predict-only forever, z unbounded.
+	 *
+	 * That is the identical mechanism written up above for flow (est-v -> 152 m/s while
+	 * flow read ~0/ok), and the argument transfers verbatim: a fixed chi-square gate
+	 * cannot tell "bad measurement" from "good measurement vs a diverged state". The
+	 * gate was kept for position because a ToF step-jump (an obstacle passing under the
+	 * vehicle) reads as an outlier -- but a step-jump costs one wrong sample, whereas a
+	 * latched gate costs every sample from then on. Unbounded is worse than wrong.
+	 *
+	 * Safe only together with the vertical clamps added below: as with flow, the
+	 * measurement is ALWAYS allowed to pull the state back, and the state itself is
+	 * bounded so a garbage estimate can never reach the controller. */
+	tof_gate  = 0.0f;
 	r_wall = 4e-3f;      /* wall-derived horizontal position ~ (0.06 m)^2 (multizone min + a
 	                      * modest margin for wall non-perpendicularity); anchors x/y position. */
 	delay_steps = 1.0f;  /* control acts 1 step later -> predict 1 step ahead */
@@ -163,6 +182,22 @@ void EkfEstimator::update(const float accel[3], const float gyro[3],
 	const float VMAX = 5.0f;
 	if (kx.v >  VMAX) { kx.v =  VMAX; } else if (kx.v < -VMAX) { kx.v = -VMAX; }
 	if (ky.v >  VMAX) { ky.v =  VMAX; } else if (ky.v < -VMAX) { ky.v = -VMAX; }
+
+	/* The same backstop vertically, which kx/ky had and kz did not -- the omission that
+	 * let altitude run to thousands of metres on the bench while horizontal stayed sane.
+	 * The ToF is a POSITION measurement, so bound the position as well as the velocity:
+	 * a rejected-then-unbounded z is what fed the controller a huge thrust command in the
+	 * fly-away this vehicle already had.
+	 *
+	 * Bounds are deliberately far outside anything this airframe does indoors, so they
+	 * never shape a real estimate -- they only stop a diverged one from being actionable.
+	 * Below ground is bounded too: z is height above the start pose, and a small negative
+	 * excursion is legitimate if the drone is lifted off a table, but metres of it is not. */
+	const float ZVMAX = 5.0f;    /* m/s climb/descent no brushed 1S airframe exceeds */
+	const float ZMAX  = 30.0f;   /* m above start */
+	const float ZMIN  = -3.0f;   /* m below start */
+	if (kz.v >  ZVMAX) { kz.v =  ZVMAX; } else if (kz.v < -ZVMAX) { kz.v = -ZVMAX; }
+	if (kz.p >  ZMAX)  { kz.p =  ZMAX;  } else if (kz.p <  ZMIN)  { kz.p =  ZMIN;  }
 }
 
 void EkfEstimator::fuse_walls(float d_front, float d_back, float d_left, float d_right,
