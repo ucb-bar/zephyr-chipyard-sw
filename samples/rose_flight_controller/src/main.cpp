@@ -92,7 +92,16 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
  * the loop (phase margin for the fast attitude dynamics with the estimator in the loop). */
 #define CTRL_DT      0.005f
 #define START_Z      0.9f     /* gentle takeoff from near the setpoint */
+/* Hover altitude the NON-autoflight builds regulate to, and the reason a bench drone commands
+ * full thrust the moment it boots: 1.0 m is a CO-SIM number (the simulated drone starts at
+ * START_Z = 0.9 m, so the loop begins 0.1 m from its setpoint). A real drone on a bench starts at
+ * 0.02 m, which is a 0.98 m step error applied at t=0 with no climb ramp -- the altitude loop
+ * saturates on the first iteration and never leaves saturation. #ifndef-guarded and wired to the
+ * build (CMakeLists TARGET_Z) so the bench can lower it -- -DTARGET_Z=0.0f makes a stationary
+ * drone regulate to where it actually is -- without editing this file. Default unchanged. */
+#ifndef TARGET_Z
 #define TARGET_Z     1.0f
+#endif
 /* Iteration count. Default 5000 suits the RoSE co-sim (~max_sim_time). On real HW the loop now
  * runs ~1 kHz, so 5000 iters is only ~7 s -- override (-DCTRL_ITERS=...) for a longer bench run.
  * CTRL_ITERS=0 -> run FOREVER (no cap): the control/telemetry loop never exits, so a tethered
@@ -415,8 +424,84 @@ static inline void battery_poll(void) { }
  * or velocity -- or a key sensor drops out. Once latched, g_estop stays set until reset, and
  * send_control() forces every motor to 0. Thresholds are build-overridable. */
 #include <math.h>
+
+/* ===============================================================================================
+ * THE 2026-09-21 TILT-GUARD FAILURE, AND WHAT WAS ACTUALLY WRONG
+ * ===============================================================================================
+ * Measured on the bench: the drone was rotated by hand to roughly 90 degrees while
+ * `--mode esp-motors` was running, and nothing cut the motors. The console showed
+ *
+ *     it=1020  roll=-0.949  pitch=-0.029  duty=[0.100 0.100 0.100 0.100]
+ *
+ * and the ESP kept reporting flags=0x01 (ARMED) the whole way over.
+ *
+ * The estimator was NOT lagging and NOT mis-scaled. It was right, and it was MISREAD.
+ *
+ * state[3..5] are RODRIGUES (Gibbs) parameters, r = q_xyz / qw -- see estimator.hpp, and
+ * ComplementaryEstimator::get_state() / EkfEstimator::get_state(), both of which divide the
+ * quaternion vector part by qw. For a rotation of theta about one axis that is
+ *
+ *     r = tan(theta / 2)
+ *
+ * so the reported -0.949 is a true roll of 2*atan(0.949) = 1.518 rad = 87.0 DEGREES. That is the
+ * ~90 degrees the operator applied, to within how well anyone eyeballs 90 degrees. The estimator
+ * tracked the rotation correctly.
+ *
+ * What failed is that safety_violation() compared that Gibbs number against a constant named
+ * SAFE_MAX_TILT_RAD as though it were radians. 1.0 in Gibbs units is tan(theta/2) = 1, i.e.
+ * theta = 90.0 DEGREES EXACTLY -- not the ~57 degrees its own comment claimed. The guard's real
+ * trip point was 90 degrees and the operator reached 87. It missed by three degrees, and the
+ * comment had been describing a limit the code did not have since the constant was written.
+ *
+ * The same misreading was in the arm gate: ARM_MAX_TILT_RAD 0.10 "(~5.7 deg)" is really
+ * 2*atan(0.1) = 11.4 degrees.
+ *
+ * The codebase already knew, in one place. read_sensor_frame()'s flow tilt-compensation derives
+ * cos(tilt) from "the Gibbs state" with (1 - ga^2 - gb^2 + gc^2)/(1 + ga^2 + gb^2 + gc^2); put
+ * ga = 0.949 through it and it returns 0.052, which is cos(87.0 deg). Two independent routes to
+ * the same answer, so this is not a guess.
+ *
+ * THE FIX IS IN THREE PARTS, because one would not have been enough:
+ *
+ *   1. Convert. tilt_rad_from_gibbs() turns the state into actual radians, once, and every
+ *      attitude limit now compares radians against radians. The constants finally mean what they
+ *      are named.
+ *   2. Do not depend on the estimator at all for the handling case. accel_envelope() reads the
+ *      accelerometer directly -- gravity is a true attitude reference with no filter, no
+ *      convergence and no parameterisation to misread -- and adds FREE FALL and IMPACT, which
+ *      NOTHING in this file had. Tilt cannot catch a drop: a drone dropped flat stays flat the
+ *      whole way down and only |a| gives it away. The approach and the thresholds come from
+ *      integration/zephyr/safety/motor_guard.{h,c}, which is proven to compile and run on the
+ *      bench workloads; see the note on accel_envelope() for why the module is not linked here.
+ *   3. Debounce in MILLISECONDS, not iterations. SAFE_DEBOUNCE_ITERS was 15 consecutive iterations,
+ *      which is 20 ms under the PID cascade (1.3 ms/iter) and 525 ms under TinyMPC (35 ms/iter) --
+ *      a factor of TWENTY-SIX between two builds of the same guard, and the offload run that
+ *      failed was the slow one. A brisk tilt-and-return cannot outlast half a second. Time is the
+ *      unit that means the same thing in both builds.
+ *
+ * WHAT THE ACCELEROMETER GUARD IS AND IS NOT GOOD AT, stated so nobody over-trusts it. It reads
+ * SPECIFIC FORCE. Sitting still or hovering, that is gravity and the tilt it reports is true. In a
+ * hard translational acceleration the thrust vector dominates and body-frame horizontal accel
+ * stays small even at a real tilt, so it UNDER-reports during aggressive flight -- which is
+ * exactly where the estimator-based check is strong. They are a complementary pair on purpose, and
+ * the direction test is skipped entirely while |a| is outside a plausible band, because the
+ * direction of a vector that is not gravity says nothing about attitude.
+ * =============================================================================================== */
+
+/* Rodrigues/Gibbs magnitude of the roll+pitch part -> true tilt angle from vertical, in radians.
+ * Exact for a single-axis rotation; for a combined roll/pitch it is the half-angle of the combined
+ * rotation, which is what an envelope wants anyway. Saturates gracefully: r -> inf as theta -> 180,
+ * and atanf() simply approaches pi/2, so a tumbling frame reads pi rather than wrapping. */
+static inline float tilt_rad_from_gibbs(const float *state)
+{
+	return 2.0f * atanf(sqrtf(state[3] * state[3] + state[4] * state[4]));
+}
+
 #ifndef SAFE_MAX_TILT_RAD
-#define SAFE_MAX_TILT_RAD   1.0f     /* ~57 deg: past any recoverable bench perturbation */
+/* 0.70 rad = 40 deg, and now genuinely 40 deg. The old 1.0 was documented as 57 deg and behaved as
+ * 90 deg; a hover test that reaches 40 deg at 300 mm is already not going to be recovered, and a
+ * frame being picked up passes 40 deg long before it passes 90. */
+#define SAFE_MAX_TILT_RAD   0.70f
 #endif
 #ifndef SAFE_MAX_RATE_RADPS
 #define SAFE_MAX_RATE_RADPS 10.0f    /* ~573 deg/s: a violent tumble */
@@ -430,12 +515,86 @@ static inline void battery_poll(void) { }
 #ifndef SAFE_MAX_IMU_MISS
 #define SAFE_MAX_IMU_MISS   10       /* consecutive IMU read failures => sensor lost */
 #endif
-#ifndef SAFE_DEBOUNCE_ITERS
-#define SAFE_DEBOUNCE_ITERS 15       /* a limit must be exceeded this many CONSECUTIVE control iters
-                                      * (~13 ms @ 1 kHz) before latching estop. Rejects single-sample
-                                      * transients -- a motor-vibration gyro spike at spin-up, a
-                                      * between-sample velocity blip -- while still catching a genuine
-                                      * runaway (which persists for 100s of ms) essentially instantly. */
+
+/* ---- accelerometer envelope (no estimator in the path) --------------------------------------
+ * Thresholds carried over from integration/zephyr/safety/motor_guard.h so the two guards can be
+ * compared and tuned against each other. That module states tilt as sin^2(theta) in percent to stay
+ * integer-only for FPU-less builds; this file is float throughout, so the same limit is written as
+ * an angle and squared once at compile time. 40 deg here is sin^2 = 41%, against the module's
+ * bench default of 50% (45 deg) -- tighter, because this guard runs while motors may be driving. */
+#ifndef SAFE_ACC_TILT_RAD
+#define SAFE_ACC_TILT_RAD   0.70f    /* 40 deg, measured against gravity directly */
+#endif
+#ifndef SAFE_FREEFALL_MPS2
+#define SAFE_FREEFALL_MPS2  3.92f    /* |a| below ~0.4 g: the airframe is falling */
+#endif
+#ifndef SAFE_IMPACT_MPS2
+#define SAFE_IMPACT_MPS2    29.43f   /* |a| above ~3 g: it hit something */
+#endif
+/* Trust the accelerometer's DIRECTION only inside this band. Outside it, |a| is not gravity and the
+ * two magnitude tests above own the case.
+ *
+ * WHETHER TO WIDEN THIS WAS THE HARDEST CALL IN THE 2026-09-21 SAFETY AUDIT, because this band is
+ * the one place a test in this guard can switch itself off, and prop vibration is exactly what
+ * pushes |a| out of it. The decision is NOT TO WIDEN. The reasoning, in full, so that the next
+ * person to reach for these numbers argues with it rather than guessing at it:
+ *
+ * WHAT IS STILL TRUE OUTSIDE THE BAND. Free-fall and impact are magnitude tests evaluated BEFORE
+ * this check, so they never stop. est tilt, rate, velocity and height are computed after this
+ * returns, from the estimator and the gyro, and never touch this path. Exactly ONE of the seven
+ * tests suspends -- the accelerometer's DIRECTION -- and the estimator's tilt covers the same
+ * failure by a different route. That is not a hole; it is a degradation to six tests from seven.
+ * On the bench it was the estimator test that actually fired ("47.457 deg est-tilt") precisely
+ * BECAUSE hand-tilting the frame had pushed |a| out of this band. The pair works.
+ *
+ * WHY WIDENING WOULD NOT BUY WHAT IT LOOKS LIKE IT BUYS. Outside the band |a| is not gravity, so
+ * asin(|horiz|/|a|) is not attitude. Under thrust- or vibration-dominated |a| the horizontal part
+ * stays small relative to a LARGER total, so the formula UNDER-reports the tilt. A widened band
+ * therefore does not gain a test that trips; it gains a test that reads a plausible small number
+ * and does not trip. Against a limit, "absent" and "silently under-reporting" fail identically.
+ *
+ * WHY WIDENING WOULD ACTIVELY COST SOMETHING. g_guard_tilt_rad is what the telemetry line prints
+ * as accNdeg, and the whole pre-flight proof that the guard is alive is "tilt the frame by hand and
+ * watch acc follow" -- see docs/tethered-flight-attempt.md. Suspended, it publishes pi, which
+ * prints as acc180deg: an unmistakable "I do not know". Widened, it would publish a believable
+ * wrong angle instead. Trading an honest refusal for a plausible fiction is the wrong trade in a
+ * device whose previous failure was a guard that looked like it was working.
+ *
+ * WHAT THE MEASUREMENT SAYS. Props ON, on the bench: |a| ranged 7.85 .. 12.46 m/s^2 and 0 of 44
+ * samples fell outside this band. It was not being hit. The honest caveat is that this was at the
+ * 10 % bench cap, and nobody has sampled |a| at the 65-75 % duty a tethered hover needs.
+ *
+ * SO INSTEAD OF WIDENING, MAKE IT COUNTABLE. g_guard_acc_skips counts every sample the direction
+ * test sits out. At rest it stays 0; if it climbs with props spinning, the accelerometer test is
+ * effectively off and the estimator test is carrying the attitude envelope alone -- which is a
+ * thing to know and act on, not a thing to hide behind a wider band. The telemetry line and
+ * hardware/flight/guard-check.gdb both report it. */
+#ifndef SAFE_ACC_TRUST_LO_MPS2
+#define SAFE_ACC_TRUST_LO_MPS2 5.89f   /* 0.6 g */
+#endif
+#ifndef SAFE_ACC_TRUST_HI_MPS2
+#define SAFE_ACC_TRUST_HI_MPS2 14.72f  /* 1.5 g */
+#endif
+
+/* ---- debounce, in milliseconds ---------------------------------------------------------------
+ * A limit must be exceeded continuously for this long, AND across at least
+ * SAFE_DEBOUNCE_MIN_SAMPLES samples, before the estop latches. The sample floor is what rejects a
+ * single garbage reading on a fast loop; the time is what makes the guard behave identically under
+ * the PID cascade (~1.3 ms/iter) and TinyMPC (~35 ms/iter).
+ *
+ * 120 ms for attitude/rate/velocity/height/battery: long enough to ride out a spin-up vibration
+ * spike, short enough that a deliberate tilt-and-return is caught -- the failed run crossed and
+ * returned inside about 600 ms, so the old 375-525 ms could not have caught it either.
+ * 40 ms for free fall and impact: those are not transients to be ridden out. A 40 ms fall is 8 mm.
+ */
+#ifndef SAFE_DEBOUNCE_MS
+#define SAFE_DEBOUNCE_MS       120
+#endif
+#ifndef SAFE_SHOCK_DEBOUNCE_MS
+#define SAFE_SHOCK_DEBOUNCE_MS 40
+#endif
+#ifndef SAFE_DEBOUNCE_MIN_SAMPLES
+#define SAFE_DEBOUNCE_MIN_SAMPLES 2
 #endif
 static volatile bool g_estop;        /* latched emergency stop (cleared only by a reset -- chip OR soft) */
 static volatile bool g_arming;       /* autoflight arm-settle countdown in progress (for status LED) */
@@ -473,7 +632,13 @@ static const bool    g_armed = true;
 #define ARM_SETTLE_MS        3000   /* ROSE_ARM_NO_GESTURE: level+ground+still hold time to auto-arm */
 #endif
 #ifndef ARM_MAX_TILT_RAD
-#define ARM_MAX_TILT_RAD    0.10f   /* must be level (~5.7 deg) to arm */
+/* TRUE radians, compared against tilt_rad_from_gibbs(), not against the raw Gibbs parameter.
+ * The old 0.10 was commented "~5.7 deg" and, read as Gibbs, was really 2*atan(0.10) = 11.4 deg --
+ * the same units bug that let the safety envelope sit at 90 deg while claiming 57. 0.20 rad is
+ * 11.5 deg, so the gate keeps the angle it has actually been enforcing all along and only its name
+ * changes. Tighten it deliberately if the bench wants a flatter start; do not tighten it by
+ * accident, because arming that cannot complete is its own kind of failure. */
+#define ARM_MAX_TILT_RAD    0.20f   /* 11.5 deg, and now genuinely 11.5 deg */
 #endif
 #ifndef ARM_MAX_HEIGHT_M
 #define ARM_MAX_HEIGHT_M    0.020f  /* must be on the ground (<20 mm) to arm */
@@ -503,43 +668,435 @@ static const bool    g_armed = true;
 #ifndef FLIGHT_MAX_MS
 #define FLIGHT_MAX_MS       10000   /* hard cap regardless of the profile */
 #endif
+/*
+ * Per-motor duty ceiling in flight. READ THIS BEFORE BELIEVING THE DEFAULT.
+ *
+ * The comment that used to sit on this line said "hover~0.15; margin above". That is wrong, and
+ * it is wrong in the dangerous direction. 0.15 is MOTOR_BREAKAWAY_DUTY, ~90 lines down: the duty
+ * at which a motor first turns at all. It was evidently copied here and nothing about this
+ * airframe supports it as a hover figure. There are three numbers in this tree claiming to be
+ * hover duty and they differ by about 5x:
+ *
+ *   0.583  the CONTROLLER'S LINEARISATION POINT, not a measurement. It is the +0.583f in
+ *          actuator_duty() and the box TinympcController::init() builds around it
+ *          (u_min -0.583, u_max 1-0.583). It says what the controller ASSUMES hover is.
+ *   0.71   MEASURED IN FLIGHT. docs/FLIGHT_TUNING_LOG.md, platform line: "~71 % hover duty, raw
+ *          command saturating 42-65 % of the flight". Those flights ran with
+ *          AUTOFLIGHT_MAX_DUTY=0.95 (same file) and docs/FLIGHT_BUILD.md's recipe passes 0.8f
+ *          with the note "hover needs ~65%".
+ *   0.15   the copied break-away number. Not a hover duty at all.
+ *
+ * So 0.45 IS PROBABLY BELOW HOVER, and a ceiling below hover does not make a gentle flight: the
+ * anti-saturation cut holds the collective at the ceiling, the drone sits on the ground at full
+ * command, and the honest-looking console shows every motor pinned. The reaction that costs an
+ * airframe is to assume something is broken and start raising limits in a hurry. Raise this
+ * deliberately, in one step, having decided the number first -- 0.8f is what the recorded flight
+ * recipe used.
+ *
+ * The default is left at 0.45 rather than raised here: it is the conservative direction, it is
+ * what every existing autoflight build has been tested against, and a flight cap is not
+ * something a file edit should hand out. The #pragma below makes the situation impossible to
+ * miss at build time instead. NOTE this knob is the AUTOFLIGHT path only; --mode esp-motors is a
+ * non-autoflight build and is capped by MOTOR_MAX_DUTY (a scale) plus the ESP's own ceiling.
+ */
 #ifndef AUTOFLIGHT_MAX_DUTY
-#define AUTOFLIGHT_MAX_DUTY 0.45f   /* per-motor duty ceiling in flight (hover~0.15; margin above) */
+#define AUTOFLIGHT_MAX_DUTY 0.45f
 #endif
+/* The comparison against the measured hover duty is made at RUN TIME, in safety_banner(), not
+ * here: `#if` cannot compare floats (a float in a preprocessor expression is an error, not a
+ * comparison), and a line in a build log is read once while the boot banner is read at the
+ * bench every time the board comes up. */
 #endif /* ROSE_AUTOFLIGHT */
 
 /* Returns a short reason if any safety limit is exceeded (state = 12-DoF body state, gyro = body
  * rates rad/s), else NULL. Attitude from the estimate; rate straight from the gyro (no filter lag);
  * velocity from the estimate. */
-static const char *safety_violation(const float *state, const float *gyro)
+/* Live guard view, published every iteration so telemetry and a debugger can see WHAT THE GUARD
+ * SEES. Without these, "it did not trip" and "it is not looking" produce identical output, which is
+ * the one thing a safety device must never do -- and is precisely how the 90-degree miss went
+ * unnoticed until someone rotated the drone by hand. */
+static volatile float g_guard_tilt_rad;   /* accelerometer tilt from vertical (rad) */
+static volatile float g_guard_est_rad;    /* estimator tilt from vertical (rad), Gibbs converted */
+static volatile float g_guard_amag;       /* |accel| (m/s^2) */
+/* How many samples the accel DIRECTION test has sat out because |a| left the trust band. The one
+ * test in this guard that can switch itself off must be countable, or "it never tripped" and "it
+ * was not running" produce the same console again -- see the note on the trust band. */
+static volatile uint32_t g_guard_acc_skips;
+
+/*
+ * ACCELEROMETER ENVELOPE -- the estimator is deliberately not in this path.
+ *
+ * Reuses the tests and the thresholds from integration/zephyr/safety/motor_guard.{h,c}. It is NOT
+ * linked in here, and the reason is worth writing down: that module runs its own cooperative thread
+ * that calls sensor_sample_fetch() on the BMI088 and zeroes an array of pwm_dt_spec on a trip.
+ * Neither fits this application. The control loop already fetches the same accelerometer every
+ * iteration, and a second thread fetching it concurrently would contend for the same bus behind a
+ * driver that does not expect two samplers; and on the ESP-offload path there are NO pwm_dt_spec
+ * motors at all -- the FPGA drives no gate -- so a guard that stops motors by writing PWM would be
+ * a guard that does nothing. Here the trip latches g_estop instead, which both actuator backends
+ * already honour, and which on the offload path transmits an explicit zero-duty ESTOP frame on the
+ * very next tick because a flags change bypasses the frame rate limiter.
+ *
+ * Returns a reason or NULL. *need_ms is how long THIS reason must persist, *meas / *unit are the
+ * number that tripped it, for the console.
+ */
+static const char *accel_envelope(const float *accel, int *need_ms, float *meas, const char **unit)
 {
-	if (fabsf(state[3]) > SAFE_MAX_TILT_RAD || fabsf(state[4]) > SAFE_MAX_TILT_RAD) {
+	const float ax = accel[0], ay = accel[1], az = accel[2];
+	const float horiz2 = ax * ax + ay * ay;
+	const float total2 = horiz2 + az * az;
+	const float amag = sqrtf(total2);
+
+	g_guard_amag = amag;
+
+	/* Free fall first: it is the most urgent and the only one tilt can never see. A drone dropped
+	 * flat stays flat the whole way down. */
+	if (total2 < (SAFE_FREEFALL_MPS2) * (SAFE_FREEFALL_MPS2)) {
+		*need_ms = SAFE_SHOCK_DEBOUNCE_MS;
+		*meas = amag; *unit = "m/s2 |a|";
+		return "free-fall";
+	}
+	if (total2 > (SAFE_IMPACT_MPS2) * (SAFE_IMPACT_MPS2)) {
+		*need_ms = SAFE_SHOCK_DEBOUNCE_MS;
+		*meas = amag; *unit = "m/s2 |a|";
+		return "impact";
+	}
+	/* Direction is attitude only while the magnitude is plausibly gravity. Outside the band the
+	 * two tests above own the case and this one stays quiet rather than guessing. */
+	if (amag >= (SAFE_ACC_TRUST_LO_MPS2) && amag <= (SAFE_ACC_TRUST_HI_MPS2)) {
+		/* tilt from vertical, straight out of gravity: sin(theta) = |horizontal| / |a|. */
+		const float tilt = asinf(sqrtf(horiz2 / total2));
+
+		g_guard_tilt_rad = tilt;
+		if (tilt > (SAFE_ACC_TILT_RAD)) {
+			*need_ms = SAFE_DEBOUNCE_MS;
+			*meas = tilt * (180.0f / 3.14159265f); *unit = "deg accel-tilt";
+			return "accel-tilt";
+		}
+	} else {
+		/* Out of the trust band: publish "unknown, assume the worst" rather than leaving the
+		 * last good value in place. The arm gate reads this, and a stale level reading is the
+		 * one way a cross-check can silently permit what it was added to forbid. */
+		g_guard_tilt_rad = 3.14159265f;
+		g_guard_acc_skips++;
+	}
+	return NULL;
+}
+
+/*
+ * Full envelope: the accelerometer tests above, then the estimator-based ones.
+ *
+ * Attitude is compared in REAL RADIANS now. state[3..4] are Rodrigues parameters, r = tan(theta/2)
+ * per axis -- comparing them directly against a constant named *_RAD is the bug that let a
+ * 87-degree hand rotation sit under a limit everyone believed was 57 degrees and was actually 90.
+ * See the long note above the thresholds.
+ */
+static const char *safety_violation(const float *state, const float *gyro, const float *accel,
+				    int *need_ms, float *meas, const char **unit)
+{
+	const char *why;
+	float tilt;
+
+	*need_ms = SAFE_DEBOUNCE_MS;
+	*meas = 0.0f;
+	*unit = "";
+
+	why = accel_envelope(accel, need_ms, meas, unit);
+	if (why != NULL) {
+		return why;
+	}
+	*need_ms = SAFE_DEBOUNCE_MS;
+
+	tilt = tilt_rad_from_gibbs(state);
+	g_guard_est_rad = tilt;
+	if (tilt > SAFE_MAX_TILT_RAD) {
+		*meas = tilt * (180.0f / 3.14159265f); *unit = "deg est-tilt";
 		return "tilt";
 	}
 	if (fabsf(gyro[0]) > SAFE_MAX_RATE_RADPS || fabsf(gyro[1]) > SAFE_MAX_RATE_RADPS ||
 	    fabsf(gyro[2]) > SAFE_MAX_RATE_RADPS) {
+		float m = fabsf(gyro[0]);
+
+		if (fabsf(gyro[1]) > m) m = fabsf(gyro[1]);
+		if (fabsf(gyro[2]) > m) m = fabsf(gyro[2]);
+		*meas = m; *unit = "rad/s";
 		return "rate";
 	}
 	if (fabsf(state[6]) > SAFE_MAX_VEL_MPS || fabsf(state[7]) > SAFE_MAX_VEL_MPS ||
 	    fabsf(state[8]) > SAFE_MAX_VEL_MPS) {
+		float m = fabsf(state[6]);
+
+		if (fabsf(state[7]) > m) m = fabsf(state[7]);
+		if (fabsf(state[8]) > m) m = fabsf(state[8]);
+		*meas = m; *unit = "m/s";
 		return "velocity";
 	}
 	if (state[2] > SAFE_MAX_HEIGHT_M) {   /* z = altitude (up); one-sided ceiling guard */
+		*meas = state[2]; *unit = "m";
 		return "height";
 	}
 #if ROSE_BATT_SENSE
 	/* Low-voltage cutoff: only a VALID reading (>= 1.0 V) below the threshold trips -- a garbage-low
 	 * read (< 1.0 V, sensor fault) is ignored so it can't false-estop mid-flight. Debounced by the
-	 * caller (SAFE_DEBOUNCE_ITERS) like every other reason. */
+	 * caller like every other reason. */
 	if (g_vbat >= 1.0f && g_vbat < BATT_CUTOFF_V) {
+		*meas = g_vbat; *unit = "V";
 		return "battery";
 	}
 #endif
 	return NULL;
 }
 
+/* Say what the envelope IS, at boot, in units a human can check against a protractor. A guard
+ * nobody can read is a guard nobody can verify, and this one was wrong for as long as it has
+ * existed precisely because its numbers were only ever printed as source comments. */
+static void safety_banner(void)
+{
+	printk("flight_controller: ENVELOPE GUARD -- accel tilt >%d deg, free-fall <%s%d.%03d m/s2, "
+	       "impact >%s%d.%03d m/s2 (no estimator in that path)\n",
+	       (int)((SAFE_ACC_TILT_RAD) * (180.0f / 3.14159265f) + 0.5f),
+	       FP3((float)(SAFE_FREEFALL_MPS2)), FP3((float)(SAFE_IMPACT_MPS2)));
+	printk("flight_controller: ENVELOPE GUARD -- est tilt >%d deg, rate >%d rad/s, vel >%s%d.%03d m/s, "
+	       "height >%s%d.%03d m\n",
+	       (int)((SAFE_MAX_TILT_RAD) * (180.0f / 3.14159265f) + 0.5f),
+	       (int)(SAFE_MAX_RATE_RADPS),
+	       FP3((float)(SAFE_MAX_VEL_MPS)), FP3((float)(SAFE_MAX_HEIGHT_M)));
+	printk("flight_controller: ENVELOPE GUARD -- dwell %d ms (%d ms for free-fall/impact), "
+	       "min %d samples; ACTIVE ONLY WHILE ARMED\n",
+	       (int)(SAFE_DEBOUNCE_MS), (int)(SAFE_SHOCK_DEBOUNCE_MS),
+	       (int)(SAFE_DEBOUNCE_MIN_SAMPLES));
+	/* "ACTIVE ONLY WHILE ARMED" is true and is read as narrower than it is, so say what armed
+	 * MEANS in this build. In every non-autoflight mode -- which is every mode that will be
+	 * flown on the offload path -- g_armed is a compile-time `true` (see its definition), so the
+	 * guard latches from the first control tick to the last and there is no unarmed window. */
+	printk("flight_controller: ENVELOPE GUARD -- armed=%s in this build, so the latch is %s\n",
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	       "the run-time arm gate", "live only after arming");
+#else
+	       "COMPILE-TIME TRUE", "live from the first control tick");
+#endif
+	/* The one test that can suspend itself. accel_envelope() skips the DIRECTION check while
+	 * |a| is outside the trust band, because the direction of a vector that is not gravity says
+	 * nothing about attitude -- and prop vibration is exactly what pushes |a| out of that band.
+	 * It is visible, not silent: g_guard_tilt_rad is published as pi, which the telemetry line
+	 * prints as acc180deg. Free-fall, impact, est-tilt, rate, velocity and height are unaffected
+	 * and keep running; they are tested before the band, or do not use the accelerometer at all. */
+	printk("flight_controller: ENVELOPE GUARD -- accel-tilt test is SUSPENDED while |a| is "
+	       "outside %s%d.%03d..%s%d.%03d m/s2; telemetry then reads acc180deg and counts it in "
+	       "accskip=. The other six tests keep running.\n",
+	       FP3((float)(SAFE_ACC_TRUST_LO_MPS2)), FP3((float)(SAFE_ACC_TRUST_HI_MPS2)));
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	/* Checked at run time because `#if` cannot compare floats. 0.71 is the only MEASURED hover
+	 * duty this tree has (docs/FLIGHT_TUNING_LOG.md); a ceiling below it is a safe failure that
+	 * looks exactly like broken hardware, and the reaction that costs an airframe is to start
+	 * raising limits in a hurry. Say it here instead. */
+	if ((float)(AUTOFLIGHT_MAX_DUTY) < 0.71f) {
+		printk("flight_controller: *** AUTOFLIGHT_MAX_DUTY %s%d.%03d IS BELOW THE MEASURED "
+		       "0.71 HOVER DUTY *** -- this build may be unable to leave the ground. That is "
+		       "a SAFE failure. Do not react to it by raising limits in a hurry.\n",
+		       FP3((float)(AUTOFLIGHT_MAX_DUTY)));
+	}
+#endif
+}
+
+/* ---- COMMITMENT GATE -------------------------------------------------------------------------
+ *
+ * THE REQUIREMENT, in the operator's words: "make sure we have reliable ways of stopping and
+ * motors dont spin for too long until we are COMMITTED (meaning im actively aware) to a flight
+ * test." Two separate things: stopping must be reliable, and an UNCOMMITTED build must not be
+ * able to run motors for long. Everything else in this file -- estop, the arm gate, the duty
+ * ceilings, the bench actuation timeout -- answers the first. This answers the second.
+ *
+ * WHY IT IS NEEDED AT ALL. In every non-autoflight mode g_armed is a compile-time `true`, so a
+ * board that boots `--mode motors` or `--mode esp-motors` is armed from its first control tick.
+ * The controller regulates to TARGET_Z, so it asks for thrust immediately and keeps asking for as
+ * long as the loop runs -- CTRL_ITERS iterations, or forever with CTRL_ITERS=0. The only bound was
+ * ROSE_ACTUATE_TIMEOUT_MS, which DEFAULTS TO 0 = never (see the CMake cache entry), so the default
+ * build had no time bound on motor output whatsoever.
+ *
+ * THE DEFAULT. Motors may run for ROSE_MOTOR_WINDOW_MS (5 s) measured from the first instant a
+ * non-zero duty would actually have been written. Then all four are commanded to 0 and LATCHED --
+ * whatever the controller asks for afterwards, and whatever the arm gate says. 5 s is chosen to be
+ * long enough to hear each motor spin up and see a duty in telemetry, and far too short to fly.
+ *
+ * COMMITTING, and why it cannot happen by accident. It takes TWO independent acts:
+ *
+ *   1. BUILD TIME  -DROSE_FLIGHT_COMMIT=1. Deliberately NOT selected by any --mode (see
+ *      tools/rb/boards.py): no mode name can quietly imply it, so it has to be typed, as
+ *      RB_CMAKE_ARGS="-DROSE_FLIGHT_COMMIT=1". Without it, g_flight_commit_key below is not
+ *      compiled at all -- so the run-time act is not merely refused, the symbol does not exist and
+ *      the GDB script fails with "No symbol". That absence is the proof the image cannot fly.
+ *
+ *   2. RUN TIME    the operator writes ROSE_COMMIT_KEY into g_flight_commit_key from a tethered
+ *      debugger (hardware/flight/commit.gdb), on the bench, with the drone in front of them. It is
+ *      a specific 32-bit constant, so neither uninitialised RAM, nor a stray `set var x = 1`, nor a
+ *      wild store can produce it; and it is polled, not latched at boot, so it cannot survive into
+ *      a later session.
+ *
+ * Neither act alone does anything. A committed image that is never keyed behaves exactly like the
+ * default. A key written into an uncommitted image has nowhere to land.
+ *
+ * Committed, the window becomes ROSE_COMMIT_MAX_MS (60 s) rather than unbounded: a commitment is
+ * permission for A FLIGHT TEST, not permission forever. FLIGHT_MAX_MS (10 s) still ends an
+ * autoflight long before this, so the 60 s is the backstop for the backstop.
+ *
+ * ANNOUNCED, ALWAYS. "Actively aware" is the requirement, so every transition prints: the banner at
+ * boot, the window opening on the first live duty, a 1 Hz heartbeat while motors may run, the
+ * latch, the commit being accepted or refused, and a soft reset that does NOT clear the latch. A
+ * state the console does not name is a state the operator is not aware of.
+ *
+ * WHAT THE GATE DOES NOT COVER, said plainly: the autoflight boot/ready chirps drive PWM directly
+ * rather than through send_control(), so they do not open the window. They are bounded by
+ * construction (MOTOR_CHIRP_MS per pulse, six pulses) and are the signal that the board reset,
+ * which is itself a safety feature. There is no chirp at all on the ESP-offload path.
+ */
+#ifndef ROSE_FLIGHT_COMMIT
+#define ROSE_FLIGHT_COMMIT 0
+#endif
+#ifndef ROSE_MOTOR_WINDOW_MS
+#define ROSE_MOTOR_WINDOW_MS 5000    /* uncommitted: motor-live time before the latch */
+#endif
+#ifndef ROSE_COMMIT_MAX_MS
+#define ROSE_COMMIT_MAX_MS 60000     /* committed: still bounded, just usefully longer */
+#endif
+#ifndef ROSE_MOTOR_LIVE_NOTE_MS
+#define ROSE_MOTOR_LIVE_NOTE_MS 1000 /* heartbeat cadence while the window is open */
+#endif
+/* "FLY!" -- chosen so the value is recognisable in a memory dump and impossible to hit by
+ * accident. Do not make it 1, and do not make it derivable from anything the program computes. */
+#define ROSE_COMMIT_KEY 0x464C5921u
+
 /* ---- Actuator output: RoSE bridge (co-sim) vs PWM motors (real) ---- */
 #define HAVE_ROSE DT_HAS_COMPAT_STATUS_OKAY(ucbbar_roseadapter)
+
+#if HAVE_ROSE
+/* Co-sim drives no physical motor, so there is nothing here to time-bound: a simulated flight that
+ * cut out after 5 s would be a broken simulation, not a safe one. Stubs, named so the call sites
+ * below read identically on both targets. */
+static inline void motor_gate_banner(void) { }
+static inline bool motor_gate_permit(const float *duty) { (void)duty; return true; }
+static inline bool motor_gate_committed(void) { return false; }
+static inline void motor_gate_note_reset(void) { }
+#else
+#if ROSE_FLIGHT_COMMIT
+/* NOT static, and volatile: the operator writes it from GDB, nothing in the image ever writes it,
+ * and --gc-sections must not drop a variable whose only writer is a human. Kept out of the image
+ * entirely on an uncommitted build -- that is the build-time half of the interlock. */
+volatile uint32_t g_flight_commit_key;
+#endif
+static volatile bool    g_motor_committed;    /* the run-time key was accepted */
+static volatile bool    g_motor_latched;      /* window expired: OFF until a board reset */
+static volatile int64_t g_motor_live_since;   /* 0 = no non-zero duty has been commanded yet */
+
+static inline bool motor_gate_committed(void) { return g_motor_committed; }
+
+static inline int motor_gate_limit_ms(void)
+{
+	return g_motor_committed ? (int)(ROSE_COMMIT_MAX_MS) : (int)(ROSE_MOTOR_WINDOW_MS);
+}
+
+static void motor_gate_banner(void)
+{
+#if ROSE_FLIGHT_COMMIT
+	printk("flight_controller: COMMIT GATE -- build is COMMIT-CAPABLE (ROSE_FLIGHT_COMMIT=1) but "
+	       "NOT COMMITTED: motors latch OFF %d ms after they first spin.\n",
+	       (int)(ROSE_MOTOR_WINDOW_MS));
+	printk("flight_controller: COMMIT GATE -- to commit, write 0x%08x to g_flight_commit_key "
+	       "(hardware/flight/commit.gdb). Committed cap is %d ms.\n",
+	       (unsigned)ROSE_COMMIT_KEY, (int)(ROSE_COMMIT_MAX_MS));
+#else
+	printk("flight_controller: COMMIT GATE -- UNCOMMITTED BUILD: motors latch OFF %d ms after "
+	       "they first spin, and CANNOT be committed at run time.\n",
+	       (int)(ROSE_MOTOR_WINDOW_MS));
+	printk("flight_controller: COMMIT GATE -- a flight test needs BOTH a rebuild with "
+	       "RB_CMAKE_ARGS=\"-DROSE_FLIGHT_COMMIT=1\" AND hardware/flight/commit.gdb.\n");
+#endif
+}
+
+/* A soft reset (rose_cmd_reset / hardware/flight/reset.gdb) clears estop and disarms, and the
+ * operator reasonably expects it to clear everything. It does NOT clear this latch -- "stays there
+ * until reset" means a real reset -- so say so, once, rather than leaving them to wonder why the
+ * motors never came back. */
+static void motor_gate_note_reset(void)
+{
+	if (g_motor_latched) {
+		printk("MOTOR GATE: soft reset does NOT clear the window latch -- motors stay OFF "
+		       "until the board is reset.\n");
+	}
+}
+
+/*
+ * Called once per control tick with the duty that WOULD have been written, after every other
+ * safety layer has had its say. Returns false when the caller must write zeros instead.
+ *
+ * Deliberately last in send_control() on both actuator backends: taking the duty as an argument
+ * rather than re-deriving it means no branch above can reach a motor without passing through here,
+ * and the gate cannot disagree with the actuator about what was about to be commanded.
+ */
+static bool motor_gate_permit(const float *duty)
+{
+	const int64_t now = k_uptime_get();
+	bool live = false;
+
+#if ROSE_FLIGHT_COMMIT
+	if (!g_motor_committed && g_flight_commit_key == ROSE_COMMIT_KEY) {
+		if (g_motor_latched) {
+			static bool refused;
+
+			if (!refused) {
+				refused = true;
+				printk("MOTOR GATE: COMMIT REFUSED -- the window already latched. "
+				       "Reset the board, then commit BEFORE the motors run.\n");
+			}
+		} else {
+			g_motor_committed = true;
+			printk("MOTOR GATE: *** COMMITTED TO A FLIGHT TEST *** -- motor budget is now "
+			       "%d ms (was %d ms). Props are live.\n",
+			       (int)(ROSE_COMMIT_MAX_MS), (int)(ROSE_MOTOR_WINDOW_MS));
+		}
+	}
+#endif
+	if (g_motor_latched) {
+		return false;
+	}
+	for (int i = 0; i < NACTIONS; i++) {
+		if (duty[i] > 0.0f) {
+			live = true;
+			break;
+		}
+	}
+	if (g_motor_live_since == 0) {
+		if (!live) {
+			return true;   /* nothing has spun yet: the clock has not started */
+		}
+		g_motor_live_since = now;
+		printk("MOTOR GATE: WINDOW OPEN -- motors are live; %d ms budget starts now (%s)\n",
+		       motor_gate_limit_ms(), g_motor_committed ? "COMMITTED" : "uncommitted");
+	}
+	{
+		const int64_t elapsed = now - g_motor_live_since;
+
+		if (elapsed >= (int64_t)motor_gate_limit_ms()) {
+			g_motor_latched = true;
+			printk("MOTOR GATE: WINDOW EXPIRED after %d ms -- ALL FOUR MOTORS COMMANDED OFF "
+			       "AND LATCHED (board reset to clear)\n", (int)elapsed);
+			return false;
+		}
+		{
+			static int64_t next_note;
+
+			if (now >= next_note) {
+				next_note = now + (int64_t)(ROSE_MOTOR_LIVE_NOTE_MS);
+				printk("MOTOR GATE: MOTORS LIVE %d/%d ms (%s)\n", (int)elapsed,
+				       motor_gate_limit_ms(),
+				       g_motor_committed ? "COMMITTED" : "uncommitted");
+			}
+		}
+	}
+	return true;
+}
+#endif /* HAVE_ROSE */
+
 #if HAVE_ROSE
 #include <rose/rose.h>
 #define ROSE_CMD_CONTROL 0x20u
@@ -557,8 +1114,10 @@ static void send_control(const float *u)
 		rose_tx(rose, w);
 	}
 }
+static inline void motor_power_banner(void) { /* no physical motor on the RoSE target */ }
 static void motors_startup_pulse(void) { /* no motors on the RoSE target */ }
 static void motors_boot_chirp(void) { /* no motors on the RoSE target */ }
+static void motors_shutdown(void) { /* no motors on the RoSE target */ }
 #else /* real target: drive 4 PWM motors (thrust ~ duty). Actuator parity is future work. */
 #include <zephyr/drivers/pwm.h>
 /* Last duty actually written per motor, and the last return code from writing
@@ -566,38 +1125,131 @@ static void motors_boot_chirp(void) { /* no motors on the RoSE target */ }
 static volatile float g_last_duty[NACTIONS];
 static volatile int   g_last_pwm_rc[NACTIONS];
 
-#define MOTORS_NODE DT_ALIAS(motors)
-#if DT_NODE_EXISTS(MOTORS_NODE)
-static const struct pwm_dt_spec motors[NACTIONS] = {
-	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 0),
-	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 1),
-	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 2),
-	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 3),
-};
 /* SAFETY (early bench bring-up): hard ceiling on motor duty. The controller
  * regulates to a hover setpoint, so its raw command ramps toward hover/takeoff
  * thrust; this scales the full [0,1] duty into [0, MOTOR_MAX_DUTY] so the
  * controller can respond and be observed, but CANNOT produce flight thrust.
- * Raise deliberately only for actual flight testing. */
-#ifndef MOTOR_MAX_DUTY
+ * Raise deliberately only for actual flight testing.
+ *
+ * IT IS A SCALE, NOT A CLAMP, and the difference decides whether a flight build
+ * can hover. actuator_duty() MULTIPLIES by it (the loop at the end of that
+ * function); the clamp on the following line only catches the already
+ * impossible. So every duty -- collective AND differential -- is multiplied by
+ * this number. Thrust goes as roughly duty^2, so a cap of s gives about s^2 of
+ * full thrust while leaving the torque/thrust ratio unchanged, which is what
+ * makes it a usable power limiter rather than something that eats attitude
+ * authority. What it also means: the PID altitude loop has no integrator, so it
+ * cannot claw the scale back. A cap below the real hover duty is a drone that
+ * sits on the floor at full command, not a drone that climbs slowly.
+ *
+ * IT IS NOT THE ONLY CEILING. On the ESP-offload path the last word belongs to
+ * ESP_MOTORS_MAX_DUTY_PCT in workloads/esp_motors (default 25 %), applied in
+ * motors_apply() after the frame arrives, and it deliberately does not trust
+ * this side. Raising only this one is silently clamped there and looks exactly
+ * like a thrust failure or a tuning problem. See the check under
+ * ROSE_ESP_MOTORS below, which is there to make that mistake noisy.
+ *
+ * These three knobs used to live inside the `#if DT_NODE_EXISTS(MOTORS_NODE)`
+ * block below, with MOTOR_MAX_DUTY doubly #ifndef-guarded so that a build which
+ * already defined it (every build does -- the CMakeLists passes all three)
+ * skipped the break-away and chirp defaults too. Hoisted and de-nested here
+ * because the ESP-offload backend needs the same numbers and must not carry a
+ * second copy of them. No build changes: CMake defines all three either way. */
 #ifndef MOTOR_MAX_DUTY
 #define MOTOR_MAX_DUTY 0.10f
 #endif
+
+/* ---- MOTOR_MAX_DUTY IS A SCALE, NOT A CLAMP -- and why a second knob exists.
+ *
+ * Read actuator_duty() below before setting either of these for a flight test.
+ * On the bench (non-autoflight) path MOTOR_MAX_DUTY is applied as the LAST
+ * step, as a MULTIPLIER on a duty that is already physical:
+ *
+ *     duty[i] = (u[i] + 0.583) ... anti-saturation cut at 1.0 ... * MOTOR_MAX_DUTY
+ *
+ * That is right for a propellers-off bench run -- every motor still responds
+ * and the differential is visible at a duty too low to lift anything -- and it
+ * is WRONG as a flight cap, for a reason that is easy to miss and expensive to
+ * discover with props on:
+ *
+ *   the controller's output IS the physical duty it wants. u + 0.583 round-trips
+ *   controller_pid.cpp's forceToVoltage() exactly. Hover on this airframe needs
+ *   ~0.65-0.71 duty (FLIGHT_BUILD.md: "hover needs ~65%"; FLIGHT_TUNING_LOG.md:
+ *   "~71 % hover duty"). Set MOTOR_MAX_DUTY to 0.75 "as a 75 % cap" and the
+ *   motors get 0.71 * 0.75 = 0.53 at the controller's hover command -- about
+ *   55 % of hover THRUST, since thrust goes as duty^2. The drone cannot hover.
+ *   Worse, it does not fail cleanly: while the altitude error is large the loop
+ *   saturates, the scaled command sits at 0.75 and the drone climbs hard; as it
+ *   approaches the setpoint the command falls back toward 0.71, the scale bites,
+ *   and thrust collapses. That is a porpoise, with props on, on a tether.
+ *
+ * MOTOR_DUTY_CEILING is the knob that means what "cap" sounds like. It replaces
+ * the hard-coded 1.0 the bench path's ATTITUDE-PRIORITY ANTI-SATURATION cut
+ * works against, so exceeding it lowers the COLLECTIVE and preserves the
+ * differential -- the same semantics AUTOFLIGHT_MAX_DUTY already has on the
+ * autoflight path, and the reason a per-motor clamp is the wrong tool here (a
+ * clamp flattens four commands into four equal numbers = no attitude authority,
+ * exactly when the vehicle is asking for the most thrust).
+ *
+ * Default 1.0f, so every existing build is bit-identical: the cut compares
+ * against 1.0 as before and no clamp fires below it.
+ *
+ * FOR A TETHERED FLIGHT ATTEMPT the pair is:
+ *
+ *     RB_CMAKE_ARGS="-DMOTOR_MAX_DUTY=1.0f -DMOTOR_DUTY_CEILING=0.75f"
+ *
+ * Both are CMake cache variables listed in target_compile_definitions (see
+ * CMakeLists.txt), so RB_CMAKE_ARGS is what reaches them; a bare -D of a name
+ * that is NOT listed there is discarded, which is the trap that CMakeLists
+ * already documents for PID_MASS_KG and CS_GPIO_PIN. Cache variables also
+ * PERSIST in a build tree, so use --pristine always when switching a build tree
+ * between a flight configuration and a bench one, and read the value back off
+ * the DUTY CHAIN boot banner rather than trusting the command line.
+ *
+ * AND IT IS NOT THE LAST CEILING. workloads/esp_motors applies its own,
+ * ESP_MOTORS_MAX_DUTY_PCT (default 25 %), in the last component before the
+ * gate, and it does not trust this image. Raising only these two still clamps
+ * at 25 % at the ESP and looks exactly like a thrust failure. See
+ * docs/tethered-flight-attempt.md. */
+#ifndef MOTOR_DUTY_CEILING
+#define MOTOR_DUTY_CEILING 1.0f
+#endif
+static_assert((float)(MOTOR_DUTY_CEILING) > 0.0f && (float)(MOTOR_DUTY_CEILING) <= 1.0f,
+	      "MOTOR_DUTY_CEILING must be in (0, 1]: it is a fraction of full duty");
+static_assert((float)(MOTOR_MAX_DUTY) > 0.0f && (float)(MOTOR_MAX_DUTY) <= 1.0f,
+	      "MOTOR_MAX_DUTY must be in (0, 1]: it is a fraction of full duty");
 
 /* ---- Break-away duty -------------------------------------------------------
  * The lowest duty at which EVERY motor on this airframe reliably starts.
  *
  * Measured on riskybird v3, driving one motor at a time: 15% starts all four,
- * 10% starts three. Motor 4 does not break away at 10% -- it sits stalled, and
- * its ESC then latches locked-rotor protection. That latch survives an ELF
- * reload AND a full FPGA reconfigure; only removing power clears it. So a
- * single 250 ms chirp below this threshold disables a motor for the rest of the
- * session, and every later test at a perfectly good duty then fails for a
- * reason that has nothing to do with the duty being asked for.
+ * 10% starts three. Motor 4 does not break away at 10% -- it sits stalled.
+ *
+ * WHAT A STALLED MOTOR ACTUALLY COSTS, corrected. An earlier version of this
+ * comment said the motor's ESC latches locked-rotor protection and that only
+ * removing power clears it. THERE ARE NO ESCs ON THIS AIRFRAME. The motors are
+ * brushed, driven low-side by SI2302 FETs straight off the pack; there is no
+ * controller in between to latch anything. The hazard is real but different: a
+ * stalled brushed motor is very nearly a short across the pack through the FET,
+ * dissipating in the winding and the channel with no rotation to cool either.
+ * It heats in seconds. So the rule is unchanged -- do not command a duty below
+ * break-away -- but the reason is thermal, the damage is cumulative rather than
+ * a latch, and NOTHING clears itself when you power-cycle. Do not leave the
+ * drone sitting at a sub-break-away duty while you read the console.
+ *
+ * ALSO: 15% IS AN FPGA-PATH NUMBER. It was measured with the FPGA driving the
+ * gates, and all three of the things that set it have changed under
+ * ROSE_ESP_MOTORS: the gate is now driven from the ESP's 3.3 V through its own
+ * 47R rather than from FPGA VCCO through the FPGA's, which is a different V_GS
+ * on the SI2302; the FPGA path's motor outputs are INVERTED in the generated
+ * Verilog and nobody has re-derived whether a commanded duty was the duty the
+ * gate saw; and the quantisation differs (sifive comparator 1/2500 vs LEDC
+ * 11-bit). Treat 0.15 as an order of magnitude on the offload path, not as a
+ * measurement, until it is re-measured there with workloads/motor_duty.
  *
  * This is a property of the airframe, not of the code. Re-measure it after any
- * motor or ESC change: drive each motor alone, step the duty up, and take the
- * highest value at which any of them first turns -- then leave margin.
+ * motor or wiring change: drive each motor alone, step the duty up, and take
+ * the highest value at which any of them first turns -- then leave margin.
  */
 #ifndef MOTOR_BREAKAWAY_DUTY
 #define MOTOR_BREAKAWAY_DUTY 0.15f
@@ -608,7 +1260,178 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
 #ifndef MOTOR_CHIRP_MS
 #define MOTOR_CHIRP_MS 400
 #endif
+
+/* ---- Motor offload to the ESP32-C6 ----------------------------------------
+ * ROSE_ESP_MOTORS=1 replaces the PWM actuator with a duty-frame emitter on
+ * uart1. The FPGA then drives NO motor gate at all: ball F13 is dead as an
+ * output so motor4 could never be driven from here, and every gate is a
+ * wired-OR of an FPGA 47R and an ESP 47R into a 10k pulldown, so handing all
+ * four to the ESP removes the dual-driver contention instead of working around
+ * one pin. See integration/zephyr/motor_link/include/riskybird/motor_link.h. */
+#ifndef ROSE_ESP_MOTORS
+#define ROSE_ESP_MOTORS 0
 #endif
+
+/*
+ * THE SECOND CEILING, named here because raising the first one alone is silent.
+ *
+ * workloads/esp_motors applies ESP_MOTORS_MAX_DUTY_PCT (default 25) in
+ * motors_apply(), as the last thing before the gate, to every duty it receives.
+ * That is deliberate -- the receiver does not trust the sender -- and it means a
+ * flight-configured FPGA build flashed against a default ESP image is clamped at
+ * 25 % and produces no useful thrust. From the FPGA console that is
+ * indistinguishable from a broken motor, a dead pack or a mis-tuned controller,
+ * which is the failure mode this message exists to pre-empt.
+ *
+ * A #pragma message rather than an #error: the two images are built and flashed
+ * separately (different toolchains, different boards), so this side cannot know
+ * what the ESP is running, and refusing the build would be refusing something
+ * that may well be correct. It prints at compile time, in the build log, right
+ * where the operator raised the cap.
+ */
+/* The warning itself is issued at RUN TIME by motors_startup_pulse() on the offload path, for
+ * two reasons: `#if` cannot compare floats, and the operator reads the boot console at the
+ * bench while a compile-time message scrolls past once, days earlier, on another machine. */
+
+/* ---- Controller thrust -> per-motor duty -----------------------------------
+ * The ONE copy of this math. Both actuator backends call it, so the PWM path
+ * and the ESP-offload path cannot drift apart in the battery scaling, the
+ * clamps, the anti-saturation cut or the bench ceiling -- which is exactly the
+ * kind of divergence that would only show up in flight. */
+static inline void actuator_duty(const float *u, float duty[NACTIONS])
+{
+	/* Controller's normalized thrust (u in ~[-0.583, 0.417]) -> physical per-motor duty [0,1].
+	 * Battery sag compensation: multiply the raw thrust command by BATT_NOMINAL_V/g_vbat (clamped to
+	 * [1.0, BATT_SCALE_MAX]) so commanded thrust holds as the pack drains. Applied BEFORE the
+	 * anti-saturation cut and the ceiling below; batt_thrust_scale() returns 1.0 (no-op) when
+	 * battery sense is disabled or g_vbat looks invalid. */
+	const float batt_scale = batt_thrust_scale();
+	/* The ceiling the anti-saturation cut works against, IN THE UNITS duty[] carries here:
+	 *
+	 *   autoflight -- duty[] is already physical, so the ceiling is the flight cap itself.
+	 *   bench      -- duty[] is still NORMALIZED [0,1]; MOTOR_MAX_DUTY is applied as a SCALE
+	 *                 at the end. The saturation that matters on that path is therefore the
+	 *                 one at 1.0, not the one at the cap.
+	 */
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	const float ceiling = ((float)(AUTOFLIGHT_MAX_DUTY) < 1.0f) ? (float)(AUTOFLIGHT_MAX_DUTY) : 1.0f;
+#else
+	/* Was a hard-coded 1.0f. See the MOTOR_DUTY_CEILING note above: this is the
+	 * ceiling the collective cut works against, and it is the ONLY duty limit on
+	 * this path that preserves the roll/pitch/yaw differential. */
+	const float ceiling = (float)(MOTOR_DUTY_CEILING);
+#endif
+	float peak = 0.0f;
+
+	for (int i = 0; i < NACTIONS; i++) {
+		duty[i] = (u[i] + 0.583f) * batt_scale;
+		if (duty[i] < 0.0f) duty[i] = 0.0f;
+		/* NOTE the absence of a per-motor clamp to the ceiling here, and that it is the whole
+		 * point of this function. Clamping each motor to 1.0 at this line is what destroyed the
+		 * differential: with every u >= 0.417 (which is every iteration of a bench run that
+		 * regulates to TARGET_Z from the floor) all four raw duties exceed 1.0, all four clamp
+		 * to exactly 1.0, and four identical numbers stay identical through anything applied
+		 * afterwards -- including the cut below, which then subtracted the same amount from
+		 * four equal values and produced four equal values. Measured on the bench: u =
+		 * [1.082 0.977 1.429 1.541] -> duty = [0.100 0.100 0.100 0.100] for 1200 iterations. */
+		if (duty[i] > peak) peak = duty[i];
+	}
+	/* ATTITUDE-PRIORITY ANTI-SATURATION, on EVERY path -- not just autoflight. The collective
+	 * (altitude) thrust and the roll/pitch/yaw differentials share the same motor range. If the
+	 * peak motor would exceed the ceiling, subtract the excess from ALL FOUR: this lowers the
+	 * COLLECTIVE thrust while preserving the differential, so attitude authority always survives
+	 * -- sacrifice a little altitude, never attitude. (Per-motor clamping instead flattens the
+	 * differential once the altitude loop maxes out -> no control -> tip.) This is THE fix for the
+	 * "bad down-ToF maxes the altitude loop -> all four pin -> tip/tumble" failure: the drone
+	 * climbs LEVEL and recoverable instead.
+	 *
+	 * It is applied on the bench path too because "all four pinned at the cap" is not a safe
+	 * bench behaviour either -- it is the SAME loss of attitude authority, just at a duty too low
+	 * to demonstrate it -- and because the bench is where the flight path's saturation behaviour
+	 * has to be observable BEFORE props go on. In the unsaturated region (peak <= ceiling) this
+	 * is bit-identical to what it replaces: the cut does not run and no clamp ever fired. */
+	if (peak > ceiling) {
+		const float cut = peak - ceiling;
+		for (int i = 0; i < NACTIONS; i++) {
+			duty[i] -= cut;   /* collective cut; a low motor may go < 0 -> floored here */
+			if (duty[i] < 0.0f) duty[i] = 0.0f;
+		}
+	}
+#if !(defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT)
+	for (int i = 0; i < NACTIONS; i++) {
+		duty[i] *= MOTOR_MAX_DUTY;                 /* bench: scale [0,1] -> [0, cap] */
+		if (duty[i] > MOTOR_MAX_DUTY) duty[i] = MOTOR_MAX_DUTY;
+	}
+#endif
+}
+
+/*
+ * Say, at boot, the WHOLE duty chain and the worst-case number that can come out
+ * of it -- in the same spirit as safety_banner(): a limit that is only a source
+ * comment is a limit nobody can check against the thing in front of them.
+ *
+ * The operator's second hard requirement is "it never runs too powerfully". The
+ * answer to that is one number, and this is where it gets printed. It is the
+ * duty this IMAGE can command; it is NOT what reaches a gate on the offload
+ * path, because workloads/esp_motors applies its own ceiling afterwards and this
+ * image has no way to read it. That asymmetry is stated out loud rather than
+ * left for someone to assume the printed number is the final one.
+ */
+static void motor_power_banner(void)
+{
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+	const float ceiling = ((float)(AUTOFLIGHT_MAX_DUTY) < 1.0f) ? (float)(AUTOFLIGHT_MAX_DUTY) : 1.0f;
+	const float scale = 1.0f;
+	const char *which = "AUTOFLIGHT_MAX_DUTY";
+#else
+	const float ceiling = (float)(MOTOR_DUTY_CEILING);
+	const float scale = (float)(MOTOR_MAX_DUTY);
+	const char *which = "MOTOR_DUTY_CEILING";
+#endif
+	const float worst = ceiling * scale;
+
+	printk("flight_controller: DUTY CHAIN -- collective ceiling %s = %s%d.%03d (anti-saturation "
+	       "cut, differential preserved), then x MOTOR_MAX_DUTY %s%d.%03d\n",
+	       which, FP3(ceiling), FP3(scale));
+	printk("flight_controller: DUTY CHAIN -- WORST CASE THIS IMAGE CAN COMMAND: %d.%02d %% per "
+	       "motor%s\n", (int)(worst * 100.0f), ((int)(worst * 10000.0f)) % 100,
+	       (worst < 0.20f) ? "  (bench cap -- CANNOT LIFT; hover needs ~65-71 %)" : "");
+	/*
+	 * The one way to get this wrong that fails TOWARDS more power, said loudly.
+	 *
+	 * Setting MOTOR_MAX_DUTY=1.0f turns the scale off, which is correct for a flight build --
+	 * but if MOTOR_DUTY_CEILING is then forgotten this image has NO duty limit of its own and
+	 * the only remaining one is the ESP's. Every other mistake in this chain fails towards a
+	 * drone that cannot lift; this one does not, so it gets its own line rather than leaving the
+	 * operator to divide two numbers on a banner.
+	 *
+	 * 0.85 rather than 1.0: on this airframe hover is ~0.65-0.71 duty and thrust goes as duty^2,
+	 * so 0.85 is already ~1.43x weight. Anything above it is not a cap in any useful sense.
+	 */
+	if (worst > 0.85f) {
+		printk("flight_controller: *** DUTY CHAIN -- NO MEANINGFUL POWER CAP ON THIS SIDE *** "
+		       "%d %% is ~%d.%02dx hover thrust (hover ~0.71 duty, thrust ~ duty^2). If you "
+		       "meant to cap power, set -DMOTOR_DUTY_CEILING; MOTOR_MAX_DUTY alone is a SCALE "
+		       "and detunes the controller instead of capping it.\n",
+		       (int)(worst * 100.0f),
+		       (int)((worst * worst) / (0.71f * 0.71f)),
+		       ((int)((worst * worst) / (0.71f * 0.71f) * 100.0f)) % 100);
+	}
+#if ROSE_ESP_MOTORS
+	printk("flight_controller: DUTY CHAIN -- the ESP applies its OWN ceiling "
+	       "(ESP_MOTORS_MAX_DUTY_PCT) after this one and does not trust this image; read it "
+	       "off the ESP console's 'duty ceiling NN%%' boot line. The LOWER of the two wins.\n");
+#endif
+}
+
+#define MOTORS_NODE DT_ALIAS(motors)
+#if DT_NODE_EXISTS(MOTORS_NODE)
+static const struct pwm_dt_spec motors[NACTIONS] = {
+	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 0),
+	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 1),
+	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 2),
+	PWM_DT_SPEC_GET_BY_IDX(MOTORS_NODE, 3),
+};
 /* HARD MOTOR CUT (telemetry / bench-safety builds). When ROSE_MOTORS_INHIBIT=1 the actuator layer
  * NEVER drives the PWM channels above 0 -- send_control() forces all four to 0 and the boot / ready /
  * startup chirps are skipped entirely -- regardless of arm state, controller output, or estop. Use
@@ -619,73 +1442,54 @@ static const struct pwm_dt_spec motors[NACTIONS] = {
 #endif
 static void send_control(const float *u)
 {
+	/*
+	 * ONE write path, and one place that decides the duty.
+	 *
+	 * Every reason a motor might be off -- inhibit, estop, disarm, the bench actuation timeout,
+	 * and now the commitment gate -- converges on the single loop at the bottom instead of each
+	 * returning early with its own copy of "write zeros". The early returns were not equivalent:
+	 * the actuation-timeout branch zeroed the PWM registers but left g_last_duty holding the last
+	 * flying values, so telemetry reported a drone still under power after the bench cut. The
+	 * estop branch already carried a comment about exactly that hazard; the timeout branch had
+	 * the bug the comment describes. Converging them fixes it by construction.
+	 */
+	float duty[NACTIONS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
 #if ROSE_MOTORS_INHIBIT
-	/* Motors hard-inhibited: force every channel to 0 and never drive PWM. */
-	for (int i = 0; i < NACTIONS; i++) {
-		pwm_set_pulse_dt(&motors[i], 0);
-	}
-	(void)u;
-	return;
-#endif
-	/* Emergency cutoff OR disarmed: force every motor to 0 and ignore the command entirely. */
-	if (g_estop || !g_armed) {
-		for (int i = 0; i < NACTIONS; i++) {
-			pwm_set_pulse_dt(&motors[i], 0);
-			/* Report what is actually on the pins. Leaving the last
-			 * flying values here made an estop look, in telemetry,
-			 * exactly like a drone still under power. */
-			g_last_duty[i] = 0.0f;
-		}
-		return;
-	}
+	(void)u;   /* hard-inhibited: duty stays all-zero, and 0 is still WRITTEN and reported */
+#else
+	bool blocked = g_estop || !g_armed;
 #if ROSE_ACTUATE_TIMEOUT_MS > 0
 	/* Bench safety: cut all motors ROSE_ACTUATE_TIMEOUT_MS after boot. The
-	 * controller/estimator keep running (still logging) — only the actuator stops. */
-	if (k_uptime_get() >= (int64_t)ROSE_ACTUATE_TIMEOUT_MS) {
+	 * controller/estimator keep running (still logging) -- only the actuator stops.
+	 * NOTE its default is 0, i.e. DISABLED; the commitment gate below is what bounds
+	 * motor run time in a default build. */
+	if (!blocked && k_uptime_get() >= (int64_t)ROSE_ACTUATE_TIMEOUT_MS) {
 		static bool stopped;
-		for (int i = 0; i < NACTIONS; i++) {
-			pwm_set_pulse_dt(&motors[i], 0);
-		}
+
+		blocked = true;
 		if (!stopped) {
 			printk("send_control: actuation timeout (%d ms) reached -- motors OFF\n",
 			       (int)ROSE_ACTUATE_TIMEOUT_MS);
 			stopped = true;
 		}
-		return;
 	}
 #endif
-	/* Controller's normalized thrust (u in ~[-0.583, 0.417]) -> physical per-motor duty [0,1].
-	 * Battery sag compensation: multiply the raw thrust command by BATT_NOMINAL_V/g_vbat (clamped to
-	 * [1.0, BATT_SCALE_MAX]) so commanded thrust holds as the pack drains. Applied BEFORE the [0,1]
-	 * clamp and the AUTOFLIGHT_MAX_DUTY cap below; batt_thrust_scale() returns 1.0 (no-op) when
-	 * battery sense is disabled or g_vbat looks invalid. */
-	const float batt_scale = batt_thrust_scale();
-	float duty[NACTIONS];
-	for (int i = 0; i < NACTIONS; i++) {
-		duty[i] = (u[i] + 0.583f) * batt_scale;
-		if (duty[i] < 0.0f) duty[i] = 0.0f;
-		if (duty[i] > 1.0f) duty[i] = 1.0f;
+	if (!blocked) {
+		/* The battery scaling, the [0,1] clamp, the autoflight anti-saturation cut
+		 * and the bench ceiling all live in actuator_duty() now, so the ESP-offload
+		 * backend applies exactly the same numbers. */
+		actuator_duty(u, duty);
 	}
-#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
-	/* ATTITUDE-PRIORITY ANTI-SATURATION. The collective (altitude) thrust and the roll/pitch/yaw
-	 * differentials share the same motor range. If the peak motor would exceed the safety ceiling,
-	 * subtract the excess from ALL FOUR: this lowers the COLLECTIVE thrust while preserving the
-	 * differential, so attitude authority always survives -- sacrifice a little altitude, never
-	 * attitude. (Per-motor clamping instead flattens the differential once the altitude loop maxes
-	 * out -> no control -> tip.) This is THE fix for the "bad down-ToF maxes the altitude loop ->
-	 * all four pin -> tip/tumble" failure: the drone now climbs LEVEL and recoverable instead. */
-	float peak = 0.0f;
-	for (int i = 0; i < NACTIONS; i++) {
-		if (duty[i] > peak) peak = duty[i];
-	}
-	if (peak > AUTOFLIGHT_MAX_DUTY) {
-		float cut = peak - AUTOFLIGHT_MAX_DUTY;
+#endif
+	/* Commitment gate LAST, on the duty that would actually have been written: no branch above
+	 * can reach a motor without passing through it, and it is the only thing here that latches. */
+	if (!motor_gate_permit(duty)) {
 		for (int i = 0; i < NACTIONS; i++) {
-			duty[i] -= cut;   /* collective cut; a low motor may go < 0 -> floored just below */
+			duty[i] = 0.0f;
 		}
 	}
 	for (int i = 0; i < NACTIONS; i++) {
-		if (duty[i] < 0.0f) duty[i] = 0.0f;
 		int prc = pwm_set_pulse_dt(&motors[i],
 					   (uint32_t)(motors[i].period * duty[i]));
 
@@ -701,30 +1505,12 @@ static void send_control(const float *u)
 		/* pwm_set_pulse_dt's return was discarded here. motor4 is the only
 		 * output on pwm1 rather than pwm0, so it is the one channel whose
 		 * write can fail on its own -- and a silent failure looks exactly
-		 * like a dead ESC or a broken wire from outside. */
+		 * like a dead motor or a broken wire from outside. */
 		if (prc != 0 && g_last_pwm_rc[i] != prc) {
 			printk("send_control: motor%d pwm_set rc=%d\n", i + 1, prc);
 		}
 		g_last_pwm_rc[i] = prc;
 	}
-#else
-	for (int i = 0; i < NACTIONS; i++) {
-		float d = duty[i] * MOTOR_MAX_DUTY;                /* bench: scale [0,1] -> [0, cap] */
-		if (d > MOTOR_MAX_DUTY) d = MOTOR_MAX_DUTY;
-		int prc = pwm_set_pulse_dt(&motors[i],
-					   (uint32_t)(motors[i].period * d));
-
-		/* Recorded on this path too. Without it the telemetry's duty[]
-		 * reads 0.000 in every mode that is not autoflight, which is
-		 * indistinguishable from a motor genuinely commanded to zero --
-		 * the exact confusion the field was added to remove. */
-		g_last_duty[i] = d;
-		if (prc != 0 && g_last_pwm_rc[i] != prc) {
-			printk("send_control: motor%d pwm_set rc=%d\n", i + 1, prc);
-		}
-		g_last_pwm_rc[i] = prc;
-	}
-#endif
 }
 /* Optional boot "go" signal: pulse all motors at the safety cap for ROSE_START_PULSE_MS, then
  * stop. Used by the handheld IMU tilt test so the operator knows when the stream has started.
@@ -756,8 +1542,11 @@ static void motors_boot_chirp(void)
 #endif
 	for (int i = 0; i < NACTIONS; i++) {
 		/* At or above break-away, never below: a chirp that stalls a motor
-		 * is worse than no chirp, because the ESC latches and the motor is
-		 * gone until the battery is pulled. */
+		 * is worse than no chirp. Not because anything latches -- there are
+		 * no ESCs here, the motors are brushed on low-side SI2302 FETs --
+		 * but because a stalled brushed motor is a resistor across the pack
+		 * drawing locked-rotor current with no back-EMF and no airflow, so
+		 * motor and FET heat within seconds. See MOTOR_BREAKAWAY_DUTY. */
 		pwm_set_pulse_dt(&motors[i],
 				 (uint32_t)(motors[i].period * MOTOR_BREAKAWAY_DUTY));
 		k_msleep(MOTOR_CHIRP_MS);
@@ -789,11 +1578,230 @@ static void motors_ready_chirp(void)
 		k_msleep(120);
 	}
 }
+/*
+ * End of run: say OFF, do not merely stop talking.
+ *
+ * The control loop is finite (CTRL_ITERS) in most builds. When it ends, main() returns and nothing
+ * calls send_control() again. On the PWM path the comparators keep whatever they hold, so they must
+ * be written to zero. On the ESP-offload path silence alone WOULD stop the motors -- the receiver's
+ * 120 ms failsafe sees the frames stop -- but "commanded off" and "link dead" are different things
+ * and the receiver should be told which one this is, at once, rather than inferring it 120 ms later
+ * from an absence. Three frames, because the last word on a wire should not depend on one frame.
+ */
+static void motors_shutdown(void)
+{
+	for (int i = 0; i < NACTIONS; i++) {
+		pwm_set_pulse_dt(&motors[i], 0);
+		g_last_duty[i] = 0.0f;
+	}
+	printk("flight_controller: motors parked at 0 duty (end of run)\n");
+}
+#elif ROSE_ESP_MOTORS
+/* ---- Actuator: motor offload to the ESP32-C6 --------------------------------
+ *
+ * This backend drives NO motor pin. It encodes the same duties the PWM backend
+ * would have written and sends them to the ESP32-C6 over uart1; the ESP owns all
+ * four gates and generates the PWM. See the protocol header for the frame, the
+ * latency budget and the resynchronisation rule.
+ *
+ * Why there is no PWM here at all: ball F13, motor4's gate driver, is dead as an
+ * output. A bare-metal bitstream driving the four pads at 4/8/12/16 % reads back
+ * M1=40 M2=80 M3=120 M4=0 per mille at the gates, and the same ball configured
+ * as an input reads the carrier's 10k pulldown -- so the net is fine and the IOB
+ * is not. Handing only motor4 to the ESP would leave the other three gates
+ * driven by two 47R sources at once; handing over all four removes that as well.
+ *
+ * SAFETY, and specifically how this is BETTER than what it replaces. The SiFive
+ * PWM comparators are free-running hardware: halting the Rocket core -- which
+ * `rb debug` does every session -- leaves them driving the gates at the last
+ * programmed duty, forever, until a reconfigure or a power cycle. Nothing in the
+ * current design stops that. Here, a halted core simply stops emitting frames,
+ * and the ESP cuts all four motors after its receive timeout. A crash, a reset
+ * and an unplugged ribbon all behave the same way.
+ *
+ * "Off" is also sent EXPLICITLY rather than being left to the timeout: while
+ * disarmed, estopped, past the bench actuation timeout, or built with motors
+ * inhibited, this still transmits a frame -- with duty 0 and the ARMED bit
+ * clear -- so the receiver distinguishes "commanded off" from "link dead".
+ */
+#include <zephyr/drivers/uart.h>
+#include <riskybird/motor_link.h>
+
+#if !DT_NODE_EXISTS(DT_ALIAS(esp_uart))
+#error "ROSE_ESP_MOTORS=1 needs the esp-uart alias: build a shell that elaborates \
+serial@10021000 so rb appends hardware/zephyr/fpga-esp-uart.overlay."
+#endif
+static const struct device *const esp_link = DEVICE_DT_GET(DT_ALIAS(esp_uart));
+
+/*
+ * Frame rate, fixed and independent of the loop rate.
+ *
+ * The control loop is 25-35 ms under the default controller but ~1.3 ms with the
+ * PID cascade, and a frame per iteration at that rate would be 10.8 kB/s -- 94 %
+ * of a 115200 link. 50 Hz is 700 B/s (6.1 %), leaves room for the ASCII
+ * telemetry line if the two are ever merged onto this wire, and is 4x the
+ * receiver's failsafe timeout in margin. A loop slower than 50 Hz simply sends
+ * once per iteration.
+ */
+#ifndef ROSE_ESP_MOTORS_HZ
+#define ROSE_ESP_MOTORS_HZ 50
+#endif
+#define ESP_MOTORS_PERIOD_MS (1000 / (ROSE_ESP_MOTORS_HZ))
+
+/* Visible to the debugger and to whatever telemetry wants them: a link that is
+ * not being fed is otherwise indistinguishable from motors that are commanded
+ * to zero. */
+static volatile uint32_t g_esp_frames;
+static volatile uint8_t  g_esp_flags;
+
+static void esp_motors_tx(const float duty[NACTIONS], uint8_t flags)
+{
+	static uint8_t seq;
+	uint8_t frame[MOTOR_LINK_FRAME_LEN];
+	uint16_t wire[MOTOR_LINK_NMOTORS];
+
+	for (int i = 0; i < NACTIONS; i++) {
+		wire[i] = motor_link_duty_from_float(duty[i]);
+		g_last_duty[i] = duty[i];   /* what telemetry reports, as sent */
+	}
+	motor_link_encode(frame, ++seq, flags, wire);
+	/* Polled, like every other UART write on this carrier. uart_sifive_poll_out
+	 * spins only while the TX FIFO is FULL, so the cost charged to the control
+	 * loop is the part of the 1.215 ms wire time the FIFO cannot absorb. */
+	for (unsigned i = 0; i < MOTOR_LINK_FRAME_LEN; i++) {
+		uart_poll_out(esp_link, frame[i]);
+	}
+	g_esp_frames++;
+	g_esp_flags = flags;
+}
+
+static void send_control(const float *u)
+{
+	static int64_t next_ms;
+	static uint8_t last_flags = 0xFFu;   /* nothing matches -> first call always sends */
+	float duty[NACTIONS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	uint8_t block = 0u;      /* every reason the motors must be off, as wire flags */
+	bool    armed_now = false;
+	uint8_t flags;
+	int64_t now;
+
+#if ROSE_MOTORS_INHIBIT
+	block = MOTOR_LINK_FLAG_INHIBIT;
+	(void)u;
+#else
+	if (g_estop) {
+		block |= MOTOR_LINK_FLAG_ESTOP;
+	}
+#if ROSE_ACTUATE_TIMEOUT_MS > 0
+	/* Bench safety: stop commanding thrust ROSE_ACTUATE_TIMEOUT_MS after boot.
+	 * The controller and estimator keep running; only the actuator stops.
+	 * NOTE its default is 0, i.e. DISABLED; the commitment gate below is what
+	 * bounds motor run time in a default build. */
+	if (k_uptime_get() >= (int64_t)ROSE_ACTUATE_TIMEOUT_MS) {
+		block |= MOTOR_LINK_FLAG_TIMEOUT;
+	}
+#endif
+	/* Armed AND nothing objecting. duty[] stays all-zero otherwise, so a frame
+	 * that is not ARMED also carries zeros -- the receiver gets the same answer
+	 * from the flag and from the payload. */
+	if (g_armed && block == 0u) {
+		armed_now = true;
+		actuator_duty(u, duty);
+	}
+#endif
+	/* Commitment gate LAST, on the duty that would actually have been sent: no branch above can
+	 * reach the wire without passing through it. A refusal both zeroes the payload and clears
+	 * ARMED, so the receiver is told to stop by the flag and by the data. */
+	if (!motor_gate_permit(duty)) {
+		for (int i = 0; i < NACTIONS; i++) {
+			duty[i] = 0.0f;
+		}
+		block |= MOTOR_LINK_FLAG_WINDOW;
+		armed_now = false;
+	}
+	flags = (uint8_t)(block | (armed_now ? MOTOR_LINK_FLAG_ARMED : 0u) |
+			  (motor_gate_committed() ? MOTOR_LINK_FLAG_COMMIT : 0u));
+
+	now = k_uptime_get();
+	/* Rate-limited -- except that any change in the flags goes out at once. A
+	 * disarm or an estop must not wait up to a frame period to be transmitted,
+	 * and it is the one transition where latency has a cost. */
+	if (flags == last_flags && now < next_ms) {
+		return;
+	}
+	last_flags = flags;
+	next_ms = now + ESP_MOTORS_PERIOD_MS;
+	esp_motors_tx(duty, flags);
+}
+
+/*
+ * No chirps on this path, deliberately.
+ *
+ * The boot / ready / startup chirps spin motors at MOTOR_BREAKAWAY_DUTY to tell
+ * the operator the board reset. Reproducing them over the link means holding the
+ * frame stream up during each k_msleep, which is exactly the pattern the
+ * receiver's failsafe exists to cut. They are worth having back once this path
+ * is proven on the bench -- as duty frames emitted from a loop, not as sleeps --
+ * and an autoflight offload mode should not ship without them.
+ */
+static void motors_startup_pulse(void)
+{
+	printk("flight_controller: MOTOR OFFLOAD -- FPGA drives no gate; duty frames "
+	       "at %d Hz on %s to the ESP32-C6\n", ROSE_ESP_MOTORS_HZ, esp_link->name);
+	/*
+	 * THE TWO CEILINGS, at boot, in one line, because raising one alone is silent.
+	 *
+	 * This side scales every duty by MOTOR_MAX_DUTY. The ESP then clamps whatever arrives to
+	 * ESP_MOTORS_MAX_DUTY_PCT in its own motors_apply(), as the last thing before the gate,
+	 * and it deliberately does not trust this side. A flight-configured FPGA image flashed
+	 * against a default (25 %) ESP image is clamped there and produces no useful thrust, and
+	 * from this console that is indistinguishable from a dead pack, a broken motor or a
+	 * mis-tuned controller. This image cannot read the ESP's ceiling -- separate build,
+	 * separate board, separate flash -- so it prints what it is asking for and names where the
+	 * other half lives. The ESP prints its own ceiling in its boot banner; compare the two.
+	 */
+	printk("flight_controller: DUTY CEILING (this side) = %s%d.%03d of full scale. THE ESP HAS "
+	       "ITS OWN, applied last: ESP_MOTORS_MAX_DUTY_PCT in workloads/esp_motors, default "
+	       "25%%. Both must be raised in the same session or the motors clamp at the lower.\n",
+	       FP3((float)(MOTOR_MAX_DUTY)));
+	if (!device_is_ready(esp_link)) {
+		printk("flight_controller: esp-uart NOT READY -- no frames will be sent, "
+		       "so the ESP failsafe keeps every motor off\n");
+		return;
+	}
+	/* One explicit disarmed, all-zero frame before the loop starts, so the ESP
+	 * has a good frame to point at rather than inferring "off" from silence. */
+	static const float zero[NACTIONS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	esp_motors_tx(zero, 0u);
+}
+static void motors_boot_chirp(void) { /* see the note above */ }
+static void motors_ready_chirp(void) { /* see the note above */ }
+/*
+ * End of run: say OFF, do not merely stop talking.
+ *
+ * The control loop is finite (CTRL_ITERS) in most builds. When it ends, main() returns and nothing
+ * calls send_control() again. On the PWM path the comparators keep whatever they hold, so they must
+ * be written to zero. On the ESP-offload path silence alone WOULD stop the motors -- the receiver's
+ * 120 ms failsafe sees the frames stop -- but "commanded off" and "link dead" are different things
+ * and the receiver should be told which one this is, at once, rather than inferring it 120 ms later
+ * from an absence. Three frames, because the last word on a wire should not depend on one frame.
+ */
+static void motors_shutdown(void)
+{
+	static const float zero[NACTIONS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+	for (int i = 0; i < 3; i++) {
+		esp_motors_tx(zero, 0u);
+	}
+	printk("flight_controller: sent explicit disarmed zero frames (end of run); the ESP "
+	       "failsafe covers the silence that follows\n");
+}
 #else
 static void send_control(const float *u) { (void)u; /* no actuator bound */ }
 static void motors_startup_pulse(void) { /* no motors bound */ }
 static void motors_boot_chirp(void) { /* no motors bound */ }
 static void motors_ready_chirp(void) { /* no motors bound */ }
+static void motors_shutdown(void) { /* no motors bound */ }
 #endif
 #endif
 
@@ -829,6 +1837,39 @@ static IController &ctrl = active_controller();
 #ifndef ROSE_THREADED
 #define ROSE_THREADED 0
 #endif
+
+/*
+ * THE THREADED BLOCKS HAVE NO ENVELOPE GUARD. Refuse to build them against a real actuator.
+ *
+ * io_block() reads a frame, hands it to est_block()/ctrl_block() and calls send_control() --
+ * and that is the whole pipeline. safety_violation() is called from exactly one place in this
+ * file, the single-loop control loop in main(); grep it. So -DROSE_THREADED=1 on a board that
+ * can drive motors produces an image that commands thrust with NO accel-tilt, free-fall,
+ * impact, est-tilt, rate, velocity or height check anywhere in the path -- and nothing at run
+ * time says so, because safety_banner() is called from main() before the blocks start, so the
+ * ENVELOPE GUARD banner still prints at boot. A guard that announces itself and is then never
+ * evaluated is worse than no guard at all.
+ *
+ * The first hard requirement for a tethered flight attempt is that the watchdog is ALWAYS on.
+ * This is the one build knob that could silently clear it, so it is refused at compile time
+ * rather than documented. ROSE_THREADED is not set by any --mode (see tools/rb/boards.py) and
+ * its cache default is 0, so this cannot fire by accident -- only a hand-written RB_CMAKE_ARGS
+ * can reach it, which is exactly the case worth catching, since a flight build already has to
+ * pass RB_CMAKE_ARGS for -DROSE_FLIGHT_COMMIT=1.
+ *
+ * HAVE_ROSE (co-sim) is exempt: there is no physical motor there, the RoSE actuator is a
+ * bridge packet, and the threaded blocks exist to be debugged against the lockstep protocol.
+ *
+ * To lift this, MOVE the guard rather than deleting the check: the estimator state and the raw
+ * accel/gyro must reach a guard evaluation on the same path that reaches send_control(), i.e.
+ * inside io_block() or ctrl_block(), latching g_estop as the single loop does.
+ */
+#if ROSE_THREADED && !HAVE_ROSE
+#error "ROSE_THREADED=1 on a real target: the threaded blocks never call safety_violation(), \
+so the envelope guard would be absent while motors are commanded. Build the single loop \
+(-DROSE_THREADED=0, the default), or port the guard into io_block()/ctrl_block() first."
+#endif
+
 #ifndef ROSE_CTRL_DIV
 #define ROSE_CTRL_DIV 1        /* control runs every Nth estimator tick (1 = same rate) */
 #endif
@@ -1614,6 +2655,12 @@ int main(void)
 	printk("flight_controller: MOTORS INHIBITED (ROSE_MOTORS_INHIBIT=1) -- PWM forced to 0, "
 	       "no chirps, no actuation\n");
 #endif
+	/* Say, at boot and in real units, what will stop the motors and how long they may run.
+	 * The operator's requirement is to be ACTIVELY AWARE; a state nobody printed is a state
+	 * nobody knows they are in. */
+	safety_banner();
+	motor_power_banner();
+	motor_gate_banner();
 
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
 	flightlog_init();   /* erase 'storage' partition + ready to append (see flightlog.h) */
@@ -1731,6 +2778,7 @@ int main(void)
 			io_block, NULL, NULL, NULL, PRIO_IO, 0, K_NO_WAIT);
 	k_thread_join(&io_t, K_FOREVER);   /* run until the IO block finishes its iterations */
 	k_thread_abort(&keepalive_t);
+	motors_shutdown();   /* transmit/write OFF explicitly; never leave it to silence */
 	printk("flight_controller: control loop done (%d iters)\n", CTRL_ITERS);
 	return 0;
 #else
@@ -1753,6 +2801,18 @@ int main(void)
 			printk("flight_controller: IMU fetch error\n");
 			if (++imu_miss >= SAFE_MAX_IMU_MISS && !g_estop) {
 				g_estop = true;
+				/* COMMAND ZERO FIRST, REPORT AFTERWARDS.
+				 *
+				 * Everything below this line is slow: printk on this carrier is a
+				 * POLLING 115200 console that busy-waits (measured 30-60 ms stalls),
+				 * flightlog_flush() writes flash, and after this block the loop still
+				 * runs a full controller solve (~30 ms under TinyMPC) before it would
+				 * otherwise reach send_control(). Latching g_estop and then talking
+				 * would leave the motors driving for all of it. g_estop is already set,
+				 * so this call forces every motor to 0 -- and on the ESP-offload path it
+				 * transmits an explicit zero-duty ESTOP frame on this tick, because a
+				 * flags change bypasses the frame rate limiter. `u` is not read. */
+				send_control(u);
 				printk("flight_controller: EMERGENCY CUTOFF -- IMU lost (%d misses); "
 				       "motors OFF (reset to clear)\n", imu_miss);
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
@@ -1786,6 +2846,7 @@ int main(void)
 			g_setpoint[2] = 0.0f;
 			printk("flight_controller: SOFT RESET -- estop cleared, disarmed"
 			       "%s\n", ROSE_RECAL_ON_RESET ? ", recalibrating gyro" : " (keeping boot gyro cal)");
+			motor_gate_note_reset();   /* the window latch is NOT one of the things this clears */
 		}
 		/* Battery voltage: poll the ADS7128 ADC at a LOW rate (every BATT_CHECK_DIV iters). One short
 		 * I2C transfer shared with the ToF bus -- infrequent so it adds negligible average load; no-op
@@ -1803,27 +2864,72 @@ int main(void)
 		est.get_state(state);
 		g_att_roll = state[3]; g_att_pitch = state[4]; g_att_yaw = state[5];   /* cache for next frame's comp */
 		PF_ACC(pf_est, _pe);
-		/* Emergency watchdog: latch a kill if attitude/rate/velocity exceed safe limits. Checked
-		 * every iteration before actuation; send_control() enforces the cut. */
-		/* FLIGHT-only watchdog: gate on g_armed. The pre-arm lift-and-place swings the board by hand
-		 * (fast enough to spike the flow-velocity / tilt / rate limits), which must NOT latch estop
-		 * before takeoff. Motors are already forced off while disarmed (send_control), so there is
-		 * nothing to guard until armed; once armed this protects the entire flight. */
-		if (g_armed && !g_estop) {
-			const char *why = safety_violation(state, f.gyro);
-			static int viol_count;   /* consecutive iters in violation (debounce transient spikes) */
-			viol_count = (why != NULL) ? (viol_count + 1) : 0;
-			if (why != NULL && viol_count >= SAFE_DEBOUNCE_ITERS) {
+		/* Emergency watchdog: latch a kill if the airframe leaves its envelope.
+		 *
+		 * EVALUATED EVERY ITERATION, ARMED OR NOT; only the LATCH is gated on g_armed. The
+		 * pre-arm lift-and-place swings the board by hand, fast enough to spike tilt, rate and
+		 * flow velocity, and that must not estop before takeoff -- but the guard still has to
+		 * LOOK the whole time, for two reasons. The arm gate now cross-checks the
+		 * accelerometer's own tilt (g_guard_tilt_rad), which is only published by evaluating
+		 * this; and a guard that is not looking while disarmed publishes nothing, so a console
+		 * showing 0 could mean "level" or "not running" -- the ambiguity that let a guard sit
+		 * three degrees under its trip point for months without anyone noticing.
+		 *
+		 * Debounced in TIME, not iterations. Same guard, same behaviour, whether the loop is
+		 * the PID cascade at ~1.3 ms or TinyMPC at ~35 ms -- the iteration count it used to use
+		 * meant 20 ms in one build and 525 ms in the other. */
+		{
+			int need_ms = SAFE_DEBOUNCE_MS;
+			float meas = 0.0f;
+			const char *unit = "";
+			const char *why = safety_violation(state, f.gyro, f.accel, &need_ms, &meas, &unit);
+			static int64_t viol_since;   /* ms at which the current violation began (0 = none) */
+			static int     viol_count;   /* samples seen in the current violation */
+			static bool    guard_announced;
+
+			if (g_armed && !guard_announced) {
+				guard_announced = true;
+				printk("flight_controller: ENVELOPE GUARD ARMED -- watching accel tilt, "
+				       "free-fall, impact, est tilt, rate, velocity, height\n");
+			}
+			if (!g_armed || g_estop) {
+				why = NULL;   /* keep looking and keep publishing; do not latch */
+			}
+			if (why == NULL) {
+				viol_since = 0; viol_count = 0;
+			} else {
+				if (viol_since == 0) { viol_since = t_now; viol_count = 0; }
+				viol_count++;
+			}
+			if (why != NULL && viol_count >= SAFE_DEBOUNCE_MIN_SAMPLES &&
+			    (t_now - viol_since) >= (int64_t)need_ms) {
 				g_estop = true;
-				printk("flight_controller: EMERGENCY CUTOFF -- %s limit exceeded (%d iters); "
-				       "motors OFF (reset to clear)\n", why, viol_count);
+				/* COMMAND ZERO FIRST, REPORT AFTERWARDS.
+				 *
+				 * Everything below this line is slow: printk on this carrier is a
+				 * POLLING 115200 console that busy-waits (measured 30-60 ms stalls),
+				 * flightlog_flush() writes flash, and after this block the loop still
+				 * runs a full controller solve (~30 ms under TinyMPC) before it would
+				 * otherwise reach send_control(). Latching g_estop and then talking
+				 * would leave the motors driving for all of it. g_estop is already set,
+				 * so this call forces every motor to 0 -- and on the ESP-offload path it
+				 * transmits an explicit zero-duty ESTOP frame on this tick, because a
+				 * flags change bypasses the frame rate limiter. `u` is not read. */
+				send_control(u);
+				printk("flight_controller: *** EMERGENCY CUTOFF *** %s limit exceeded: "
+				       "measured %s%d.%03d %s, held %d ms over %d samples; motors OFF "
+				       "(reset to clear)\n", why, FP3(meas), unit,
+				       (int)(t_now - viol_since), viol_count);
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
 				/* Final record: encode WHICH limit tripped in flags[2..4] (0=none 1=tilt 2=rate
 				 * 3=velocity 4=height 5=battery; first char of `why` is unique per reason) and carry
 				 * the raw gyro x/y in the fvx/fvy columns -- the rate/gyro path isn't otherwise logged,
 				 * so this is how we tell a vibration rate-spike from a real tilt/velocity runaway. */
+				/* 6/7/8 are the accelerometer envelope's, added with it: 'f'ree-fall,
+				 * 'i'mpact, 'a'ccel-tilt. Still one unique first character per reason. */
 				uint8_t rc = (why[0]=='t')?1 : (why[0]=='r')?2 : (why[0]=='v')?3 : (why[0]=='h')?4 :
-					     (why[0]=='b')?5 : 0;
+					     (why[0]=='b')?5 : (why[0]=='f')?6 : (why[0]=='i')?7 :
+					     (why[0]=='a')?8 : 0;
 				struct flight_rec er = {0};
 				er.t_ms     = (uint32_t)k_uptime_get();
 				er.roll_mrad  = (int16_t)(state[3] * 1000.0f);
@@ -1858,8 +2964,14 @@ int main(void)
 			}
 			g_arming = false;             /* status LED: default; set true below while counting down */
 			if (!g_armed && !g_estop && !flight_done) {
-				bool level  = fabsf(state[3]) < ARM_MAX_TILT_RAD &&
-					      fabsf(state[4]) < ARM_MAX_TILT_RAD;
+				/* Level by BOTH references. The estimator's tilt (converted out of Gibbs)
+				 * and the accelerometer's tilt straight from gravity must agree that the
+				 * frame is flat, so an estimator that has not converged -- or has been
+				 * misread, which is exactly what happened here -- cannot on its own permit
+				 * arming. g_guard_tilt_rad is 0 until the accelerometer is in its trust
+				 * band, which for a drone sitting on a bench it always is. */
+				bool level  = tilt_rad_from_gibbs(state) < ARM_MAX_TILT_RAD &&
+					      g_guard_tilt_rad < ARM_MAX_TILT_RAD;
 				bool ground = f.tof_valid && state[2] < ARM_MAX_HEIGHT_M;
 				bool still  = fabsf(f.gyro[0]) < ARM_MAX_RATE_RADPS &&
 					      fabsf(f.gyro[1]) < ARM_MAX_RATE_RADPS &&
@@ -2033,15 +3145,26 @@ int main(void)
 #else
 			/* Attitude + ALL 4 motor commands, so the restoring differential is visible: a
 			 * pitch tilt should split the fore/aft motor pair, a roll tilt the left/right pair. */
+			/* roll/pitch/yaw here are the RODRIGUES (Gibbs) state, r = tan(theta/2) per
+			 * axis -- NOT radians and NOT degrees. Reading them as radians is what put the
+			 * tilt guard's real trip point at 90 deg while its constant said 57. The
+			 * appended tilt= field is the honest number, in degrees: est is the estimator's
+			 * (converted), acc is straight out of gravity with no estimator involved. Watch
+			 * those two, not roll/pitch, when checking the guard. Fields are appended rather
+			 * than substituted so existing parsers keep working. */
 			printk("flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d "
 			       "z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] "
-			       "duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]\n",
+			       "duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] "
+			       "tilt=est%ddeg/acc%ddeg |a|=%s%d.%03d accskip=%u\n",
 			       iter, (int)(dt * 1000.0f + 0.5f),
 			       FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
 			       (int)f.tof_valid, FP3(f.height),
 			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]),
 			       FP3(g_last_duty[0]), FP3(g_last_duty[1]),
-			       FP3(g_last_duty[2]), FP3(g_last_duty[3]));
+			       FP3(g_last_duty[2]), FP3(g_last_duty[3]),
+			       (int)(g_guard_est_rad * (180.0f / 3.14159265f) + 0.5f),
+			       (int)(g_guard_tilt_rad * (180.0f / 3.14159265f) + 0.5f),
+			       FP3(g_guard_amag), (unsigned)g_guard_acc_skips);
 #endif
 #if defined(ROSE_BUMPER) && ROSE_BUMPER
 			/* Wall distances (mm; -1 = no target/no wall) so bring-up + facing can be verified on
@@ -2076,6 +3199,7 @@ int main(void)
 	flightlog_flush();
 	printk("flight_controller: flight log flushed to flash (dump with -DROSE_FLIGHTLOG_DUMP=1)\n");
 #endif
+	motors_shutdown();   /* transmit/write OFF explicitly; never leave it to silence */
 	printk("flight_controller: control loop done (%d iters)\n", CTRL_ITERS);
 	return 0;
 #endif

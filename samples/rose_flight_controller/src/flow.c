@@ -95,7 +95,25 @@ void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid)
 #define FLOW_LP_TAU_Y 0.0f       /* y low-pass time constant (s); 0 = off */
 #endif
 
-#define CS_GPIO_PIN 19           /* software chip-select (v3: SCLK=6 MOSI=7 MISO=18 CS=19) */
+/*
+ * Software chip-select pin, on the controller named by `gpio0`.
+ *
+ * 19 is the ESP32-C6's (v3: SCLK=6 MOSI=7 MISO=18 CS=19). The FPGA carrier's
+ * DroneLogic GPIO block is a DIFFERENT controller with its own numbering, and
+ * the flow sensor's CS is logical index 0 there -- which is what
+ * hardware/zephyr/targets/fpga/workloads/pmw3901_test.overlay declares and what
+ * workloads/bootup_check reads the chip ID through successfully.
+ *
+ * THIS WAS NOT OVERRIDABLE. Both flight_controller-flow.overlay and
+ * docs/flight-on-fpga.md tell the operator to pass -DCS_GPIO_PIN=0 for the FPGA
+ * build, and a bare `#define` here silently won that argument: the command-line
+ * definition is redefined by this line (a warning, not an error), so an FPGA
+ * flow build drove gpio0 pin 19 as chip select and the sensor never answered.
+ * The #ifndef makes the documented override actually work.
+ */
+#ifndef CS_GPIO_PIN
+#define CS_GPIO_PIN 19
+#endif
 
 /* Manually-constructed pmw3901 device (the driver takes cfg/data via a struct device, same as the
  * pmw3901_test bring-up sample). */

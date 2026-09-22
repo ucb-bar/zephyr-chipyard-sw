@@ -240,6 +240,19 @@ int pmw3901_init(const struct device *dev)
     cs_assert(dev);
     k_msleep(2);
 
+    /*
+     * Discard the first read. On this bench the first register read after the
+     * CS dance above comes back bit-reversed -- 0x92 where 0x49 is expected,
+     * which is exactly 0x49 with its bits in the other order -- while the very
+     * next read (0x5F) returns a correct 0xB6. A global LSB-first mismatch
+     * would reverse both, and 0xB6 reversed would be 0x6D, so it is the first
+     * transaction that is misaligned rather than the bus.
+     *
+     * Ported from workloads/pmw3901_test/src/pmw3901.c, which is the copy of
+     * this driver the FPGA bring-up used and where the effect was measured.
+     */
+    (void)pmw3901_register_read(dev, 0x00);
+
     /* Read chip ID */
     chip_id = pmw3901_register_read(dev, 0x00);
     inv_chip_id = pmw3901_register_read(dev, 0x5F);
@@ -247,7 +260,15 @@ int pmw3901_init(const struct device *dev)
     /* Use printk so this is visible even when CONFIG_LOG is disabled */
     printk("PMW3901 chip ID: 0x%02X, inverted: 0x%02X\n", chip_id, inv_chip_id);
 
-    if (chip_id == 0x49 || inv_chip_id == 0xB6) {
+    /*
+     * BOTH, not either. This was `||`, which passes when one of the two
+     * registers is right and the other is garbage -- the exact case seen on
+     * this bench, chip_id=0x92 with inv_chip_id=0xB6. The pair is a complement
+     * check; accepting half of it accepts a sensor whose reads cannot be
+     * trusted and reports it as healthy, which for optical flow means a
+     * silently wrong velocity rather than an absent one.
+     */
+    if (chip_id == 0x49 && inv_chip_id == 0xB6) {
         /* Power on reset */
         pmw3901_register_write(dev, 0x3A, 0x5A);
         k_msleep(5);
