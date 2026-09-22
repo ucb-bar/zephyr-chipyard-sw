@@ -53,6 +53,32 @@ extern "C" void pid_set_walls(int16_t front_mm, int16_t back_mm,
 #define HAVE_FLOW DT_NODE_EXISTS(DT_ALIAS(flow))
 #define HAVE_TOF  DT_NODE_EXISTS(DT_ALIAS(tof))
 #define HAVE_BARO DT_NODE_EXISTS(DT_ALIAS(baro))   /* BMP388 (bosch,bmp388) -> `baro` alias */
+#define HAVE_ESP_UART DT_NODE_EXISTS(DT_ALIAS(esp_uart))
+#if HAVE_ESP_UART
+/* The FPGA full-drone shell exposes the ESP link as `esp-uart`. Keep the
+ * shared ESP32-C6 build byte-for-byte unchanged: it has no alias, so neither
+ * the UART dependency nor this writer exists there. If the ESP UART is already
+ * the console (`--mode telem`), printk emits the line and a second copy would
+ * exceed the rate budget. */
+#define ESP_UART_IS_CONSOLE DT_SAME_NODE(DT_ALIAS(esp_uart), DT_CHOSEN(zephyr_console))
+#if !ESP_UART_IS_CONSOLE
+#include <zephyr/drivers/uart.h>
+#include <stdio.h>
+
+static const struct device *const esp_uart_dev = DEVICE_DT_GET(DT_ALIAS(esp_uart));
+
+static void esp_uart_write_line(const char *line, size_t length)
+{
+	if (!device_is_ready(esp_uart_dev)) {
+		return;
+	}
+
+	for (size_t i = 0; i < length; ++i) {
+		uart_poll_out(esp_uart_dev, line[i]);
+	}
+}
+#endif /* !ESP_UART_IS_CONSOLE */
+#endif /* HAVE_ESP_UART */
 /*
  * The D8 status LED hangs off the ADS7128 expander, but every helper it needs -- g_led_bus,
  * ads7128_set_bit/clr_bit, STATUS_LED_CH, ADS7128_GPO_VALUE -- is defined inside the
@@ -211,6 +237,94 @@ static inline bool batt_ok_to_arm(void)
  * builds with printf FP support off). Expands to the sign string + magnitude int + 3-digit frac. */
 #include <math.h>
 #define FP3(x) ((x) < 0 ? "-" : ""), (int)fabsf(x), ((int)(fabsf(x) * 1000.0f)) % 1000
+
+/*
+ * The v1.1 telemetry tail -- position, velocity, setpoint, battery and state.
+ *
+ * The ground station renders its state banner, 3D position view, drift arrow
+ * and battery gauge from these; riskybird_panel.py parses them with TAIL_RE
+ * (vx vy vz zsp vbat st, in that order) and POS_RE (x y). Without them the
+ * dashboard has attitude and altitude and nothing else, which is what the FPGA
+ * build showed.
+ *
+ * Every value here is ALREADY computed each iteration -- the CONFIG_WIFI block
+ * below packs exactly these into a telem_snapshot. On the FPGA that block is
+ * compiled out (the radio is a UART away, not on-chip) and telem_wifi.c is not
+ * in this checkout at all, so the values were being computed and discarded.
+ * This only prints what the loop already knows; it adds no estimation work.
+ *
+ * Defined once and used by both the printk and the esp-uart mirror below, so
+ * the tethered console and the radio cannot drift into different formats.
+ */
+#define TELEM_TAIL_FMT \
+	" x=%s%d.%03d y=%s%d.%03d vx=%s%d.%03d vy=%s%d.%03d vz=%s%d.%03d " \
+	"zsp=%s%d.%03d vbat=%s%d.%03d st=%u"
+
+/*
+ * Flag bits, matching riskybird_panel.py's FLAG_ARMED/ESTOP/ARMING/CALDONE.
+ * Spelled out rather than taken from telem_wifi.h, which this checkout does
+ * not have -- the same reason the CONFIG_WIFI path cannot be relied on here.
+ */
+#define ROSE_TELEM_FLAG_ARMED   1u
+#define ROSE_TELEM_FLAG_ESTOP   2u
+#define ROSE_TELEM_FLAG_ARMING  4u
+#define ROSE_TELEM_FLAG_CALDONE 8u
+
+#define TELEM_TAIL_ARGS \
+	FP3(state[0]), FP3(state[1]), \
+	FP3(state[6]), FP3(state[7]), FP3(state[8]), \
+	FP3(g_setpoint[2]), FP3(g_vbat), \
+	(unsigned int)((g_armed         ? ROSE_TELEM_FLAG_ARMED   : 0u) | \
+		       (g_estop         ? ROSE_TELEM_FLAG_ESTOP   : 0u) | \
+		       (g_arming        ? ROSE_TELEM_FLAG_ARMING  : 0u) | \
+		       (g_gyro_cal_done ? ROSE_TELEM_FLAG_CALDONE : 0u))
+
+/*
+ * THE WHOLE TELEMETRY LINE, in one place.
+ *
+ * Two independent lines of work both wrote this string and both had to be
+ * kept: the v1.1 state tail above (x/y/vx/vy/vz/zsp/vbat/st, which is what the
+ * ground station's banner, 3D view, drift arrow and battery gauge are parsed
+ * out of) and the safety guard's own fields (tilt in DEGREES, |a|, accskip --
+ * see the note at the print site: roll/pitch/yaw are Rodrigues parameters, not
+ * radians, so tilt= is the only honest angle on the line).
+ *
+ * They are combined rather than chosen between, and in this order:
+ *
+ *   base ... duty=[...]   <- v1 core, unchanged
+ *   TELEM_TAIL_FMT        <- v1.1 tail, in the position riskybird_panel.py's
+ *                            TAIL_RE/POS_RE already expect it
+ *   tilt= |a|= accskip=   <- appended last, so every existing parser keeps
+ *                            working and the new fields are additive
+ *
+ * Defined once, as a format/arguments PAIR, and used by both the printk that
+ * feeds the tethered console and the esp-uart mirror that feeds the radio --
+ * which is the point: two copies of a 15-line format string is how the console
+ * and the radio drift into different formats, and the merge that produced this
+ * file started with exactly that duplication.
+ *
+ * The argument list names loop locals (iter, dt, state, f, u), so it is usable
+ * only inside the control loop. That is deliberate; there is nowhere else this
+ * line should be emitted from.
+ */
+#define TELEM_LINE_FMT \
+	"flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d " \
+	"z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] " \
+	"duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]" \
+	TELEM_TAIL_FMT \
+	" tilt=est%ddeg/acc%ddeg |a|=%s%d.%03d accskip=%u\n"
+
+#define TELEM_LINE_ARGS \
+	iter, (int)(dt * 1000.0f + 0.5f), \
+	FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]), \
+	(int)f.tof_valid, FP3(f.height), \
+	FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]), \
+	FP3(g_last_duty[0]), FP3(g_last_duty[1]), \
+	FP3(g_last_duty[2]), FP3(g_last_duty[3]), \
+	TELEM_TAIL_ARGS, \
+	(int)(g_guard_est_rad  * (180.0f / 3.14159265f) + 0.5f), \
+	(int)(g_guard_tilt_rad * (180.0f / 3.14159265f) + 0.5f), \
+	FP3(g_guard_amag), (unsigned)g_guard_acc_skips
 
 /* ---- Sensor devices (Zephyr sensor API; bound per board overlay) ---- */
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
@@ -1631,6 +1745,22 @@ static void motors_shutdown(void)
 #error "ROSE_ESP_MOTORS=1 needs the esp-uart alias: build a shell that elaborates \
 serial@10021000 so rb appends hardware/zephyr/fpga-esp-uart.overlay."
 #endif
+/*
+ * uart1 now carries TWO things: these binary duty frames and the mirrored ASCII
+ * telemetry line (see the esp-uart mirror at the print site). That multiplex is
+ * safe because both writers are the control-loop thread and are strictly
+ * sequential -- but only while printk is somewhere else. Point zephyr,console at
+ * esp-uart as well (what --mode telem does, and it does NOT set ROSE_ESP_MOTORS)
+ * and every printk in the image, from any thread and at any moment, becomes a
+ * third writer that can land in the middle of a 14-byte frame. The receiver's
+ * sliding window would resynchronise on the next frame, but that frame is lost
+ * and the loss is invisible from this end. Refuse the build instead.
+ */
+#if defined(ESP_UART_IS_CONSOLE) && ESP_UART_IS_CONSOLE
+#error "ROSE_ESP_MOTORS=1 with zephyr,console on esp-uart: printk would interleave \
+ASCII into the middle of a binary duty frame. Keep the console on uart0 -- see \
+hardware/zephyr/targets/fpga/workloads/flight_controller-esp-motors.overlay."
+#endif
 static const struct device *const esp_link = DEVICE_DT_GET(DT_ALIAS(esp_uart));
 
 /*
@@ -1674,6 +1804,43 @@ static void esp_motors_tx(const float duty[NACTIONS], uint8_t flags)
 	g_esp_frames++;
 	g_esp_flags = flags;
 }
+
+/*
+ * Re-send the last command, with a fresh sequence number.
+ *
+ * Called either side of the long telemetry write that shares this UART, so the
+ * receiver's 120 ms failsafe is not being asked to tolerate a gap made of
+ * console bytes. Read the note at the call site for the numbers; the two things
+ * that matter here are that the seq MUST advance (a receiver drops a frame whose
+ * seq is not newer and that path does not feed the failsafe, so a byte-identical
+ * re-send would pet nothing) and that the payload is whatever send_control()
+ * last decided -- identical to what the 50 Hz rate limiter emits between two
+ * control updates, so this adds no new command, only a repeat of the live one.
+ *
+ * g_last_duty is volatile (it is read by telemetry and by the debugger), so it
+ * is copied out before being handed back to the encoder.
+ */
+static inline void esp_motors_keepalive(void)
+{
+	float duty[NACTIONS];
+
+	for (int i = 0; i < NACTIONS; i++) {
+		duty[i] = g_last_duty[i];
+	}
+	esp_motors_tx(duty, g_esp_flags);
+}
+
+/*
+ * "The duty-frame emitter above is the actuator in THIS build."
+ *
+ * Not the same statement as ROSE_ESP_MOTORS=1. The actuator backends are an
+ * #if/#elif chain and the PWM branch is selected first, so a shell that both
+ * declares a `motors` alias and sets ROSE_ESP_MOTORS compiles the PWM actuator
+ * and none of this. The telemetry mirror's keepalive calls have to be guarded by
+ * what was actually compiled, not by what was asked for, or such a build fails
+ * with an undeclared esp_motors_keepalive 1500 lines away from the cause.
+ */
+#define ROSE_ESP_LINK_ACTIVE 1
 
 static void send_control(const float *u)
 {
@@ -3152,19 +3319,92 @@ int main(void)
 			 * (converted), acc is straight out of gravity with no estimator involved. Watch
 			 * those two, not roll/pitch, when checking the guard. Fields are appended rather
 			 * than substituted so existing parsers keep working. */
-			printk("flight_controller: it=%d dt=%dms roll=%s%d.%03d pitch=%s%d.%03d yaw=%s%d.%03d "
-			       "z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] "
-			       "duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] "
-			       "tilt=est%ddeg/acc%ddeg |a|=%s%d.%03d accskip=%u\n",
-			       iter, (int)(dt * 1000.0f + 0.5f),
-			       FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
-			       (int)f.tof_valid, FP3(f.height),
-			       FP3(u[0]), FP3(u[1]), FP3(u[2]), FP3(u[3]),
-			       FP3(g_last_duty[0]), FP3(g_last_duty[1]),
-			       FP3(g_last_duty[2]), FP3(g_last_duty[3]),
-			       (int)(g_guard_est_rad * (180.0f / 3.14159265f) + 0.5f),
-			       (int)(g_guard_tilt_rad * (180.0f / 3.14159265f) + 0.5f),
-			       FP3(g_guard_amag), (unsigned)g_guard_acc_skips);
+			printk(TELEM_LINE_FMT, TELEM_LINE_ARGS);
+#if HAVE_ESP_UART
+#if !ESP_UART_IS_CONSOLE
+			/*
+			 * Mirror the SAME line to the ESP link, while printk keeps the tethered
+			 * console. One format string, one argument list, shared with the printk
+			 * above -- so the radio sees the v1.1 state tail AND the guard fields,
+			 * and the two sinks cannot drift into different formats.
+			 *
+			 * SHARING uart1 WITH THE BINARY DUTY FRAMES -- verified, not assumed.
+			 * In an --mode esp-motors build this same UART also carries the 14-byte
+			 * motor frames that esp_motors_tx() emits, so the two writers have to be
+			 * shown not to interleave:
+			 *
+			 *   - BOTH writers are THIS thread. The control loop is single-threaded
+			 *     (ROSE_THREADED=0, and no --mode sets it); send_control() is called
+			 *     from this loop earlier in this same iteration and returns before
+			 *     this block starts. Under ROSE_THREADED=1 the telemetry print does
+			 *     not exist at all -- io_block() only actuates -- so there is no
+			 *     configuration in which the two run concurrently.
+			 *   - BOTH writers use uart_poll_out(), which returns only once the byte
+			 *     is in the FIFO. There is no buffering layer that could reorder them
+			 *     and no yield point inside either writer.
+			 *   - NOTHING ELSE opens esp-uart. The down-ToF, flow, side-ToF,
+			 *     flight-log and status-LED threads write the console (uart0) at
+			 *     most, and no ISR touches this device.
+			 *
+			 * So a duty frame can never be split by a telemetry write: the two are
+			 * strictly sequential, not merely unlikely to collide. The one build that
+			 * WOULD break this -- the console pointed at esp-uart while duty frames
+			 * are on it -- is refused at compile time by the check next to
+			 * ROSE_ESP_MOTORS's esp-uart #error above.
+			 *
+			 * The other direction is the receiver's problem and is already solved:
+			 * workloads/esp_bridge demux_feed() holds the text back by exactly one
+			 * frame length and RETRACTS those bytes when the sliding-window decoder
+			 * accepts a frame, because a duty field can legitimately contain 0x0A and
+			 * would otherwise corrupt and split a telemetry line.
+			 *
+			 * Static storage rather than a ~300-byte frame on the control loop's
+			 * stack. 384 bytes, not 256: with both the v1.1 tail and the guard fields
+			 * the line runs ~290 bytes and a 256-byte buffer would silently truncate
+			 * the end of it -- which is exactly where the new fields are.
+			 */
+			static char esp_line[384];
+			int esp_len = snprintf(esp_line, sizeof(esp_line),
+					       TELEM_LINE_FMT, TELEM_LINE_ARGS);
+#if defined(ROSE_ESP_LINK_ACTIVE)
+			/*
+			 * Keep the motor link fed ACROSS the telemetry burst.
+			 *
+			 * Budget, measured: 115200 = 11520 B/s, and printk on this carrier is
+			 * POLLED (no CONFIG_UART_INTERRUPT_DRIVEN), so every byte of both copies
+			 * is charged to the control loop. ~290 bytes to the console plus ~290 to
+			 * the radio is ~50 ms, the flow line adds ~10 ms, and the next iteration's
+			 * own work is ~29 ms -- so without this the gap between two duty frames on
+			 * a telemetry iteration is ~89 ms against the ESP's 120 ms failsafe. That
+			 * is inside the timeout by 1.3x, which is not margin.
+			 *
+			 * Raising ROSE_TELEM_DIV does NOT fix it. A divisor makes the long gap
+			 * RARER, not SHORTER, and the failsafe fires on the worst gap, not the
+			 * average. Emitting a frame either side of the mirror does fix it: the
+			 * worst gap becomes ~39 ms and the margin goes back to ~3x.
+			 *
+			 * What goes out is the duty and flags send_control() last decided, with a
+			 * FRESH sequence number -- the same thing the 50 Hz rate limiter emits
+			 * between control updates. It must be a new seq: handle_frame() on the
+			 * receiver drops a frame whose seq is not newer (delta <= 0) and that path
+			 * deliberately does not feed the failsafe, so a verbatim re-send would be
+			 * counted stale and would pet nothing.
+			 *
+			 * This cannot paper over a real fault. The keepalive runs in the same
+			 * thread as everything else, so a hung, crashed or JTAG-halted core stops
+			 * emitting it too and the ESP still cuts all four motors within 120 ms.
+			 */
+			esp_motors_keepalive();
+#endif
+			if (esp_len > 0) {
+				size_t length = MIN((size_t)esp_len, sizeof(esp_line) - 1U);
+				esp_uart_write_line(esp_line, length);
+			}
+#if defined(ROSE_ESP_LINK_ACTIVE)
+			esp_motors_keepalive();   /* see the note above the first one */
+#endif
+#endif /* !ESP_UART_IS_CONSOLE */
+#endif /* HAVE_ESP_UART */
 #endif
 #if defined(ROSE_BUMPER) && ROSE_BUMPER
 			/* Wall distances (mm; -1 = no target/no wall) so bring-up + facing can be verified on
