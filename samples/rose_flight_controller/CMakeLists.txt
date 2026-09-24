@@ -41,6 +41,11 @@ set(ROSE_CTRL_DIV 1 CACHE STRING "control every Nth estimator tick (multi-rate)"
 # Estimator-only: run sensors + estimator + telemetry and never call the
 # controller. For characterising the estimator by itself; see solve_control().
 set(ROSE_ESTIMATOR_ONLY 0 CACHE STRING "1=estimator only (controller never runs)")
+# Uplink commands over uart1: the ground station's ESTOP/DISARM/RESET/HOVER_Z/
+# PROFILE/PING, read from the ESP link instead of from a radio this carrier does
+# not have. Empty = let main.cpp decide, which enables it exactly when the
+# esp-uart alias exists and is not the console. Set 0 to compile the reader out.
+set(ROSE_UART_CMD "" CACHE STRING "1=read uplink commands from uart1, 0=off, empty=auto")
 # Bench safety: stop driving motors this many ms after boot (0 = never). Real-HW bench
 # bring-up builds with 10000 so the props auto-stop 10 s after reset. Keep 0 for flight.
 #
@@ -254,6 +259,13 @@ target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_FLIGHT_COMMIT=${ROSE_FLIGHT_COMMIT}
   ROSE_MOTOR_WINDOW_MS=${ROSE_MOTOR_WINDOW_MS}
   ROSE_COMMIT_MAX_MS=${ROSE_COMMIT_MAX_MS})
+
+# Only forwarded when explicitly set. Passing ROSE_UART_CMD= (empty) would expand
+# to `-DROSE_UART_CMD=` and turn `#if ROSE_UART_CMD` into a syntax error, so the
+# empty default is left for main.cpp's own #ifndef to resolve.
+if(NOT ROSE_UART_CMD STREQUAL "")
+  target_compile_definitions(app PRIVATE ROSE_UART_CMD=${ROSE_UART_CMD})
+endif()
 
 if(ROSE_ESP_MOTORS)
   # Named rather than assumed: this sample is built in place from a submodule and

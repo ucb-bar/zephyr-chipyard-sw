@@ -79,6 +79,56 @@ static void esp_uart_write_line(const char *line, size_t length)
 }
 #endif /* !ESP_UART_IS_CONSOLE */
 #endif /* HAVE_ESP_UART */
+
+/*
+ * UPLINK COMMANDS OVER uart1 -- this carrier's substitute for a radio.
+ *
+ * The ground stations under tools/groundstation have flown a drone, and they
+ * command it over UDP to a board carrying its own WiFi. This carrier has none:
+ * CONFIG_WIFI is never set in any flight_controller build, so every rose_cmd_*
+ * hook below compiled out of every FPGA image, and workloads/esp_bridge was
+ * left inventing its own "ACK" for commands that nothing on this end read.
+ *
+ * The bytes were always arriving. esp_bridge forwards each command line to the
+ * FPGA with fpga_uart_write() and always has -- there was simply no reader.
+ * ROSE_UART_CMD is that reader. It changes no default behaviour on its own:
+ * with no ground station attached nothing is ever received, and the commands it
+ * can deliver are exactly the five the hooks already implemented.
+ *
+ * SAFETY DIRECTION. Of those five, ESTOP and DISARM only ever REMOVE authority
+ * (latch the kill, clear the arm latch). HOVER_Z is clamped to
+ * SAFE_MAX_HEIGHT_M by its hook. PROFILE only retimes a future flight. RESET is
+ * the one that grants -- it sets g_arm_enabled -- and it grants exactly what a
+ * tethered debugger already grants through hardware/flight/arm-enable.gdb. It
+ * does NOT arm: the lift-and-place gesture, the gyro cal, the battery check and
+ * the motor-commit gate all still stand between RESET and a spinning motor.
+ *
+ * SHARING uart1. This is the RX direction, and a UART receives on a different
+ * wire than it transmits, so the reader cannot interleave with either of the
+ * two TX writers whenever it runs. The ACK it writes back IS a third TX writer,
+ * and that one is safe by the same argument the telemetry mirror uses below:
+ * it runs on the control-loop thread, synchronously, between frames.
+ */
+/*
+ * DT_NODE_HAS_STATUS, not HAVE_ESP_UART. HAVE_ESP_UART is DT_NODE_EXISTS, which
+ * is true for an alias pointing at a DISABLED node -- and DEVICE_DT_GET on a
+ * disabled node emits a reference to a __device_dts_ord_N symbol that is never
+ * defined. Nothing caught that before because esp_uart_write_line() was the only
+ * user and --gc-sections discarded it whenever no build referenced it. Reading
+ * commands keeps the device alive in every build, so the guard has to be the
+ * one that is actually true: the node must be OKAY, not merely declared.
+ * Measured: with DT_NODE_EXISTS here, `--mode default` failed to link with
+ * "undefined reference to `__device_dts_ord_36'".
+ */
+#ifndef ROSE_UART_CMD
+#if HAVE_ESP_UART && !ESP_UART_IS_CONSOLE && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(esp_uart), okay)
+#define ROSE_UART_CMD 1
+#else
+#define ROSE_UART_CMD 0
+#endif
+#endif
+
 /*
  * The D8 status LED hangs off the ADS7128 expander, but every helper it needs -- g_led_bus,
  * ads7128_set_bit/clr_bit, STATUS_LED_CH, ADS7128_GPO_VALUE -- is defined inside the
@@ -2763,9 +2813,17 @@ static void ctrl_block(void *a, void *b, void *c)
 }
 #endif /* ROSE_THREADED */
 
-#if defined(CONFIG_WIFI)
-/* Uplink command hooks (declared in telem_wifi.h); the command-RX thread calls these. Each just
- * pokes a control-loop shared flag consumed on the next iteration -- no locks, no blocking. */
+#if defined(CONFIG_WIFI) || ROSE_UART_CMD
+/* Uplink command hooks. Previously WiFi-only, which meant absent from every FPGA
+ * image ever built; ROSE_UART_CMD now compiles them in for the uart1 reader too.
+ *
+ * telem_wifi.h, named as their declaration site, is NOT IN THIS REPOSITORY --
+ * neither it nor telem_wifi.c exists on any branch, though CMakeLists.txt and
+ * the include above both reference them under CONFIG_WIFI. These are the
+ * definitions and they stand alone; nothing here needs that header.
+ *
+ * Each hook just pokes a control-loop shared flag consumed on the next
+ * iteration -- no locks, no blocking. */
 extern "C" void rose_cmd_estop(void) { g_estop = true; }   /* latched remote kill */
 extern "C" void rose_cmd_disarm(void)
 {
@@ -2800,7 +2858,120 @@ extern "C" void rose_cmd_set_profile(int climb_ms, int hover_ms, int descend_ms,
 /* Soft reset: return the FC to the just-booted state (clear estop, disarm, re-run gyro cal, re-init
  * estimator/controller) WITHOUT a chip reset. Done in the control loop; here we just bump the gen. */
 extern "C" void rose_cmd_reset(void) { g_arm_enabled = true; g_reset_gen++; }   /* enable arming + soft reset */
-#endif /* CONFIG_WIFI */
+#endif /* CONFIG_WIFI || ROSE_UART_CMD */
+
+#if ROSE_UART_CMD
+/*
+ * The uart1 command reader. See the ROSE_UART_CMD note near the top.
+ *
+ * Wire format is whatever the ground station already sends: one command per
+ * line, uppercase verb, optional decimal arguments, terminated by \n (\r
+ * tolerated). That is exactly what workloads/esp_bridge forwards, unchanged,
+ * from the dashboard's POST /cmd whitelist.
+ *
+ * The reply is the point of this half. esp_bridge builds "ACK <cmd>" locally
+ * and sends it back whether or not anything acted -- so the dashboard has
+ * always gone green on delivery to a UART, never on execution. An ACK emitted
+ * HERE means the command was parsed and its hook ran, and a NAK means it was
+ * not understood. The ESP passes both through untouched.
+ */
+static void uart_cmd_reply(const char *verb, bool ok)
+{
+	char out[64];
+	int n = snprintf(out, sizeof(out), "%s %s\n", ok ? "FCACK" : "FCNAK", verb);
+
+	if (n > 0) {
+		esp_uart_write_line(out, MIN((size_t)n, sizeof(out) - 1U));
+	}
+}
+
+static void uart_cmd_dispatch(char *line)
+{
+	/* Strip trailing blanks so "ESTOP " and "ESTOP" are the same command. */
+	size_t n = strlen(line);
+
+	while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t')) {
+		line[--n] = '\0';
+	}
+	if (n == 0) {
+		return;
+	}
+
+	if (strcmp(line, "ESTOP") == 0) {
+		rose_cmd_estop();
+		printk("UARTCMD: ESTOP -- latched\n");
+		uart_cmd_reply("ESTOP", true);
+	} else if (strcmp(line, "DISARM") == 0) {
+		rose_cmd_disarm();
+		printk("UARTCMD: DISARM\n");
+		uart_cmd_reply("DISARM", true);
+	} else if (strcmp(line, "RESET") == 0) {
+		rose_cmd_reset();
+		printk("UARTCMD: RESET -- arming enabled, soft reset queued\n");
+		uart_cmd_reply("RESET", true);
+	} else if (strncmp(line, "HOVER_Z", 7) == 0) {
+		/* Millimetres on the wire, metres in the hook -- the dashboard's
+		 * button sends mm and rose_cmd_set_hover_z() clamps to
+		 * SAFE_MAX_HEIGHT_M, so a bad number cannot raise the ceiling.
+		 * sscanf rather than atoi: stdlib.h is not included here, and a
+		 * missing number should NAK rather than silently mean zero. */
+		int mm = 0;
+
+		if (sscanf(line + 7, "%d", &mm) == 1) {
+			rose_cmd_set_hover_z((float)mm / 1000.0f);
+			printk("UARTCMD: HOVER_Z %d mm\n", mm);
+			uart_cmd_reply("HOVER_Z", true);
+		} else {
+			uart_cmd_reply("HOVER_Z", false);
+		}
+	} else if (strncmp(line, "PROFILE", 7) == 0) {
+		int a = 0, b = 0, c = 0, d = 0;
+
+		if (sscanf(line + 7, "%d %d %d %d", &a, &b, &c, &d) == 4) {
+			rose_cmd_set_profile(a, b, c, d);
+			uart_cmd_reply("PROFILE", true);
+		} else {
+			uart_cmd_reply("PROFILE", false);
+		}
+	} else if (strcmp(line, "PING") == 0) {
+		uart_cmd_reply("PING", true);
+	} else {
+		/* Unknown, or a fragment of a binary duty frame that happened to
+		 * contain a newline. Either way say so rather than guessing. */
+		uart_cmd_reply("?", false);
+	}
+}
+
+static void uart_cmd_poll(void)
+{
+	static char buf[80];
+	static size_t len;
+	unsigned char ch;
+	/* Bounded so a babbling link cannot hold the control loop. At 115200 a
+	 * 10 ms iteration can only deliver ~115 bytes anyway, so this drains a
+	 * full iteration's worth and leaves the rest for the next pass. */
+	int budget = 128;
+
+	if (!device_is_ready(esp_uart_dev)) {
+		return;
+	}
+	while (budget-- > 0 && uart_poll_in(esp_uart_dev, &ch) == 0) {
+		if (ch == '\n' || ch == '\r') {
+			if (len > 0) {
+				buf[len] = '\0';
+				uart_cmd_dispatch(buf);
+				len = 0;
+			}
+		} else if (len < sizeof(buf) - 1U) {
+			buf[len++] = (char)ch;
+		} else {
+			/* Overrun: drop the whole line rather than dispatch a
+			 * truncated verb that might match a real one. */
+			len = 0;
+		}
+	}
+}
+#endif /* ROSE_UART_CMD */
 
 int main(void)
 {
@@ -2992,6 +3163,14 @@ int main(void)
 			continue;
 		}
 		imu_miss = 0;
+#if ROSE_UART_CMD
+		/* Drain the uplink BEFORE the reset check and before est.update, so a command
+		 * delivered this iteration takes effect this iteration rather than one loop
+		 * late. ESTOP in particular should not wait: at the PID cascade's ~1.3 ms that
+		 * is invisible, but at the default controller's 25-35 ms it is a whole
+		 * actuation period. */
+		uart_cmd_poll();
+#endif
 		/* Soft RESET (uplink cmd): return to the just-booted state WITHOUT a chip reset -- clear the
 		 * estop latch, disarm, and re-init the estimator + controller (which clears all integrators).
 		 * The gyro-bias cal is KEPT from boot (see gyro_cal_restart above): re-calibrating in the
