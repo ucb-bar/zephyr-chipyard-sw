@@ -2,6 +2,17 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+
+# No GP relaxation. With CONFIG_RISCV_GP the linker rewrites small-global accesses to be
+# gp-relative, and a later layout change can push their targets outside gp's +-2 KiB: on
+# 2026-09-25 the t21/t23 flight presets failed to link ("relocation truncated to fit:
+# R_RISCV_GPREL_S against pmw3901_cfg", and in libc malloc/free) while t16/t27 -- the same
+# sources with different knobs -- linked. Whether a flight build links must not depend on its
+# tuning values. (A Kconfig fix is not available: RISCV_GP is a one-member choice on a
+# single-hart SoC.) gp is still initialised; only the relaxation is off.
+if(CONFIG_RISCV_GP)
+  zephyr_ld_options(-Wl,--no-relax-gp)
+endif()
 project(rose_flight_controller)
 
 # Reuse the TinyMPC controller from samples/drone_control (requires:
