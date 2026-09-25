@@ -115,6 +115,14 @@ set(ROSE_BARO 0 CACHE STRING "1=enable BMP388 barometer altitude fusion, 0=disab
 # existing build.
 set(ROSE_AUTOFLIGHT 0 CACHE STRING "1=lift-and-place arm gate + autonomous altitude profile")
 set(ROSE_BATT_SENSE 0 CACHE STRING "1=battery ADC: arm gate, in-flight cutoff, thrust sag comp")
+# Split the OBSERVABILITY out of the CONTROL. With this set, ROSE_BATT_SENSE=1 still reads the
+# ADS7128 and still publishes vbat= on the telemetry line, but the reading reaches no actuator:
+# no thrust sag compensation, no low-voltage estop, no arm gate. That is what lets a mode whose
+# AIN5 scaling has not yet been checked against a meter give a remote operator the one fact they
+# need -- is a pack connected, i.e. can a motor turn -- without a plausible-but-wrong reading
+# quietly boosting duty or estopping a healthy bench run. Default 0 = full behaviour, so
+# --mode autoflight is byte-identical to before.
+set(ROSE_BATT_REPORT_ONLY 0 CACHE STRING "1=battery ADC feeds TELEMETRY ONLY (no sag comp/estop/arm gate)")
 set(ROSE_FLIGHTLOG  0 CACHE STRING "1=background flight log to RAM, flushed at flight end")
 set(ROSE_TELEM      1 CACHE STRING "1=in-loop console telemetry (MUST be 0 untethered)")
 set(ROSE_TELEM_DIV  10 CACHE STRING "print one telemetry line every Nth iteration")
@@ -247,6 +255,7 @@ target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_ESTIMATOR_ONLY=${ROSE_ESTIMATOR_ONLY}
   ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY}
   ROSE_AUTOFLIGHT=${ROSE_AUTOFLIGHT} ROSE_BATT_SENSE=${ROSE_BATT_SENSE}
+  ROSE_BATT_REPORT_ONLY=${ROSE_BATT_REPORT_ONLY}
   ROSE_FLIGHTLOG=${ROSE_FLIGHTLOG}
   ROSE_TELEM=${ROSE_TELEM} ROSE_TELEM_DIV=${ROSE_TELEM_DIV}
   ROSE_ARM_NO_GESTURE=${ROSE_ARM_NO_GESTURE}

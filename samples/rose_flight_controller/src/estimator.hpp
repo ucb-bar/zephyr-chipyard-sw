@@ -40,6 +40,11 @@ struct IStateEstimator {
 	 *               desk edge). Pass 0/false to ignore it -> the filter is unchanged (backward compat).
 	 *   baro_valid: true when a fresh/valid barometer sample is available
 	 *   dt:         control period (s)                                                  */
+	/* Whether the vehicle is flying (armed). Estimators that treat a large ToF step as a floor
+	 * change (desk/obstacle) must only do so in flight: a drone carried by hand and set down
+	 * produces exactly such a step. Default: ignored. */
+	virtual void set_airborne(bool airborne) { (void)airborne; }
+
 	virtual void update(const float accel[3], const float gyro[3], const float flow[2],
 			    bool flow_valid, float height, bool tof_valid,
 			    float baro_rel, bool baro_valid, float dt) = 0;

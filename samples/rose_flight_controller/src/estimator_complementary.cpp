@@ -53,6 +53,13 @@
  * translation -- a rotation-correlated drift that is WORST on takeoff (the velocity integrator that
  * otherwise trims it hasn't wound up yet). r for riskybird v3 (PCB): IMU is 16 mm LEFT of the CoM
  * -> IMU_OFFSET_Y = -0.016. Default 0 (opt-in); set via -DIMU_OFFSET_* . */
+/* Down-ToF floor-step handling (see update()). 0 = off: every sample is fused as before. */
+#ifndef TOF_STEP_REJECT_M
+#define TOF_STEP_REJECT_M 0.0f
+#endif
+#ifndef TOF_STEP_HOLD_S
+#define TOF_STEP_HOLD_S 0.15f
+#endif
 #ifndef IMU_OFFSET_X
 #define IMU_OFFSET_X 0.0f      /* body +x = forward */
 #endif
@@ -72,6 +79,8 @@ void ComplementaryEstimator::init(float x0, float y0, float z0)
 	w_prev[0] = w_prev[1] = w_prev[2] = 0.0f;
 	alpha_f[0] = alpha_f[1] = alpha_f[2] = 0.0f;
 	have_wprev = false;
+	need_seed = true;
+	tof_floor = 0.0f; tof_hold_t = 0.0f; airborne = false;
 	x = x0; y = y0; z = z0;
 	vx = vy = vz = 0.0f;
 	gx = gy = gz = 0.0f;
@@ -116,6 +125,9 @@ void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
 		}
 	}
 
+	if (need_seed && att.seed_from_accel(a)) {
+		need_seed = false;   /* start from the measured tilt, not from level */
+	}
 	att.update(a, gyro, dt);
 	float R[9]; att.rot(R);
 	/* Down-ToF SLANT range -> VERTICAL height via the fresh attitude: cos(tilt) = R[8] (exact). Past
@@ -192,10 +204,30 @@ void ComplementaryEstimator::update(const float accel[3], const float gyro[3],
 	}
 #else
 	(void)baro_rel; (void)baro_valid;   /* barometer disabled -> ToF-only (unchanged behavior) */
+	if (tof_hold_t > 0.0f) { tof_hold_t += dt; }
 	if (tof_vert) {
-		float rz = h_vert - z;
-		z  += z_gain*rz;
-		vz += vz_gain*rz;
+		/* Floor-step handling (TOF_STEP_REJECT_M > 0 only). The down-ToF measures height above
+		 * whatever is below it, so drifting over a desk makes it step by the desk height --
+		 * flight-logs T26: 1.28 -> 0.76 m in one sample, the estimator believed it, and the
+		 * altitude loop climbed to ~2.3 m to hold the setpoint above the desk. A true altitude
+		 * change between two ToF samples is a few cm, so a larger step is either a glitch or a
+		 * floor change: hold it off for TOF_STEP_HOLD_S (z coasts on the accelerometer), and if it
+		 * is still there, adopt it as a floor offset so z stays continuous. Leaving the obstacle
+		 * gives the opposite step, absorbed the same way. */
+		float h = h_vert + tof_floor;
+		float rz = h - z;
+		if ((float)(TOF_STEP_REJECT_M) > 0.0f && airborne && z > 0.15f && fabsf(rz) > (float)(TOF_STEP_REJECT_M)) {
+			if (tof_hold_t == 0.0f) {
+				tof_hold_t = 1e-6f;                    /* start the hold clock; coast */
+			} else if (tof_hold_t >= (float)(TOF_STEP_HOLD_S)) {
+				tof_floor += z - h;                    /* persistent: new floor, z unchanged */
+				tof_hold_t = 0.0f;
+			}
+		} else {
+			tof_hold_t = 0.0f;
+			z  += z_gain*rz;
+			vz += vz_gain*rz;
+		}
 	}
 #endif
 }

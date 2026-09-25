@@ -28,6 +28,30 @@ struct MahonyAttitude {
 		kp = 0.5f;
 	}
 
+	/* Set roll/pitch straight from gravity, yaw 0. The trim above is deliberately slow (kp 0.5),
+	 * so an init() to identity on a board that is resting tilted leaves the estimate reading
+	 * ~level for SECONDS -- measured 2026-09-23: a RESET at a 9-10 deg rest tilt zeroed the
+	 * attitude, the drone armed believing it was level, and rocked over on its legs. Returns false
+	 * (and changes nothing) unless |a| is within 20% of g, i.e. the board is plausibly at rest.
+	 * a is specific force (+g up at rest); ZYX with yaw 0: pitch = asin(-ax), roll = atan2(ay, az),
+	 * which makes R^T*(0,0,1) equal a/|a| -- the same "up in body" the trim above steers toward. */
+	bool seed_from_accel(const float a[3])
+	{
+		float amag = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+		if (amag < 0.8f * 9.81f || amag > 1.2f * 9.81f) {
+			return false;
+		}
+		float sx = -a[0] / amag;
+		if (sx > 1.0f) sx = 1.0f;
+		if (sx < -1.0f) sx = -1.0f;
+		const float pitch = asinf(sx);
+		const float roll  = atan2f(a[1], a[2]);
+		const float cr = cosf(0.5f * roll),  sr = sinf(0.5f * roll);
+		const float cp = cosf(0.5f * pitch), sp = sinf(0.5f * pitch);
+		qw = cr * cp; qx = sr * cp; qy = cr * sp; qz = -sr * sp;
+		return true;
+	}
+
 	/* Advance the quaternion with body rate + gated gravity trim. */
 	void update(const float accel[3], const float gyro[3], float dt)
 	{

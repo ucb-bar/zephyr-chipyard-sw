@@ -77,6 +77,48 @@ static void esp_uart_write_line(const char *line, size_t length)
 		uart_poll_out(esp_uart_dev, line[i]);
 	}
 }
+
+/*
+ * NON-BLOCKING telemetry to the ESP. esp_uart_write_line() above is polled: a ~290-byte line is
+ * ~25 ms of wire time at 115200 and the control loop sat in it. Measured 2026-09-23, together with
+ * the ~47 ms console printk of the same line, that froze the loop for ~70 ms out of every ~85 ms,
+ * the motors updated at ~57 Hz instead of every iteration, and the first flight rocked over on its
+ * legs. So: queue the line, and each iteration move only as many bytes as the SiFive TX FIFO will
+ * take WITHOUT WAITING (txdata bit 31 = FIFO full). A line that does not fit is dropped whole --
+ * telemetry is best-effort, the control loop is not.
+ *
+ * Duty frames still go out through uart_poll_out() in esp_motors_tx(), whole, on this same thread,
+ * so a frame is never split; if it lands between two text bytes the ESP's demux retracts it from
+ * the text stream (workloads/esp_bridge demux_feed).
+ */
+#define ESP_TXQ_SIZE 1024U
+static char esp_txq[ESP_TXQ_SIZE];
+static size_t esp_txq_head, esp_txq_tail;   /* head = next write, tail = next send */
+static volatile uint32_t g_esp_txq_drops;
+
+static void esp_uart_queue_line(const char *line, size_t length)
+{
+	size_t used = (esp_txq_head - esp_txq_tail) & (ESP_TXQ_SIZE - 1U);
+
+	if (length >= ESP_TXQ_SIZE - 1U - used) {
+		g_esp_txq_drops++;
+		return;
+	}
+	for (size_t i = 0; i < length; ++i) {
+		esp_txq[esp_txq_head] = line[i];
+		esp_txq_head = (esp_txq_head + 1U) & (ESP_TXQ_SIZE - 1U);
+	}
+}
+
+static void esp_uart_drain(void)
+{
+	volatile uint32_t *const txdata = (volatile uint32_t *)DT_REG_ADDR(DT_ALIAS(esp_uart));
+
+	while (esp_txq_tail != esp_txq_head && !(*txdata & (1U << 31))) {
+		*txdata = (uint8_t)esp_txq[esp_txq_tail];
+		esp_txq_tail = (esp_txq_tail + 1U) & (ESP_TXQ_SIZE - 1U);
+	}
+}
 #endif /* !ESP_UART_IS_CONSOLE */
 #endif /* HAVE_ESP_UART */
 
@@ -210,6 +252,12 @@ static void esp_uart_write_line(const char *line, size_t length)
  * A divisor rather than a faster console because losing the console loses all observability,
  * while a slower telemetry line costs nothing during bring-up.
  */
+/* 0 = do not print the telemetry/flow lines on the console (uart0), only queue them to the ESP.
+ * The console is a polled 115200 link, so each line cost the control loop ~47 ms; in flight the
+ * console cable is not even attached. Boot banners and events still print. */
+#ifndef ROSE_TELEM_CONSOLE
+#define ROSE_TELEM_CONSOLE 1
+#endif
 #ifndef ROSE_TELEM_DIV
 #define ROSE_TELEM_DIV 10
 #endif
@@ -225,6 +273,32 @@ static void esp_uart_write_line(const char *line, size_t length)
  *       BATT_CUTOFF_V trips the emergency watchdog (safety_violation() "battery"). */
 #ifndef ROSE_BATT_SENSE
 #define ROSE_BATT_SENSE 0
+#endif
+/* Report-only battery sense: compile the ADC read and the telemetry, but do NOT let the reading
+ * reach an actuator or the estop.
+ *
+ * ROSE_BATT_SENSE=1 on its own makes g_vbat a CONTROL INPUT in two places -- send_control()
+ * multiplies every motor duty by clamp(BATT_NOMINAL_V/g_vbat, [1, BATT_SCALE_MAX]), and
+ * safety_violation() latches the emergency estop below BATT_CUTOFF_V. Both are correct once the
+ * AIN5 channel and the 200k/100k scaling have been CONFIRMED against a meter on this carrier, and
+ * neither is correct before then, because the failure mode is not a garbage reading (those are
+ * already rejected) but a PLAUSIBLE WRONG one:
+ *
+ *   - a reading in [1.0, 3.8) V silently boosts commanded duty, up to +30 % at the clamp. The
+ *     operator sees the duty they asked for in telemetry and the motors turn harder than that.
+ *   - a reading in [1.0, 3.2) V estops a bench run that has nothing wrong with it, which reads
+ *     from a remote console exactly like a real fault.
+ *
+ * Neither is acceptable to switch on, remotely, for a sensor nobody has yet put a meter against.
+ * With this set, g_vbat is telemetry and nothing else -- so the ONE fact a remote operator needs
+ * (is the pack connected, i.e. can a motor physically turn) becomes observable WITHOUT changing
+ * what the motors do. Promote a mode to the full behaviour by dropping this from its entry in
+ * tools/rb/boards.py, once the hardware check in the battery-sense banner below has been done.
+ *
+ * Defaults to 0 = full behaviour, so --mode autoflight -- which turns ROSE_BATT_SENSE on
+ * deliberately, for a flight, with the arm gate and the cutoff as the point -- is unchanged. */
+#ifndef ROSE_BATT_REPORT_ONLY
+#define ROSE_BATT_REPORT_ONLY 0
 #endif
 #ifndef BATT_NOMINAL_V
 #define BATT_NOMINAL_V 3.8f      /* thrust-scaling reference; sag comp targets this pack voltage */
@@ -244,6 +318,12 @@ static void esp_uart_write_line(const char *line, size_t length)
 #ifndef BATT_CHECK_DIV
 #define BATT_CHECK_DIV 200       /* poll the ADC every N control iters (~1 kHz loop -> ~5 Hz) */
 #endif
+/* Declared here rather than beside battery_poll(): that block is inside `#if
+ * DT_HAS_COMPAT_STATUS_OKAY(st_vl53l1x)`, and safety_banner() -- which states the channel at boot
+ * -- is not. Same value, one definition. */
+#ifndef BATT_ADC_CH
+#define BATT_ADC_CH    5         /* ADS7128 AIN5/GPIO5 = U1 pin 4, the +BATT divider tap */
+#endif
 #ifndef BATT_SMOOTH_ALPHA
 #define BATT_SMOOTH_ALPHA 0.20f  /* EMA weight on each new sample (higher = less smoothing) */
 #endif
@@ -254,12 +334,33 @@ static void esp_uart_write_line(const char *line, size_t length)
  * board only), read by the helpers below. Treated as "invalid / not yet read" outside [1.0, 5.0] V. */
 static volatile float g_vbat = 0.0f;
 
+/* Consecutive battery_poll() calls that produced NO new sample -- I2C error, or a conversion
+ * outside the plausibility window. battery_poll() deliberately keeps the previous g_vbat in that
+ * case, which is right for a one-off glitch and silent for a permanent failure: the telemetry line
+ * would keep printing a confident, frozen voltage forever. Published as batt=stale so it cannot.
+ *
+ * This is not hypothetical on this board. The divider's bottom leg is switched by Q6, whose gate is
+ * the eFuse power-good /FUSE_PG (U16 pin 13, open-drain, 100k to +3V3). If PG ever drops, Q6 opens,
+ * the R31 leg floats, and R30 pulls the ADC input toward +BATT until U1's input ESD clamp holds it
+ * near AVDD+0.5 -- so the converter reads near FULL SCALE, about 9.9 V once scaled. battery_poll()
+ * rejects that (> 6.0 V) and holds the last good value. A power fault therefore presents as a
+ * battery reading that simply stops moving, which is exactly the thing a remote operator would
+ * otherwise never notice. */
+static volatile uint32_t g_batt_miss_run;
+
+/* How many consecutive misses before the reading is called stale. 5 polls = 5*BATT_CHECK_DIV
+ * control iterations, ~1.3 s at the ~770 Hz the PID cascade actually achieves -- long enough to
+ * ride out a single bus collision with the ToF, short enough to be seen. */
+#ifndef BATT_STALE_MISSES
+#define BATT_STALE_MISSES 5
+#endif
+
 /* Motor-duty multiplier that compensates for pack sag. Returns 1.0 (no-op) when battery sense is
  * disabled or g_vbat looks invalid (0 / absurd); otherwise clamp(BATT_NOMINAL_V/g_vbat, [1, max]).
  * Never REDUCES thrust (a fresh pack above nominal clamps to 1.0). */
 static inline float batt_thrust_scale(void)
 {
-#if ROSE_BATT_SENSE
+#if ROSE_BATT_SENSE && !ROSE_BATT_REPORT_ONLY
 	float v = g_vbat;
 	if (v < 1.0f || v > 5.0f) { return 1.0f; }   /* invalid / not-yet-read -> no scaling */
 	float s = BATT_NOMINAL_V / v;
@@ -274,12 +375,83 @@ static inline float batt_thrust_scale(void)
  * broken sensor or bring-up race never hard-locks the drone); only a VALID low reading blocks. */
 static inline bool batt_ok_to_arm(void)
 {
-#if ROSE_BATT_SENSE
+#if ROSE_BATT_SENSE && !ROSE_BATT_REPORT_ONLY
 	float v = g_vbat;
 	if (v < 1.0f || v > 5.0f) { return true; }   /* not yet read -> don't block bring-up */
 	return v >= BATT_ARM_MIN_V;
 #else
 	return true;
+#endif
+}
+
+/* ---- What vbat= on the telemetry line MEANS ---------------------------------------------------
+ *
+ * This is the one field a REMOTE operator reads to decide whether a motor can physically turn.
+ * The motors are brushed and switched by low-side SI2302 FETs straight off +BATT -- there are no
+ * ESCs -- so what makes a motor turn is energy on +BATT and nothing else.
+ *
+ * READ THIS BEFORE BUILDING ANYTHING ON TOP OF vbat=. It is the +BATT RAIL VOLTAGE. It is NOT a
+ * pack-presence flag, and on this board it CANNOT be made into one:
+ *
+ *   riskybirdv3.kicad_sch: U4 is an MCP73831-2 charger with VDD on +5V (USB VBUS, J8) and its VBAT
+ *   output wired DIRECTLY to +BATT. The pack connector J7 lands on that same net. So with USB
+ *   plugged and NO pack fitted, U4 charges the +BATT bulk capacitance (C2/C3/C40/C41 4x47uF plus
+ *   C48 10uF, ~200uF) to its 4.20 V float and terminates -- and AIN5 reads a textbook healthy
+ *   battery. An empty board on USB and a fully charged pack produce the SAME number here.
+ *
+ * What the number does tell you, truthfully: whether the rail the motor FETs switch is energised,
+ * and roughly to what. What it cannot tell you: whether there is a pack behind that rail. ~200uF
+ * at 4.2 V is a twitch, not a flight, but it is not "nothing", so a high vbat= must be read as
+ * "the motor rail is live -- assume a motor can move" and never as "a pack is fitted". The one
+ * discriminator that exists is load response (with no pack the rail collapses the instant a motor
+ * draws current, because U4 can source only ~500 mA into ~200uF), and deliberately loading the
+ * motors to find out is not something a remote, unattended build gets to do.
+ *
+ * So the field must never be ambiguous, and printing g_vbat raw is ambiguous three ways -- 0.000
+ * means "sense not compiled in", "sense compiled in but the ADC has never answered", and "a
+ * genuine zero" all at once. The first two are NOT KNOWLEDGE, and rendering them as a number that
+ * compares below any "is the pack present" threshold turns "I have no idea" into a confident
+ * "absent, motors cannot turn". Unknown must never render as safe.
+ *
+ * A voltage read through an unsigned 12-bit ADC cannot be negative, so the SIGN is free to carry
+ * "this is not a measurement" with no possibility of colliding with a real reading:
+ *
+ *   vbat=-1.000   battery sense is NOT COMPILED IN (ROSE_BATT_SENSE=0). Nothing is known, and
+ *                 nothing in this build will ever know it.
+ *   vbat=-2.000   sense IS compiled in, but no valid sample has ever reached g_vbat: the ADS7128
+ *                 is not answering on the ToF bus, or every conversion so far fell outside the
+ *                 [0.5, 6.0] V plausibility window in battery_poll().
+ *   vbat=<v>      a real, EMA-smoothed pack voltage.
+ *
+ * The sentinels are also chosen to fail safe in the tool that consumes them. tools/bench/
+ * rb-status.sh scrapes this field with `grep -ao "vbat=[0-9.]*"`, which matches no digits at all
+ * against a leading '-'; the field comes out EMPTY and the script takes its "UNKNOWN -- a remote
+ * operator CANNOT tell if motors can spin" branch, instead of parsing 0.000 and printing a green,
+ * confident, wrong "absent -- motors cannot turn".
+ *
+ * No parser breaks: riskybird_panel.py's floats are (-?\d+\.\d+), so TAIL_RE still matches and
+ * the rest of the tail (vx/vy/vz/zsp/st) keeps parsing exactly as before. */
+static inline float telem_vbat(void)
+{
+#if ROSE_BATT_SENSE
+	return (g_vbat > 0.0f) ? g_vbat : -2.0f;   /* -2.0 = compiled in, never got a valid sample */
+#else
+	return -1.0f;                              /* -1.0 = not compiled in */
+#endif
+}
+
+/* The same three states as a word, so a human reading the raw console does not have to decode a
+ * sentinel magnitude. Appended at the very END of the telemetry line (after accskip=), which is
+ * the convention this file already uses for additive fields -- every existing parser, including
+ * CORE_RE/TAIL_RE/POS_RE and every grep in rb-status.sh, is untouched by a new trailing token. */
+static inline const char *telem_batt_state(void)
+{
+#if ROSE_BATT_SENSE
+	if (g_vbat <= 0.0f)                              { return "nodata"; }
+	if (g_batt_miss_run >= (uint32_t)BATT_STALE_MISSES) { return "stale"; }
+	return "meas";
+#else
+	return "off";
 #endif
 }
 
@@ -323,7 +495,7 @@ static inline bool batt_ok_to_arm(void)
 #define TELEM_TAIL_ARGS \
 	FP3(state[0]), FP3(state[1]), \
 	FP3(state[6]), FP3(state[7]), FP3(state[8]), \
-	FP3(g_setpoint[2]), FP3(g_vbat), \
+	FP3(g_setpoint[2]), FP3(telem_vbat()), \
 	(unsigned int)((g_armed         ? ROSE_TELEM_FLAG_ARMED   : 0u) | \
 		       (g_estop         ? ROSE_TELEM_FLAG_ESTOP   : 0u) | \
 		       (g_arming        ? ROSE_TELEM_FLAG_ARMING  : 0u) | \
@@ -362,7 +534,7 @@ static inline bool batt_ok_to_arm(void)
 	"z=%s%d.%03d tofv=%d tofh=%s%d.%03d u=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d] " \
 	"duty=[%s%d.%03d %s%d.%03d %s%d.%03d %s%d.%03d]" \
 	TELEM_TAIL_FMT \
-	" tilt=est%ddeg/acc%ddeg |a|=%s%d.%03d accskip=%u\n"
+	" tilt=est%ddeg/acc%ddeg |a|=%s%d.%03d accskip=%u batt=%s gzpk=%s%d.%03d apk=%s%d.%03d grej=%u\n"
 
 #define TELEM_LINE_ARGS \
 	iter, (int)(dt * 1000.0f + 0.5f), \
@@ -374,7 +546,8 @@ static inline bool batt_ok_to_arm(void)
 	TELEM_TAIL_ARGS, \
 	(int)(g_guard_est_rad  * (180.0f / 3.14159265f) + 0.5f), \
 	(int)(g_guard_tilt_rad * (180.0f / 3.14159265f) + 0.5f), \
-	FP3(g_guard_amag), (unsigned)g_guard_acc_skips
+	FP3(g_guard_amag), (unsigned)g_guard_acc_skips, telem_batt_state(), \
+	FP3(g_gz_peak), FP3(g_amag_peak), (unsigned)g_gyro_rejects
 
 /* ---- Sensor devices (Zephyr sensor API; bound per board overlay) ---- */
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
@@ -462,7 +635,6 @@ static const struct device *g_led_bus;
  * flips channels 1-4 and 6 to GPIO, never 5). Manual mode (SEQUENCE_CFG default): select the channel
  * once via CHANNEL_SEL, then each bare 2-byte I2C read returns that channel's latest conversion
  * (12-bit, left-justified in the 16-bit frame). One short transaction -> called at a low rate. */
-#define BATT_ADC_CH         5
 #define ADS7128_CHANNEL_SEL 0x11
 static const struct device *g_batt_bus;   /* cached by battery_sense_init() (== the ToF I2C bus) */
 
@@ -480,10 +652,11 @@ static void battery_poll(void)
 	const struct device *bus = g_batt_bus;
 	if (!bus) { return; }
 	uint8_t rx[2];
-	if (i2c_read(bus, rx, sizeof(rx), ADS7128_I2C_ADDR) != 0) { return; }
+	if (i2c_read(bus, rx, sizeof(rx), ADS7128_I2C_ADDR) != 0) { g_batt_miss_run++; return; }
 	uint16_t raw = (uint16_t)(((uint16_t)rx[0] << 4) | (rx[1] >> 4));   /* 12-bit, left-justified */
 	float vbat = ((float)raw / 4096.0f) * BATT_VREF_V * BATT_DIVIDER;
-	if (vbat < 0.5f || vbat > 6.0f) { return; }          /* reject garbage */
+	if (vbat < 0.5f || vbat > 6.0f) { g_batt_miss_run++; return; }   /* reject garbage; say so */
+	g_batt_miss_run = 0;
 	if (g_vbat <= 0.0f) { g_vbat = vbat; }               /* seed the EMA on the first sample */
 	else { g_vbat = g_vbat + BATT_SMOOTH_ALPHA * (vbat - g_vbat); }
 }
@@ -634,9 +807,11 @@ static inline void battery_poll(void) { }
  *      accelerometer directly -- gravity is a true attitude reference with no filter, no
  *      convergence and no parameterisation to misread -- and adds FREE FALL and IMPACT, which
  *      NOTHING in this file had. Tilt cannot catch a drop: a drone dropped flat stays flat the
- *      whole way down and only |a| gives it away. The approach and the thresholds come from
- *      integration/zephyr/safety/motor_guard.{h,c}, which is proven to compile and run on the
- *      bench workloads; see the note on accel_envelope() for why the module is not linked here.
+ *      whole way down and only |a| gives it away. The approach and the thresholds were taken from
+ *      riskybird's standalone bench motor-guard module, which has since been DELETED from that
+ *      tree as an unreferenced duplicate of the upstream watchdog; see the note on
+ *      accel_envelope() for why a separate module was never linked in here anyway. This file is
+ *      now the only copy of those tests and thresholds.
  *   3. Debounce in MILLISECONDS, not iterations. SAFE_DEBOUNCE_ITERS was 15 consecutive iterations,
  *      which is 20 ms under the PID cascade (1.3 ms/iter) and 525 ms under TinyMPC (35 ms/iter) --
  *      a factor of TWENTY-SIX between two builds of the same guard, and the offload run that
@@ -681,10 +856,11 @@ static inline float tilt_rad_from_gibbs(const float *state)
 #endif
 
 /* ---- accelerometer envelope (no estimator in the path) --------------------------------------
- * Thresholds carried over from integration/zephyr/safety/motor_guard.h so the two guards can be
- * compared and tuned against each other. That module states tilt as sin^2(theta) in percent to stay
+ * Thresholds carried over from riskybird's standalone bench motor-guard module, which has since
+ * been deleted there as an unreferenced duplicate of the upstream watchdog -- so these values now
+ * live here and nowhere else. That module stated tilt as sin^2(theta) in percent to stay
  * integer-only for FPU-less builds; this file is float throughout, so the same limit is written as
- * an angle and squared once at compile time. 40 deg here is sin^2 = 41%, against the module's
+ * an angle and squared once at compile time. 40 deg here is sin^2 = 41%, against that module's
  * bench default of 50% (45 deg) -- tighter, because this guard runs while motors may be driving. */
 #ifndef SAFE_ACC_TILT_RAD
 #define SAFE_ACC_TILT_RAD   0.70f    /* 40 deg, measured against gravity directly */
@@ -890,8 +1066,9 @@ static volatile uint32_t g_guard_acc_skips;
 /*
  * ACCELEROMETER ENVELOPE -- the estimator is deliberately not in this path.
  *
- * Reuses the tests and the thresholds from integration/zephyr/safety/motor_guard.{h,c}. It is NOT
- * linked in here, and the reason is worth writing down: that module runs its own cooperative thread
+ * Reuses the tests and the thresholds from riskybird's standalone bench motor-guard module (since
+ * deleted there as an unreferenced duplicate of the upstream watchdog). It was never linked in
+ * here, and the reason is worth writing down: that module ran its own cooperative thread
  * that calls sensor_sample_fetch() on the BMI088 and zeroes an array of pwm_dt_spec on a trip.
  * Neither fits this application. The control loop already fetches the same accelerometer every
  * iteration, and a second thread fetching it concurrently would contend for the same bus behind a
@@ -999,10 +1176,16 @@ static const char *safety_violation(const float *state, const float *gyro, const
 		*meas = state[2]; *unit = "m";
 		return "height";
 	}
-#if ROSE_BATT_SENSE
+#if ROSE_BATT_SENSE && !ROSE_BATT_REPORT_ONLY
 	/* Low-voltage cutoff: only a VALID reading (>= 1.0 V) below the threshold trips -- a garbage-low
 	 * read (< 1.0 V, sensor fault) is ignored so it can't false-estop mid-flight. Debounced by the
-	 * caller like every other reason. */
+	 * caller like every other reason.
+	 *
+	 * That guard is sufficient against a reading that is garbage-LOW and nothing else. It does NOT
+	 * protect against a plausible wrong reading: a mis-scaled or wrong-channel result that lands in
+	 * [1.0, 3.2) V trips this exactly as a flat pack would, and from a remote console the two are
+	 * indistinguishable. That is why a mode whose scaling is unverified sets ROSE_BATT_REPORT_ONLY
+	 * and compiles this test out entirely rather than relying on the >= 1.0 V floor. */
 	if (g_vbat >= 1.0f && g_vbat < BATT_CUTOFF_V) {
 		*meas = g_vbat; *unit = "V";
 		return "battery";
@@ -1060,6 +1243,39 @@ static void safety_banner(void)
 		       "a SAFE failure. Do not react to it by raising limits in a hurry.\n",
 		       FP3((float)(AUTOFLIGHT_MAX_DUTY)));
 	}
+#endif
+	/* BATTERY -- said at boot for the same reason the envelope is: this is the one fact a remote
+	 * operator has no other way to get, and the difference between "measured absent" and "never
+	 * measured" is the difference between a safe bench and a false sense of one. */
+#if !ROSE_BATT_SENSE
+	printk("flight_controller: BATTERY SENSE OFF (ROSE_BATT_SENSE=0) -- telemetry prints "
+	       "vbat=-1.000 batt=off. This build CANNOT tell whether a pack is connected, so it "
+	       "cannot tell whether a motor can physically turn. Do not read the absence of a "
+	       "voltage here as the absence of a battery.\n");
+#else
+	printk("flight_controller: BATTERY SENSE ON -- ADS7128 AIN%d, Vbat = Vadc * %d "
+	       "(R30 200k / R31 100k), ref %s%d.%03d V, polled every %d iters. Telemetry: vbat=<V> "
+	       "batt=meas when read, vbat=-2.000 batt=nodata before the first valid sample, "
+	       "batt=stale if %d polls in a row fail.\n",
+	       BATT_ADC_CH, (int)BATT_DIVIDER, FP3((float)(BATT_VREF_V)), (int)BATT_CHECK_DIV,
+	       (int)BATT_STALE_MISSES);
+	printk("flight_controller: vbat= IS THE +BATT RAIL, NOT A PACK-PRESENT FLAG -- the MCP73831 "
+	       "(U4) charges +BATT from USB, so with no pack fitted it holds the bulk caps at ~4.2 V "
+	       "and this reads like a full battery. A HIGH vbat means ASSUME A MOTOR CAN MOVE. It "
+	       "never proves a pack is absent.\n");
+#if ROSE_BATT_REPORT_ONLY
+	printk("flight_controller: BATTERY SENSE IS REPORT-ONLY -- no thrust sag compensation, no "
+	       "low-voltage estop, no arm gate. The reading reaches TELEMETRY AND NOTHING ELSE, so "
+	       "turning it on cannot change what the motors do. UNVERIFIED ON HARDWARE: put a meter "
+	       "on the pack and compare it with vbat= before trusting the number or dropping "
+	       "ROSE_BATT_REPORT_ONLY.\n");
+#else
+	printk("flight_controller: BATTERY IS A CONTROL INPUT -- duty is scaled by %s%d.%03d/vbat "
+	       "(clamped to %s%d.%03d), arming is blocked below %s%d.%03d V, and a reading in "
+	       "[1.000, %s%d.%03d) V latches the emergency estop.\n",
+	       FP3((float)(BATT_NOMINAL_V)), FP3((float)(BATT_SCALE_MAX)),
+	       FP3((float)(BATT_ARM_MIN_V)), FP3((float)(BATT_CUTOFF_V)));
+#endif
 #endif
 }
 
@@ -1249,7 +1465,7 @@ static bool motor_gate_permit(const float *duty)
 		{
 			static int64_t next_note;
 
-			if (now >= next_note) {
+			if (ROSE_TELEM_CONSOLE && now >= next_note) {   /* ~3.4 ms polled, 1 Hz: console builds only */
 				next_note = now + (int64_t)(ROSE_MOTOR_LIVE_NOTE_MS);
 				printk("MOTOR GATE: MOTORS LIVE %d/%d ms (%s)\n", (int)elapsed,
 				       motor_gate_limit_ms(),
@@ -2338,6 +2554,22 @@ static float g_att_roll, g_att_pitch, g_att_yaw;   /* last estimator attitude, G
 #define GBIAS_TRACK_STILL_RADPS 0.10f  /* only re-track when very still (tighter than the boot-cal gate) */
 #endif
 static float g_gyro_bias[3];           /* measured gyro bias (rad/s); 0 until the cal completes */
+/* Gyro step guard + peak telemetry. A sudden yaw kick of ~250 deg/s preceded two upsets
+ * (flight-logs T10 at 0.2 m, T27 at 1.4 m) with nothing commanding it. The ~28 Hz telemetry cannot
+ * tell a corrupted-but-"successful" IMU read from a real rotation, so: record the peak raw |gz| and
+ * |a| between telemetry lines (gzpk/apk/grej fields), and optionally hold any sample whose rate
+ * changes by more than GYRO_STEP_MAX (rad/s) from the previous one -- at the ~1.1 kHz loop that is
+ * >5000 rad/s^2, far beyond this airframe -- for at most GYRO_STEP_HOLD_N samples, so a real,
+ * sustained rotation still gets through. GYRO_STEP_MAX 0 = off (default). */
+#ifndef GYRO_STEP_MAX
+#define GYRO_STEP_MAX 0.0f
+#endif
+#ifndef GYRO_STEP_HOLD_N
+#define GYRO_STEP_HOLD_N 3
+#endif
+static float    g_gz_peak;       /* max raw |gyro z| since the last telemetry line (rad/s) */
+static float    g_amag_peak;     /* max |accel| since the last telemetry line (m/s^2) */
+static uint32_t g_gyro_rejects;  /* samples held by the step guard, cumulative */
 static volatile bool g_gyro_cal_done;  /* startup bias cal finished -> OK to arm */
 /* Gyro-cal accumulators at FILE scope so a soft-reset (rose_cmd_reset) can restart the cal cleanly;
  * if they stayed function-local statics, re-clearing g_gyro_cal_done would leave a stale gstill_since
@@ -2446,6 +2678,31 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	f->gyro[0] -= g_gyro_bias[0];
 	f->gyro[1] -= g_gyro_bias[1];
 	f->gyro[2] -= g_gyro_bias[2];
+	{
+		const float gz_abs = fabsf(f->gyro[2]);
+		const float amag = sqrtf(f->accel[0] * f->accel[0] + f->accel[1] * f->accel[1] +
+					 f->accel[2] * f->accel[2]);
+		if (gz_abs > g_gz_peak) { g_gz_peak = gz_abs; }
+		if (amag > g_amag_peak) { g_amag_peak = amag; }
+		static float   gprev[3];
+		static bool    gprev_ok;
+		static uint8_t grun;
+		if ((float)(GYRO_STEP_MAX) > 0.0f && gprev_ok) {
+			bool bad = false;
+			for (int i = 0; i < 3; i++) {
+				if (fabsf(f->gyro[i] - gprev[i]) > (float)(GYRO_STEP_MAX)) { bad = true; }
+			}
+			if (bad && grun < (uint8_t)(GYRO_STEP_HOLD_N)) {
+				f->gyro[0] = gprev[0]; f->gyro[1] = gprev[1]; f->gyro[2] = gprev[2];
+				grun++;
+				g_gyro_rejects++;
+			} else {
+				grun = 0;
+			}
+		}
+		gprev[0] = f->gyro[0]; gprev[1] = f->gyro[1]; gprev[2] = f->gyro[2];
+		gprev_ok = true;
+	}
 	PF_ACC(pf_imu_get, _pf);
 	f->flow[0] = f->flow[1] = 0.0f;
 	f->flow_valid = true;
@@ -2938,6 +3195,7 @@ static void uart_cmd_dispatch(char *line)
 	} else {
 		/* Unknown, or a fragment of a binary duty frame that happened to
 		 * contain a newline. Either way say so rather than guessing. */
+		printk("UARTCMD: unrecognised line (%u B) -- NAK\n", (unsigned)n);
 		uart_cmd_reply("?", false);
 	}
 }
@@ -2955,19 +3213,33 @@ static void uart_cmd_poll(void)
 	if (!device_is_ready(esp_uart_dev)) {
 		return;
 	}
+	static bool discarding;
+
 	while (budget-- > 0 && uart_poll_in(esp_uart_dev, &ch) == 0) {
 		if (ch == '\n' || ch == '\r') {
-			if (len > 0) {
+			if (len > 0 && !discarding) {
 				buf[len] = '\0';
 				uart_cmd_dispatch(buf);
-				len = 0;
 			}
+			len = 0;
+			discarding = false;
+		} else if (ch < 0x20 || ch > 0x7e) {
+			/* Non-printable = line noise, not command text. Resync here, so
+			 * the command that follows is read on its own. Measured
+			 * 2026-09-23: an ESP reset glitched its TX, the junk sat in this
+			 * buffer with no newline, and the next ESTOP arrived as
+			 * "<junk>ESTOP" -- NAKed, and the FC never latched it. */
+			len = 0;
+			discarding = false;
+		} else if (discarding) {
+			/* rest of an overlong line: never dispatch its tail */
 		} else if (len < sizeof(buf) - 1U) {
 			buf[len++] = (char)ch;
 		} else {
-			/* Overrun: drop the whole line rather than dispatch a
-			 * truncated verb that might match a real one. */
+			/* Overrun: drop the whole line, up to its newline, rather
+			 * than dispatch a truncated verb or the line's tail. */
 			len = 0;
+			discarding = true;
 		}
 	}
 }
@@ -3132,7 +3404,10 @@ int main(void)
 	/* Use the REAL measured loop period, not the nominal CTRL_DT. On this soft-float target the
 	 * loop runs ~15 Hz (dt ~67 ms), not the 200 Hz the design assumes; feeding the fixed 5 ms made
 	 * the estimator integrate ~13x too slow, so real tilts barely registered. Measure dt each iter. */
-	int64_t t_prev = k_uptime_get();
+	/* dt from the HW cycle counter (50 kHz here, 20 us steps), NOT k_uptime_get(): whole-ms uptime
+	 * reads dt = 0 on most iterations once the loop passes ~500 Hz, and the guard below then
+	 * substitutes CTRL_DT (5 ms) -- a wrong step fed to the estimator and the controller. */
+	uint32_t cyc_prev = k_cycle_get_32();
 	int imu_miss = 0;
 	for (int iter = 0; CTRL_RUN_FOREVER || iter < CTRL_ITERS; iter++) {
 		if (!read_sensor_frame(&f)) {
@@ -3201,10 +3476,12 @@ int main(void)
 			battery_poll();
 		}
 		int64_t t_now = k_uptime_get();
-		float dt = (float)(t_now - t_prev) * 1e-3f;   /* real loop period (s) */
+		const uint32_t cyc_now = k_cycle_get_32();
+		float dt = (float)(uint32_t)(cyc_now - cyc_prev) / (float)sys_clock_hw_cycles_per_sec();
 		if (dt <= 0.0f || dt > 0.5f) dt = CTRL_DT;     /* first-iter / stall guard */
-		t_prev = t_now;
+		cyc_prev = cyc_now;
 		uint32_t _pe = PF_NOW();
+		est.set_airborne(g_armed);   /* floor-step handling (ToF) only while flying; cleared on the ground */
 		est.update(f.accel, f.gyro, f.flow, f.flow_valid, f.height, f.tof_valid,
 			   f.baro_rel, f.baro_valid, dt);
 		est.get_state(state);
@@ -3235,6 +3512,7 @@ int main(void)
 
 			if (g_armed && !guard_announced) {
 				guard_announced = true;
+				if (ROSE_TELEM_CONSOLE)   /* ~10 ms polled, at the instant of takeoff */
 				printk("flight_controller: ENVELOPE GUARD ARMED -- watching accel tilt, "
 				       "free-fall, impact, est tilt, rate, velocity, height\n");
 			}
@@ -3477,6 +3755,9 @@ int main(void)
 			pf_est = pf_ctrl = pf_send = pf_flow = pf_iters = 0;
 		}
 #endif
+#if HAVE_ESP_UART && !ESP_UART_IS_CONSOLE
+		esp_uart_drain();   /* every iteration: a few bytes, never waits */
+#endif
 #if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID
 		if (0) {   /* grid-validation build: suppress periodic telemetry so GRID lines own the console */
 #else
@@ -3498,7 +3779,9 @@ int main(void)
 			 * (converted), acc is straight out of gravity with no estimator involved. Watch
 			 * those two, not roll/pitch, when checking the guard. Fields are appended rather
 			 * than substituted so existing parsers keep working. */
-			printk(TELEM_LINE_FMT, TELEM_LINE_ARGS);
+			if (ROSE_TELEM_CONSOLE) {
+				printk(TELEM_LINE_FMT, TELEM_LINE_ARGS);
+			}
 #if HAVE_ESP_UART
 #if !ESP_UART_IS_CONSOLE
 			/*
@@ -3542,7 +3825,7 @@ int main(void)
 			 * the line runs ~290 bytes and a 256-byte buffer would silently truncate
 			 * the end of it -- which is exactly where the new fields are.
 			 */
-			static char esp_line[384];
+			static char esp_line[448];
 			int esp_len = snprintf(esp_line, sizeof(esp_line),
 					       TELEM_LINE_FMT, TELEM_LINE_ARGS);
 #if defined(ROSE_ESP_LINK_ACTIVE)
@@ -3577,8 +3860,9 @@ int main(void)
 #endif
 			if (esp_len > 0) {
 				size_t length = MIN((size_t)esp_len, sizeof(esp_line) - 1U);
-				esp_uart_write_line(esp_line, length);
+				esp_uart_queue_line(esp_line, length);
 			}
+			g_gz_peak = 0.0f; g_amag_peak = 0.0f;   /* peaks are per telemetry line */
 #if defined(ROSE_ESP_LINK_ACTIVE)
 			esp_motors_keepalive();   /* see the note above the first one */
 #endif
@@ -3598,7 +3882,7 @@ int main(void)
 #if defined(ROSE_FLOW) && ROSE_FLOW
 			/* Flow-derived body velocity (m/s) + estimator vx/vy, so bench validation shows the
 			 * flow feeding through to the estimated velocity. squal/ok = raw sample quality/gate. */
-			{
+			if (ROSE_TELEM_CONSOLE) {   /* console-only line: ~11 ms polled, skip in flight */
 				float ax, ay; int sq; bool fv;
 				flow_get(&ax, &ay, &sq, &fv);   /* ax/ay = RAW angular flow (rad/s), pre-comp */
 				/* aRaw = raw angular flow; gyro = body roll/pitch rate (what gyro-comp subtracts);
