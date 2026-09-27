@@ -6,6 +6,7 @@
  * (samples/riskybird/pmw3901_test) with the optimized busy_wait_us read path (~285 us/read).
  */
 #include "flow.h"
+#include "fc_shared_math.h"
 #include "pmw3901.h"
 
 #include <zephyr/kernel.h>
@@ -147,20 +148,11 @@ static void flow_thread_fn(void *a, void *b, void *c)
 		t_prev = t_now;
 
 		if (rc == 0 && dt > 1e-4f && dt < 0.5f) {
-			/* remap sensor deltas -> drone body frame, convert counts -> angular rate (rad/s).
-			 * drone +x (fwd) = -deltaX ; drone +y (left) = +deltaY  (validated on HW). */
-			float ax = -(float)m.deltaX * FLOW_RAD_PER_COUNT / dt;
-			float ay =  (float)m.deltaY * FLOW_RAD_PER_COUNT / dt;
-			/* Per-sample low-pass at the sensor rate. k = 1 - exp(-dt/tau): a longer tau (smaller k)
-			 * smooths harder + lags more. tau=0 -> k=1 -> pass-through (raw). Seeded on first sample. */
-			static float axf, ayf; static bool lp_seed;
-			if (!lp_seed) { axf = ax; ayf = ay; lp_seed = true; }
-			float kx = (FLOW_LP_TAU_X > 0.0f) ? (1.0f - expf(-dt / FLOW_LP_TAU_X)) : 1.0f;
-			float ky = (FLOW_LP_TAU_Y > 0.0f) ? (1.0f - expf(-dt / FLOW_LP_TAU_Y)) : 1.0f;
-			axf += kx * (ax - axf);
-			ayf += ky * (ay - ayf);
-			k_mutex_lock(&flow_mtx, K_FOREVER);
-			g_ax = axf; g_ay = ayf;
+            static struct fc_flow_filter filtered;
+            fc_flow_counts(&filtered, m.deltaX, m.deltaY, dt, FLOW_RAD_PER_COUNT,
+                           FLOW_LP_TAU_X, FLOW_LP_TAU_Y);
+            k_mutex_lock(&flow_mtx, K_FOREVER);
+            g_ax = filtered.x; g_ay = filtered.y;
 			g_squal = m.squal; g_squal_ok = (m.squal >= FLOW_MIN_SQUAL);
 			g_last_ms = k_uptime_get();
 			g_seq++;

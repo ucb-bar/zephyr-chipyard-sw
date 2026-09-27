@@ -34,6 +34,7 @@
 #include "controller.hpp"
 #include "flightlog.h"
 #include "side_tof.h"           /* side-ToF wall "bumper" (ROSE_BUMPER); no-op if disabled */
+#include "fc_shared_math.h"
 #include "flow.h"               /* PMW3901 optical flow (ROSE_FLOW); no-op if disabled */
 #if defined(CONFIG_WIFI)
 #include "telem_wifi.h"         /* WiFi SoftAP UDP telemetry downlink (opt-in telem.conf; see plan) */
@@ -833,7 +834,7 @@ static inline void battery_poll(void) { }
  * and atanf() simply approaches pi/2, so a tumbling frame reads pi rather than wrapping. */
 static inline float tilt_rad_from_gibbs(const float *state)
 {
-	return 2.0f * atanf(sqrtf(state[3] * state[3] + state[4] * state[4]));
+    return fc_tilt_rad(state);
 }
 
 #ifndef SAFE_MAX_TILT_RAD
@@ -1118,156 +1119,21 @@ static volatile uint32_t g_guard_acc_skips;
  * Returns a reason or NULL. *need_ms is how long THIS reason must persist, *meas / *unit are the
  * number that tripped it, for the console.
  */
-static const char *accel_envelope(const float *accel, int *need_ms, float *meas, const char **unit)
-{
-	const float ax = accel[0], ay = accel[1], az = accel[2];
-	const float horiz2 = ax * ax + ay * ay;
-	const float total2 = horiz2 + az * az;
-	const float amag = sqrtf(total2);
+#include "fc_shared_guard.hpp"
+static FcEnvelopeGuard g_envelope_guard;
 
-	g_guard_amag = amag;
-
-	/* Free fall first: it is the most urgent and the only one tilt can never see. A drone dropped
-	 * flat stays flat the whole way down. Tested on a low-passed |a| when SAFE_FREEFALL_LP_TAU_MS
-	 * is set, so motor vibration averages out (see SAFE_FREEFALL_DEBOUNCE_MS). */
-	float ff_amag = amag;
-#if SAFE_FREEFALL_LP_TAU_MS > 0
-	{
-		static float lp = 9.80665f;          /* start at 1 g: no false trip on the first sample */
-		static int64_t lp_prev;
-		const int64_t now = k_uptime_get();
-		const float dt_ms = lp_prev ? (float)(now - lp_prev) : 0.0f;
-
-		lp_prev = now;
-		lp += (1.0f - expf(-dt_ms / (float)(SAFE_FREEFALL_LP_TAU_MS))) * (amag - lp);
-		ff_amag = lp;
-	}
-#endif
-	if (ff_amag < (SAFE_FREEFALL_MPS2)) {
-		*need_ms = SAFE_FREEFALL_DEBOUNCE_MS;
-		*meas = ff_amag; *unit = "m/s2 |a| (free-fall test)";
-		return "free-fall";
-	}
-	if (total2 > (SAFE_IMPACT_MPS2) * (SAFE_IMPACT_MPS2)) {
-		*need_ms = SAFE_SHOCK_DEBOUNCE_MS;
-		*meas = amag; *unit = "m/s2 |a|";
-		return "impact";
-	}
-	/* Direction is attitude only while the magnitude is plausibly gravity. Outside the band the
-	 * two tests above own the case and this one stays quiet rather than guessing. */
-	if (amag >= (SAFE_ACC_TRUST_LO_MPS2) && amag <= (SAFE_ACC_TRUST_HI_MPS2)) {
-		/* tilt from vertical, straight out of gravity: sin(theta) = |horizontal| / |a|. */
-		const float tilt = asinf(sqrtf(horiz2 / total2));
-
-		g_guard_tilt_rad = tilt;
-		if (tilt > (SAFE_ACC_TILT_RAD)) {
-			*need_ms = SAFE_DEBOUNCE_MS;
-			*meas = tilt * (180.0f / 3.14159265f); *unit = "deg accel-tilt";
-			return "accel-tilt";
-		}
-	} else {
-		/* Out of the trust band: publish "unknown, assume the worst" rather than leaving the
-		 * last good value in place. The arm gate reads this, and a stale level reading is the
-		 * one way a cross-check can silently permit what it was added to forbid. */
-		g_guard_tilt_rad = 3.14159265f;
-		g_guard_acc_skips++;
-	}
-	return NULL;
-}
-
-/*
- * Full envelope: the accelerometer tests above, then the estimator-based ones.
- *
- * Attitude is compared in REAL RADIANS now. state[3..4] are Rodrigues parameters, r = tan(theta/2)
- * per axis -- comparing them directly against a constant named *_RAD is the bug that let a
- * 87-degree hand rotation sit under a limit everyone believed was 57 degrees and was actually 90.
- * See the long note above the thresholds.
- */
 static const char *safety_violation(const float *state, const float *gyro, const float *accel,
-				    int *need_ms, float *meas, const char **unit)
+                                    int *need_ms, float *meas, const char **unit)
 {
-	const char *why;
-	float tilt;
-
-	/* Filtered every call, before any early return, so the average never skips samples. */
-	static float   yaw_lp;
-	static float   vel_lp[3];
-	static int64_t yaw_lp_t;
-	{
-		const int64_t t = k_uptime_get();
-		const float dt_ms = yaw_lp_t ? (float)(t - yaw_lp_t) : 0.0f;
-		const float a = (SAFE_YAW_LP_TAU_MS > 0) ? 1.0f - expf(-dt_ms / (float)(SAFE_YAW_LP_TAU_MS)) : 1.0f;
-
-		yaw_lp += a * (gyro[2] - yaw_lp);
-		yaw_lp_t = t;
-
-		const float av = (SAFE_VEL_LP_TAU_MS > 0) ? 1.0f - expf(-dt_ms / (float)(SAFE_VEL_LP_TAU_MS)) : 1.0f;
-
-		for (int i = 0; i < 3; i++) {
-			vel_lp[i] += av * (state[6 + i] - vel_lp[i]);
-		}
-	}
-
-	*need_ms = SAFE_DEBOUNCE_MS;
-	*meas = 0.0f;
-	*unit = "";
-
-	why = accel_envelope(accel, need_ms, meas, unit);
-	if (why != NULL) {
-		return why;
-	}
-	*need_ms = SAFE_DEBOUNCE_MS;
-
-	tilt = tilt_rad_from_gibbs(state);
-	g_guard_est_rad = tilt;
-	if (tilt > SAFE_MAX_TILT_RAD) {
-		*meas = tilt * (180.0f / 3.14159265f); *unit = "deg est-tilt";
-		return "tilt";
-	}
-	if (fabsf(gyro[0]) > SAFE_MAX_RATE_RADPS || fabsf(gyro[1]) > SAFE_MAX_RATE_RADPS ||
-	    fabsf(gyro[2]) > SAFE_MAX_RATE_RADPS) {
-		float m = fabsf(gyro[0]);
-
-		if (fabsf(gyro[1]) > m) m = fabsf(gyro[1]);
-		if (fabsf(gyro[2]) > m) m = fabsf(gyro[2]);
-		*meas = m; *unit = "rad/s";
-		return "rate";
-	}
-	if (fabsf(yaw_lp) > SAFE_MAX_YAW_RATE_RADPS) {
-		*need_ms = SAFE_YAW_DEBOUNCE_MS;
-		*meas = fabsf(yaw_lp); *unit = "rad/s yaw (low-passed)";
-		return "yaw-spin";
-	}
-	if (fabsf(vel_lp[0]) > SAFE_MAX_VEL_MPS || fabsf(vel_lp[1]) > SAFE_MAX_VEL_MPS ||
-	    fabsf(vel_lp[2]) > SAFE_MAX_VEL_MPS) {
-		float m = fabsf(vel_lp[0]);
-
-		if (fabsf(vel_lp[1]) > m) m = fabsf(vel_lp[1]);
-		if (fabsf(vel_lp[2]) > m) m = fabsf(vel_lp[2]);
-		*meas = m; *unit = "m/s";
-		return "velocity";
-	}
-	if (state[2] > SAFE_MAX_HEIGHT_M) {   /* z = altitude (up); one-sided ceiling guard */
-		*meas = state[2]; *unit = "m";
-		return "height";
-	}
-#if ROSE_BATT_SENSE && !ROSE_BATT_REPORT_ONLY
-	/* Low-voltage cutoff: only a VALID reading (>= 1.0 V) below the threshold trips -- a garbage-low
-	 * read (< 1.0 V, sensor fault) is ignored so it can't false-estop mid-flight. Debounced by the
-	 * caller like every other reason.
-	 *
-	 * That guard is sufficient against a reading that is garbage-LOW and nothing else. It does NOT
-	 * protect against a plausible wrong reading: a mis-scaled or wrong-channel result that lands in
-	 * [1.0, 3.2) V trips this exactly as a flat pack would, and from a remote console the two are
-	 * indistinguishable. That is why a mode whose scaling is unverified sets ROSE_BATT_REPORT_ONLY
-	 * and compiles this test out entirely rather than relying on the >= 1.0 V floor. */
-	if (g_vbat >= 1.0f && g_vbat < BATT_CUTOFF_V) {
-		*meas = g_vbat; *unit = "V";
-		return "battery";
-	}
-#endif
-	return NULL;
+    const char *why = g_envelope_guard.evaluate(state, gyro, accel, k_uptime_get(), g_vbat,
+                                               need_ms, meas, unit);
+    g_guard_tilt_rad = g_envelope_guard.g_guard_tilt_rad;
+    g_guard_est_rad = g_envelope_guard.g_guard_est_rad;
+    g_guard_amag = g_envelope_guard.g_guard_amag;
+    g_guard_acc_skips = g_envelope_guard.g_guard_acc_skips;
+    return why;
 }
+
 
 /* Say what the envelope IS, at boot, in units a human can check against a protractor. A guard
  * nobody can read is a guard nobody can verify, and this one was wrong for as long as it has
@@ -1759,68 +1625,11 @@ static_assert((float)(MOTOR_MAX_DUTY) > 0.0f && (float)(MOTOR_MAX_DUTY) <= 1.0f,
  * kind of divergence that would only show up in flight. */
 static inline void actuator_duty(const float *u, float duty[NACTIONS])
 {
-	/* Controller's normalized thrust (u in ~[-0.583, 0.417]) -> physical per-motor duty [0,1].
-	 * Battery sag compensation: multiply the raw thrust command by BATT_NOMINAL_V/g_vbat (clamped to
-	 * [1.0, BATT_SCALE_MAX]) so commanded thrust holds as the pack drains. Applied BEFORE the
-	 * anti-saturation cut and the ceiling below; batt_thrust_scale() returns 1.0 (no-op) when
-	 * battery sense is disabled or g_vbat looks invalid. */
-	const float batt_scale = batt_thrust_scale();
-	/* The ceiling the anti-saturation cut works against, IN THE UNITS duty[] carries here:
-	 *
-	 *   autoflight -- duty[] is already physical, so the ceiling is the flight cap itself.
-	 *   bench      -- duty[] is still NORMALIZED [0,1]; MOTOR_MAX_DUTY is applied as a SCALE
-	 *                 at the end. The saturation that matters on that path is therefore the
-	 *                 one at 1.0, not the one at the cap.
-	 */
 #if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
-	const float ceiling = ((float)(AUTOFLIGHT_MAX_DUTY) < 1.0f) ? (float)(AUTOFLIGHT_MAX_DUTY) : 1.0f;
+    const float ceiling = ((float)(AUTOFLIGHT_MAX_DUTY) < 1.0f) ? (float)(AUTOFLIGHT_MAX_DUTY) : 1.0f;
+    fc_actuator_duty(u, duty, batt_thrust_scale(), ceiling, true, 1.0f);
 #else
-	/* Was a hard-coded 1.0f. See the MOTOR_DUTY_CEILING note above: this is the
-	 * ceiling the collective cut works against, and it is the ONLY duty limit on
-	 * this path that preserves the roll/pitch/yaw differential. */
-	const float ceiling = (float)(MOTOR_DUTY_CEILING);
-#endif
-	float peak = 0.0f;
-
-	for (int i = 0; i < NACTIONS; i++) {
-		duty[i] = (u[i] + 0.583f) * batt_scale;
-		if (duty[i] < 0.0f) duty[i] = 0.0f;
-		/* NOTE the absence of a per-motor clamp to the ceiling here, and that it is the whole
-		 * point of this function. Clamping each motor to 1.0 at this line is what destroyed the
-		 * differential: with every u >= 0.417 (which is every iteration of a bench run that
-		 * regulates to TARGET_Z from the floor) all four raw duties exceed 1.0, all four clamp
-		 * to exactly 1.0, and four identical numbers stay identical through anything applied
-		 * afterwards -- including the cut below, which then subtracted the same amount from
-		 * four equal values and produced four equal values. Measured on the bench: u =
-		 * [1.082 0.977 1.429 1.541] -> duty = [0.100 0.100 0.100 0.100] for 1200 iterations. */
-		if (duty[i] > peak) peak = duty[i];
-	}
-	/* ATTITUDE-PRIORITY ANTI-SATURATION, on EVERY path -- not just autoflight. The collective
-	 * (altitude) thrust and the roll/pitch/yaw differentials share the same motor range. If the
-	 * peak motor would exceed the ceiling, subtract the excess from ALL FOUR: this lowers the
-	 * COLLECTIVE thrust while preserving the differential, so attitude authority always survives
-	 * -- sacrifice a little altitude, never attitude. (Per-motor clamping instead flattens the
-	 * differential once the altitude loop maxes out -> no control -> tip.) This is THE fix for the
-	 * "bad down-ToF maxes the altitude loop -> all four pin -> tip/tumble" failure: the drone
-	 * climbs LEVEL and recoverable instead.
-	 *
-	 * It is applied on the bench path too because "all four pinned at the cap" is not a safe
-	 * bench behaviour either -- it is the SAME loss of attitude authority, just at a duty too low
-	 * to demonstrate it -- and because the bench is where the flight path's saturation behaviour
-	 * has to be observable BEFORE props go on. In the unsaturated region (peak <= ceiling) this
-	 * is bit-identical to what it replaces: the cut does not run and no clamp ever fired. */
-	if (peak > ceiling) {
-		const float cut = peak - ceiling;
-		for (int i = 0; i < NACTIONS; i++) {
-			duty[i] -= cut;   /* collective cut; a low motor may go < 0 -> floored here */
-			if (duty[i] < 0.0f) duty[i] = 0.0f;
-		}
-	}
-#if !(defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT)
-	for (int i = 0; i < NACTIONS; i++) {
-		duty[i] *= MOTOR_MAX_DUTY;                 /* bench: scale [0,1] -> [0, cap] */
-		if (duty[i] > MOTOR_MAX_DUTY) duty[i] = MOTOR_MAX_DUTY;
-	}
+    fc_actuator_duty(u, duty, batt_thrust_scale(), (float)MOTOR_DUTY_CEILING, false, MOTOR_MAX_DUTY);
 #endif
 }
 
@@ -2403,27 +2212,7 @@ static volatile float g_hover_z_m     = HOVER_Z_M;
 
 /* Desired altitude vs time-since-arm (ms): ramp up -> hold -> ramp down. Returns <0 when the
  * profile is complete (caller then disarms). */
-static float autoflight_setpoint_z(int64_t t_ms)
-{
-	const int   tc = (g_t_climb_ms > 0) ? g_t_climb_ms : 1;
-	const int   th = (g_t_hover_ms > 0) ? g_t_hover_ms : 0;
-	const int   td = (g_t_descend_ms > 0) ? g_t_descend_ms : 1;
-	const float hz = g_hover_z_m;
-	if (t_ms < tc) {
-		return hz * ((float)t_ms / (float)tc);
-	}
-	t_ms -= tc;
-	if (t_ms < th) {
-		return hz;
-	}
-	t_ms -= th;
-	/* Descent + landing as ONE continuous downward ramp: from hover, reaching 0 at td and then
-	 * continuing GRADUALLY below ground at the same rate to a real touchdown; clamp at LAND_PUSH_M.
-	 * (Motor cut is height-based, in the loop.) Longer td = slower, gentler landing. */
-	float rate = hz / (float)td;
-	float sp = hz - rate * (float)t_ms;
-	return (sp < LAND_PUSH_M) ? LAND_PUSH_M : sp;
-}
+
 
 /* LAND, DON'T DROP. The envelope guard used to cut the motors for every reason, at any height. For
  * the reasons that are not themselves a fall -- velocity, height, yaw spin, battery -- a cut at
@@ -2695,6 +2484,8 @@ static float g_att_roll, g_att_pitch, g_att_yaw;   /* last estimator attitude, G
 #ifndef GBIAS_TRACK_STILL_RADPS
 #define GBIAS_TRACK_STILL_RADPS 0.10f  /* only re-track when very still (tighter than the boot-cal gate) */
 #endif
+#include "fc_shared_gyro.hpp"
+static FcGyroCalibration g_gyro_calibration;
 static float g_gyro_bias[3];           /* measured gyro bias (rad/s); 0 until the cal completes */
 /* Gyro step guard + peak telemetry. A sudden yaw kick of ~250 deg/s preceded two upsets
  * (flight-logs T10 at 0.2 m, T27 at 1.4 m) with nothing commanding it. The ~28 Hz telemetry cannot
@@ -2716,9 +2507,6 @@ static volatile bool g_gyro_cal_done;  /* startup bias cal finished -> OK to arm
 /* Gyro-cal accumulators at FILE scope so a soft-reset (rose_cmd_reset) can restart the cal cleanly;
  * if they stayed function-local statics, re-clearing g_gyro_cal_done would leave a stale gstill_since
  * timestamp and the recal would "complete" instantly on garbage. Zero at boot (BSS) = same as before. */
-static double  g_gcal_sum[3];
-static int     g_gcal_n;
-static int64_t g_gcal_since;
 /* Barometer reference cal -- established by averaging pressure over the SAME still startup window as
  * the gyro-bias cal (co-calibrated). Reset together so a soft-reset (rose_cmd_reset) re-cals both. */
 static double  g_bcal_sum;     /* reference-pressure accumulator (kPa) */
@@ -2740,9 +2528,7 @@ static void __attribute__((unused)) gyro_cal_restart(void)
 {
 	g_gyro_cal_done = false;
 	g_gyro_bias[0] = g_gyro_bias[1] = g_gyro_bias[2] = 0.0f;
-	g_gcal_sum[0] = g_gcal_sum[1] = g_gcal_sum[2] = 0.0;
-	g_gcal_n = 0;
-	g_gcal_since = 0;
+	g_gyro_calibration = FcGyroCalibration{};
 	g_bcal_sum = 0.0; g_bcal_n = 0; g_baro_p0 = 0.0f; g_baro_have = false;
 }
 
@@ -2786,40 +2572,15 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	/* Startup gyro-bias cal: average the (should-be-zero) gyro while still, then subtract it from
 	 * every frame so the whole chain (Mahony attitude, rate loop, flow gyro-comp) sees a debiased
 	 * rate. Pre-cal the bias is 0 (subtraction is a no-op); motors stay disarmed until it finishes. */
-	if (!g_gyro_cal_done) {
-		bool gstill = fabsf(f->gyro[0]) < GYRO_CAL_STILL_RADPS &&
-			      fabsf(f->gyro[1]) < GYRO_CAL_STILL_RADPS &&
-			      fabsf(f->gyro[2]) < GYRO_CAL_STILL_RADPS;
-		int64_t gnow = k_uptime_get();
-		if (!gstill) {
-			g_gcal_since = 0; g_gcal_sum[0] = g_gcal_sum[1] = g_gcal_sum[2] = 0.0; g_gcal_n = 0;   /* bump -> restart */
-		} else {
-			if (g_gcal_since == 0) { g_gcal_since = gnow; g_gcal_sum[0] = g_gcal_sum[1] = g_gcal_sum[2] = 0.0; g_gcal_n = 0; }
-			g_gcal_sum[0] += f->gyro[0]; g_gcal_sum[1] += f->gyro[1]; g_gcal_sum[2] += f->gyro[2]; g_gcal_n++;
-			if (gnow - g_gcal_since >= (int64_t)(GYRO_CAL_SECONDS * 1000.0f) && g_gcal_n > 0) {
-				g_gyro_bias[0] = (float)(g_gcal_sum[0] / g_gcal_n);
-				g_gyro_bias[1] = (float)(g_gcal_sum[1] / g_gcal_n);
-				g_gyro_bias[2] = (float)(g_gcal_sum[2] / g_gcal_n);
-				g_gyro_cal_done = true;
-				printk("gyro-cal: bias=[%d %d %d] millirad/s (%d samples) -- ready to arm\n",
-				       (int)(g_gyro_bias[0] * 1000.0f), (int)(g_gyro_bias[1] * 1000.0f),
-				       (int)(g_gyro_bias[2] * 1000.0f), g_gcal_n);
-			}
-		}
-	}
-	/* Re-track the gyro bias to the current IMU temperature while parked (see GBIAS_TRACK_* above).
-	 * Uses the raw (pre-subtraction) rate: when the board is still, that rate IS the live bias. */
-	if (g_gyro_cal_done && !g_armed &&
-	    fabsf(f->gyro[0] - g_gyro_bias[0]) < GBIAS_TRACK_STILL_RADPS &&
-	    fabsf(f->gyro[1] - g_gyro_bias[1]) < GBIAS_TRACK_STILL_RADPS &&
-	    fabsf(f->gyro[2] - g_gyro_bias[2]) < GBIAS_TRACK_STILL_RADPS) {
-		g_gyro_bias[0] += GBIAS_TRACK_GAIN * (f->gyro[0] - g_gyro_bias[0]);
-		g_gyro_bias[1] += GBIAS_TRACK_GAIN * (f->gyro[1] - g_gyro_bias[1]);
-		g_gyro_bias[2] += GBIAS_TRACK_GAIN * (f->gyro[2] - g_gyro_bias[2]);
-	}
-	f->gyro[0] -= g_gyro_bias[0];
-	f->gyro[1] -= g_gyro_bias[1];
-	f->gyro[2] -= g_gyro_bias[2];
+    const bool cal_was_done = g_gyro_cal_done;
+    g_gyro_calibration.update(f->gyro, g_armed, k_uptime_get());
+    g_gyro_cal_done = g_gyro_calibration.done;
+    for (int i=0; i<3; ++i) g_gyro_bias[i] = g_gyro_calibration.bias[i];
+    if (!cal_was_done && g_gyro_cal_done) {
+        printk("gyro-cal: bias=[%d %d %d] millirad/s (%d samples) -- ready to arm\n",
+               (int)(g_gyro_bias[0]*1000.0f), (int)(g_gyro_bias[1]*1000.0f),
+               (int)(g_gyro_bias[2]*1000.0f), g_gyro_calibration.n);
+    }
 	{
 		const float gz_abs = fabsf(f->gyro[2]);
 		const float amag = sqrtf(f->accel[0] * f->accel[0] + f->accel[1] * f->accel[1] +
@@ -2987,17 +2748,7 @@ static bool read_sensor_frame(struct sensor_frame *f)
 			/* f->height is the RAW slant (the estimator tilt-corrects for altitude on its own fresh
 			 * R[8]); the flow needs VERTICAL height too, so correct a local copy on the cached attitude.
 			 * cos(tilt) = R_zz = (1 - qx^2 - qy^2 + qz^2)/(1 + qx^2 + qy^2 + qz^2) from the Gibbs state. */
-			float ga = g_att_roll, gb = g_att_pitch, gc = g_att_yaw;
-			float ct = (1.0f - ga*ga - gb*gb + gc*gc) / (1.0f + ga*ga + gb*gb + gc*gc);
-			float h = f->height * (ct > 0.0f ? ct : 0.0f);
-			/* Clamp the flow-derived velocity to a physical bound. v = angular_flow * height, so
-			 * at large ToF height flow NOISE is amplified into >10 m/s spikes (seen at h=2.5 m);
-			 * feeding those to the estimator (which then gates them as outliers -> predict-only ->
-			 * runaway) is what makes est-v blow up. The drone can't translate faster than this. */
-			const float FLOW_VEL_MAX = 3.0f;
-			float vfx = ax * h, vfy = ay * h;   /* body-frame horizontal velocity (m/s) */
-			f->flow[0] = vfx >  FLOW_VEL_MAX ?  FLOW_VEL_MAX : (vfx < -FLOW_VEL_MAX ? -FLOW_VEL_MAX : vfx);
-			f->flow[1] = vfy >  FLOW_VEL_MAX ?  FLOW_VEL_MAX : (vfy < -FLOW_VEL_MAX ? -FLOW_VEL_MAX : vfy);
+            fc_flow_velocity(ax, ay, f->height, g_att_roll, g_att_pitch, g_att_yaw, f->flow);
 			f->flow_valid = true;
 		} else {
 			f->flow[0] = f->flow[1] = 0.0f;
@@ -3988,14 +3739,8 @@ int main(void)
 			if (!g_armed || g_estop) {
 				why = NULL;   /* keep looking and keep publishing; do not latch */
 			}
-			if (why == NULL) {
-				viol_since = 0; viol_count = 0;
-			} else {
-				if (viol_since == 0) { viol_since = t_now; viol_count = 0; }
-				viol_count++;
-			}
-			const bool trip = why != NULL && viol_count >= SAFE_DEBOUNCE_MIN_SAMPLES &&
-					  (t_now - viol_since) >= (int64_t)need_ms;
+            const bool trip = fc_guard_dwell(why != NULL, t_now, need_ms,
+                                              SAFE_DEBOUNCE_MIN_SAMPLES, &viol_since, &viol_count);
 			if (trip && soft_land_instead(why, state[2], t_now)) {
 				viol_since = 0; viol_count = 0;
 			} else if (trip) {
@@ -4110,40 +3855,23 @@ int main(void)
 					     && batt_ok_to_arm();                                   /* refuse to arm on a low pack */
 				int64_t hold_ms = PLACE_CONFIRM_MS;
 #endif
-				if (ready) {
-					if (arm_since == 0) {
-						arm_since = t_now;
-					} else if (t_now - arm_since >= hold_ms) {
-						g_armed = true;
-						g_flight_start_ms = t_now;
-						g_land_abort_ms = 0;
-						printk("AUTOFLIGHT: ARMED -- taking off (hover %d mm, cap %d ms)\n",
-						       (int)(g_hover_z_m * 1000.0f), g_flight_max_ms);
-					}
-				} else {
-					arm_since = 0;   /* condition broke -> restart the hold timer */
-				}
+                if (fc_arm_dwell(ready, t_now, hold_ms, &arm_since)) {
+                    g_armed = true;
+                    g_flight_start_ms = t_now;
+                    g_land_abort_ms = 0;
+                    printk("AUTOFLIGHT: ARMED -- taking off (hover %d mm, cap %d ms)\n",
+                           (int)(g_hover_z_m * 1000.0f), g_flight_max_ms);
+                }
 				g_arming = (arm_since != 0 && !g_armed);   /* status LED: countdown in progress */
 			}
 			if (g_armed) {
 				int64_t tf = t_now - g_flight_start_ms;
-				float zsp = autoflight_setpoint_z(tf);
-				/* Landing phase = past the descend ramp (setpoint now LAND_PUSH_M). Cut motors on
-				 * ACTUAL touchdown (height-based), not a fixed time, so it never disarms mid-air. */
-				bool in_landing = tf >= (int64_t)(g_t_climb_ms + g_t_hover_ms + g_t_descend_ms);
-				int64_t cap_ms = g_flight_max_ms;
-				if (g_land_abort_ms != 0) {
-					/* Abort landing: ramp down from where it began, never above the profile, and
-					 * give the cap room to finish the descent (+2 s) rather than cut mid-air. */
-					const float ta = (float)(t_now - g_land_abort_ms) * 0.001f;
-					float za = g_land_abort_z - (float)(LAND_ABORT_MPS) * ta;
-					if (za < LAND_PUSH_M) { za = LAND_PUSH_M; }
-					if (za < zsp) { zsp = za; }
-					in_landing = in_landing || za <= 0.0f;
-					const int64_t need = (g_land_abort_ms - g_flight_start_ms) + 2000 +
-						(int64_t)((g_land_abort_z - LAND_PUSH_M) / (float)(LAND_ABORT_MPS) * 1000.0f);
-					if (need > cap_ms) { cap_ms = need; }
-				}
+                const fc_profile_result profile = fc_flight_profile(t_now, g_flight_start_ms,
+                    g_t_climb_ms, g_t_hover_ms, g_t_descend_ms, g_hover_z_m, LAND_PUSH_M,
+                    g_flight_max_ms, g_land_abort_ms, g_land_abort_z, LAND_ABORT_MPS);
+                float zsp = profile.z;
+                bool in_landing = profile.landing;
+                int64_t cap_ms = profile.cap_ms;
 				/* Either height counts: the estimate can sit well above the ToF after a rejected
 				 * floor step (flight-logs T85: z 1.01 m against ToF 0.53 m on the way down). */
 				bool landed = in_landing && f.tof_valid &&
