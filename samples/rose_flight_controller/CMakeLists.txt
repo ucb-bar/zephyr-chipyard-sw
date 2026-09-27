@@ -236,6 +236,14 @@ set(ROSE_ESP_MOTORS 0 CACHE STRING "1=send motor duty frames on uart1 instead of
 set(ROSE_MOTOR_LINK_DIR "" CACHE STRING "riskybird integration/zephyr/motor_link directory")
 set(ROSE_ESP_MOTORS_HZ 50 CACHE STRING "motor duty frame rate on the ESP link, Hz")
 
+# One HM01B0 still at the top of an autoflight. The capture sequence is riskybird's
+# integration/zephyr/camera (split prepare/arm/done/finish so the control loop only
+# ever pays four register writes); the sensor register map is camera_bringup's.
+# Off by default, so every existing preset builds byte-identical.
+set(ROSE_CAMERA 0 CACHE STRING "1=capture one camera frame mid-hover (autoflight)")
+set(ROSE_CAMERA_DIR "" CACHE STRING
+  "riskybird integration/zephyr/camera directory (default: RB_ROOT/integration/zephyr/camera)")
+
 target_sources(app PRIVATE
   src/main.cpp
   src/estimator_complementary.cpp
@@ -278,7 +286,28 @@ target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_ESP_MOTORS=${ROSE_ESP_MOTORS} ROSE_ESP_MOTORS_HZ=${ROSE_ESP_MOTORS_HZ}
   ROSE_FLIGHT_COMMIT=${ROSE_FLIGHT_COMMIT}
   ROSE_MOTOR_WINDOW_MS=${ROSE_MOTOR_WINDOW_MS}
-  ROSE_COMMIT_MAX_MS=${ROSE_COMMIT_MAX_MS})
+  ROSE_COMMIT_MAX_MS=${ROSE_COMMIT_MAX_MS}
+  ROSE_CAMERA=${ROSE_CAMERA})
+
+if(ROSE_CAMERA)
+  # Named, for the same reason as ROSE_MOTOR_LINK_DIR below: this sample is built from a
+  # submodule and has no fixed path to the riskybird checkout around it.
+  if(NOT ROSE_CAMERA_DIR)
+    if(NOT RB_ROOT)
+      message(FATAL_ERROR
+        "ROSE_CAMERA=1 needs -DROSE_CAMERA_DIR=<riskybird>/integration/zephyr/camera (or -DRB_ROOT)")
+    endif()
+    set(ROSE_CAMERA_DIR ${RB_ROOT}/integration/zephyr/camera)
+  endif()
+  target_sources(app PRIVATE ${ROSE_CAMERA_DIR}/src/camera.c)
+  target_include_directories(app PRIVATE
+    ${ROSE_CAMERA_DIR}/include
+    ${ROSE_CAMERA_DIR}/../../../workloads/camera_bringup/src)   # hm01b0.h
+  # Fail a dead sensor ~150 ms after MODE_SELECT instead of after the 6 s AE settle, so
+  # photo_prepare() can reset and retry at boot (see ROSE_PHOTO_TRIES in main.cpp). The
+  # 100 ms is camera_photo's proven MODE_SELECT -> PCLK check timing.
+  target_compile_definitions(app PRIVATE RB_CAMERA_EARLY_PCLK_MS=100)
+endif()
 
 # Only forwarded when explicitly set. Passing ROSE_UART_CMD= (empty) would expand
 # to `-DROSE_UART_CMD=` and turn `#if ROSE_UART_CMD` into a syntax error, so the

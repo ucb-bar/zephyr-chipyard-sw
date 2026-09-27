@@ -845,8 +845,30 @@ static inline float tilt_rad_from_gibbs(const float *state)
 #ifndef SAFE_MAX_RATE_RADPS
 #define SAFE_MAX_RATE_RADPS 10.0f    /* ~573 deg/s: a violent tumble */
 #endif
+/* Sustained YAW spin, on gyro z low-passed (tau SAFE_YAW_LP_TAU_MS) and held SAFE_YAW_DEBOUNCE_MS.
+ * flight-logs T81/T82 (2026-09-25): a yaw torque larger than the YAW_AUTH_FRAC clamp spun the frame
+ * at ~2 rad/s from liftoff; at 8 cm the legs caught the floor and it tipped (97 deg) a second later,
+ * long before the 10 rad/s tumble limit. Replayed over every armed trial of 09-23..25: good flights
+ * never held more than 0.9 rad/s for 200 ms; T02/T04/T31/T82 held 1.8..4.1. Default = the tumble
+ * limit, so builds that have flown are unchanged. */
+#ifndef SAFE_MAX_YAW_RATE_RADPS
+#define SAFE_MAX_YAW_RATE_RADPS SAFE_MAX_RATE_RADPS
+#endif
+#ifndef SAFE_YAW_LP_TAU_MS
+#define SAFE_YAW_LP_TAU_MS  80
+#endif
+#ifndef SAFE_YAW_DEBOUNCE_MS
+#define SAFE_YAW_DEBOUNCE_MS SAFE_DEBOUNCE_MS
+#endif
 #ifndef SAFE_MAX_VEL_MPS
 #define SAFE_MAX_VEL_MPS    2.5f     /* runaway translational velocity */
+#endif
+/* Velocity guard on low-passed velocity (tau ms; 0 = raw, as flown before). Optical flow at 1.5 m
+ * reads +-3 m/s spikes that no 50 g quad can reach in 100 ms (flight-logs T91: vy -1.0 -> -3.3 in
+ * 130 ms at 10 deg tilt, would need ~2 g sideways). Replayed over every armed trial: tau 300 ms,
+ * no trip; raw, T91 trips. A real runaway at > 2 m/s lasts far longer than 300 ms. */
+#ifndef SAFE_VEL_LP_TAU_MS
+#define SAFE_VEL_LP_TAU_MS  0
 #endif
 #ifndef SAFE_MAX_HEIGHT_M
 #define SAFE_MAX_HEIGHT_M   2.0f     /* altitude ceiling: cut before hitting the ceiling */
@@ -932,6 +954,21 @@ static inline float tilt_rad_from_gibbs(const float *state)
 #endif
 #ifndef SAFE_SHOCK_DEBOUNCE_MS
 #define SAFE_SHOCK_DEBOUNCE_MS 40
+#endif
+/*
+ * Free fall, separately from impact. T81 (flight-logs, 2026-09-25): at 1.47 m, climbing smoothly
+ * on the ToF, the free-fall test cut the motors -- |a| was swinging 2.2..17.8 m/s2 with the motors
+ * at 0.85-0.89 duty on a sagging pack, and a 40 ms dip below 0.4 g read as "falling". A real drop
+ * loses gravity for its whole length (~550 ms from 1.5 m), so the test can afford to ask for a
+ * SUSTAINED loss: |a| is low-passed for this test only (tau in ms; 0 = raw, the old behaviour) and
+ * given its own dwell. Impact keeps the short raw test -- an impact IS a short spike.
+ * Defaults reproduce the old guard exactly; a preset opts in.
+ */
+#ifndef SAFE_FREEFALL_DEBOUNCE_MS
+#define SAFE_FREEFALL_DEBOUNCE_MS SAFE_SHOCK_DEBOUNCE_MS
+#endif
+#ifndef SAFE_FREEFALL_LP_TAU_MS
+#define SAFE_FREEFALL_LP_TAU_MS 0
 #endif
 #ifndef SAFE_DEBOUNCE_MIN_SAMPLES
 #define SAFE_DEBOUNCE_MIN_SAMPLES 2
@@ -1091,10 +1128,24 @@ static const char *accel_envelope(const float *accel, int *need_ms, float *meas,
 	g_guard_amag = amag;
 
 	/* Free fall first: it is the most urgent and the only one tilt can never see. A drone dropped
-	 * flat stays flat the whole way down. */
-	if (total2 < (SAFE_FREEFALL_MPS2) * (SAFE_FREEFALL_MPS2)) {
-		*need_ms = SAFE_SHOCK_DEBOUNCE_MS;
-		*meas = amag; *unit = "m/s2 |a|";
+	 * flat stays flat the whole way down. Tested on a low-passed |a| when SAFE_FREEFALL_LP_TAU_MS
+	 * is set, so motor vibration averages out (see SAFE_FREEFALL_DEBOUNCE_MS). */
+	float ff_amag = amag;
+#if SAFE_FREEFALL_LP_TAU_MS > 0
+	{
+		static float lp = 9.80665f;          /* start at 1 g: no false trip on the first sample */
+		static int64_t lp_prev;
+		const int64_t now = k_uptime_get();
+		const float dt_ms = lp_prev ? (float)(now - lp_prev) : 0.0f;
+
+		lp_prev = now;
+		lp += (1.0f - expf(-dt_ms / (float)(SAFE_FREEFALL_LP_TAU_MS))) * (amag - lp);
+		ff_amag = lp;
+	}
+#endif
+	if (ff_amag < (SAFE_FREEFALL_MPS2)) {
+		*need_ms = SAFE_FREEFALL_DEBOUNCE_MS;
+		*meas = ff_amag; *unit = "m/s2 |a| (free-fall test)";
 		return "free-fall";
 	}
 	if (total2 > (SAFE_IMPACT_MPS2) * (SAFE_IMPACT_MPS2)) {
@@ -1138,6 +1189,25 @@ static const char *safety_violation(const float *state, const float *gyro, const
 	const char *why;
 	float tilt;
 
+	/* Filtered every call, before any early return, so the average never skips samples. */
+	static float   yaw_lp;
+	static float   vel_lp[3];
+	static int64_t yaw_lp_t;
+	{
+		const int64_t t = k_uptime_get();
+		const float dt_ms = yaw_lp_t ? (float)(t - yaw_lp_t) : 0.0f;
+		const float a = (SAFE_YAW_LP_TAU_MS > 0) ? 1.0f - expf(-dt_ms / (float)(SAFE_YAW_LP_TAU_MS)) : 1.0f;
+
+		yaw_lp += a * (gyro[2] - yaw_lp);
+		yaw_lp_t = t;
+
+		const float av = (SAFE_VEL_LP_TAU_MS > 0) ? 1.0f - expf(-dt_ms / (float)(SAFE_VEL_LP_TAU_MS)) : 1.0f;
+
+		for (int i = 0; i < 3; i++) {
+			vel_lp[i] += av * (state[6 + i] - vel_lp[i]);
+		}
+	}
+
 	*need_ms = SAFE_DEBOUNCE_MS;
 	*meas = 0.0f;
 	*unit = "";
@@ -1163,12 +1233,17 @@ static const char *safety_violation(const float *state, const float *gyro, const
 		*meas = m; *unit = "rad/s";
 		return "rate";
 	}
-	if (fabsf(state[6]) > SAFE_MAX_VEL_MPS || fabsf(state[7]) > SAFE_MAX_VEL_MPS ||
-	    fabsf(state[8]) > SAFE_MAX_VEL_MPS) {
-		float m = fabsf(state[6]);
+	if (fabsf(yaw_lp) > SAFE_MAX_YAW_RATE_RADPS) {
+		*need_ms = SAFE_YAW_DEBOUNCE_MS;
+		*meas = fabsf(yaw_lp); *unit = "rad/s yaw (low-passed)";
+		return "yaw-spin";
+	}
+	if (fabsf(vel_lp[0]) > SAFE_MAX_VEL_MPS || fabsf(vel_lp[1]) > SAFE_MAX_VEL_MPS ||
+	    fabsf(vel_lp[2]) > SAFE_MAX_VEL_MPS) {
+		float m = fabsf(vel_lp[0]);
 
-		if (fabsf(state[7]) > m) m = fabsf(state[7]);
-		if (fabsf(state[8]) > m) m = fabsf(state[8]);
+		if (fabsf(vel_lp[1]) > m) m = fabsf(vel_lp[1]);
+		if (fabsf(vel_lp[2]) > m) m = fabsf(vel_lp[2]);
 		*meas = m; *unit = "m/s";
 		return "velocity";
 	}
@@ -1208,9 +1283,13 @@ static void safety_banner(void)
 	       (int)((SAFE_MAX_TILT_RAD) * (180.0f / 3.14159265f) + 0.5f),
 	       (int)(SAFE_MAX_RATE_RADPS),
 	       FP3((float)(SAFE_MAX_VEL_MPS)), FP3((float)(SAFE_MAX_HEIGHT_M)));
-	printk("flight_controller: ENVELOPE GUARD -- dwell %d ms (%d ms for free-fall/impact), "
-	       "min %d samples; ACTIVE ONLY WHILE ARMED\n",
+	printk("flight_controller: ENVELOPE GUARD -- yaw spin >%s%d.%03d rad/s on gyro z low-passed tau %d ms, "
+	       "held %d ms\n", FP3((float)(SAFE_MAX_YAW_RATE_RADPS)), (int)(SAFE_YAW_LP_TAU_MS),
+	       (int)(SAFE_YAW_DEBOUNCE_MS));
+	printk("flight_controller: ENVELOPE GUARD -- dwell %d ms (%d ms for impact, %d ms for free-fall "
+	       "on |a| low-passed tau %d ms), min %d samples; ACTIVE ONLY WHILE ARMED\n",
 	       (int)(SAFE_DEBOUNCE_MS), (int)(SAFE_SHOCK_DEBOUNCE_MS),
+	       (int)(SAFE_FREEFALL_DEBOUNCE_MS), (int)(SAFE_FREEFALL_LP_TAU_MS),
 	       (int)(SAFE_DEBOUNCE_MIN_SAMPLES));
 	/* "ACTIVE ONLY WHILE ARMED" is true and is read as narrower than it is, so say what armed
 	 * MEANS in this build. In every non-autoflight mode -- which is every mode that will be
@@ -2345,6 +2424,53 @@ static float autoflight_setpoint_z(int64_t t_ms)
 	float sp = hz - rate * (float)t_ms;
 	return (sp < LAND_PUSH_M) ? LAND_PUSH_M : sp;
 }
+
+/* LAND, DON'T DROP. The envelope guard used to cut the motors for every reason, at any height. For
+ * the reasons that are not themselves a fall -- velocity, height, yaw spin, battery -- a cut at
+ * 1.5 m IS the crash: flight-logs T91 (2026-09-25) had flow noise read vy -3.3 m/s at 1.63 m, the
+ * velocity guard cut, and the drop broke a motor mount. With SAFE_SOFT_LAND=1 those reasons, above
+ * SAFE_SOFT_LAND_MIN_Z, start a descent from the current height at LAND_ABORT_MPS instead; touchdown
+ * disarms as a normal landing does. Tilt, rate, free-fall, impact and accel-tilt still cut at once,
+ * and so does anything below SAFE_SOFT_LAND_MIN_Z, where a cut is the gentle option. Default 0. */
+#ifndef SAFE_SOFT_LAND
+#define SAFE_SOFT_LAND 0
+#endif
+#ifndef SAFE_SOFT_LAND_MIN_Z
+#define SAFE_SOFT_LAND_MIN_Z 0.30f
+#endif
+#ifndef LAND_ABORT_MPS
+#define LAND_ABORT_MPS 0.30f
+#endif
+static int64_t g_land_abort_ms;   /* uptime the abort-landing began (0 = none) */
+static float   g_land_abort_z;    /* height it began from */
+
+/* Called when a guard reason has held its dwell. true = handled by landing (do not latch estop). */
+static bool soft_land_instead(const char *why, float z, int64_t t_now)
+{
+	const bool soft = why[0] == 'v' || why[0] == 'h' || why[0] == 'y' || why[0] == 'b';
+
+	if (!SAFE_SOFT_LAND || !soft || !g_armed) {
+		return false;
+	}
+	if (g_land_abort_ms != 0) {
+		return true;   /* already descending: a soft reason cannot escalate to a cut */
+	}
+	if (z <= SAFE_SOFT_LAND_MIN_Z) {
+		return false;
+	}
+	g_land_abort_ms = t_now;
+	g_land_abort_z = z;
+	printk("flight_controller: *** ABORT LANDING *** %s limit held at z=%dmm -- descending at %d mm/s "
+	       "(tilt/rate/free-fall/impact still cut)\n", why, (int)(z * 1000.0f),
+	       (int)(LAND_ABORT_MPS * 1000.0f));
+	return true;
+}
+#else
+static inline bool soft_land_instead(const char *why, float z, int64_t t_now)
+{
+	(void)why; (void)z; (void)t_now;
+	return false;
+}
 #endif
 
 struct sensor_frame {
@@ -2523,6 +2649,22 @@ static void tof_thread_fn(void *a, void *b, void *c)
  * that loop; gentle hover corrections (well under this) keep their flow. -DFLOW_GYRO_MAX=0 disables. */
 #ifndef FLOW_GYRO_MAX
 #define FLOW_GYRO_MAX 1.2f
+#endif
+/* Low-pass the gyro with the SAME time constants flow.c applies to the angular flow before it is
+ * subtracted. flow.c filters the flow (FLOW_LP_TAU_X/Y) in its sensor thread; subtracting an
+ * UNfiltered gyro from it cancels rotation only at DC. At the ~1.2 s hover rock (5 rad/s) a 0.15 s
+ * filter leaves ~60% of the rotational flow in, times height: at 1.5 m a +-10 deg rock reads as
+ * +-1.5 m/s of fake vy, which the velocity loop answers with more roll. flight-logs 09-24/25: vy
+ * tracks h*(LP(roll rate) - roll rate) with corr +0.33..+0.55 (slope ~0.6), and vx its pitch twin
+ * with the opposite sign as FLOW_GYRO_PITCH_SIGN predicts. Default 0 keeps flown builds identical. */
+#ifndef FLOW_GYRO_LP_MATCH
+#define FLOW_GYRO_LP_MATCH 0
+#endif
+#ifndef FLOW_LP_TAU_X
+#define FLOW_LP_TAU_X 0.0f       /* same defaults as flow.c */
+#endif
+#ifndef FLOW_LP_TAU_Y
+#define FLOW_LP_TAU_Y 0.0f
 #endif
 static float g_att_roll, g_att_pitch, g_att_yaw;   /* last estimator attitude, Gibbs qx/qw,qy/qw,qz/qw */
 
@@ -2816,12 +2958,31 @@ static bool read_sensor_frame(struct sensor_frame *f)
 		 * leaks into vy -> self-exciting roll<->flow oscillation). FLOW_GYRO_MAX=0 disables the gate. */
 		bool rate_ok = (FLOW_GYRO_MAX <= 0.0f) ||
 			       (fabsf(f->gyro[0]) < FLOW_GYRO_MAX && fabsf(f->gyro[1]) < FLOW_GYRO_MAX);
+		float g_pitch = f->gyro[1], g_roll = f->gyro[0];   /* the rates subtracted below */
+#if FLOW_GYRO_LP_MATCH
+		{
+			/* Every frame, valid flow or not, so the filter state never goes stale. */
+			static float gpf, grf;
+			static uint32_t gcyc;
+			static bool gseed;
+			const uint32_t c = k_cycle_get_32();
+			const float gdt = gseed ? (float)k_cyc_to_us_floor32(c - gcyc) * 1e-6f : 0.0f;
+
+			gcyc = c;
+			if (!gseed) { gpf = f->gyro[1]; grf = f->gyro[0]; gseed = true; }
+			const float kx = (FLOW_LP_TAU_X > 0.0f) ? 1.0f - expf(-gdt / FLOW_LP_TAU_X) : 1.0f;
+			const float ky = (FLOW_LP_TAU_Y > 0.0f) ? 1.0f - expf(-gdt / FLOW_LP_TAU_Y) : 1.0f;
+			gpf += kx * (f->gyro[1] - gpf);
+			grf += ky * (f->gyro[0] - grf);
+			g_pitch = gpf; g_roll = grf;
+		}
+#endif
 		if (fv && rate_ok && f->tof_valid && f->height > 0.02f) {
 			/* Gyro-compensate: strip rotation-induced flow so only translation remains. Body
 			 * rates (rad/s) share units with the angular flow. */
 #if FLOW_GYRO_COMP
-			ax -= FLOW_GYRO_PITCH_SIGN * f->gyro[1];   /* pitch rate -> forward flow */
-			ay -= FLOW_GYRO_ROLL_SIGN  * f->gyro[0];   /* roll rate  -> left flow */
+			ax -= FLOW_GYRO_PITCH_SIGN * g_pitch;   /* pitch rate -> forward flow */
+			ay -= FLOW_GYRO_ROLL_SIGN  * g_roll;    /* roll rate  -> left flow */
 #endif
 			/* f->height is the RAW slant (the estimator tilt-corrects for altitude on its own fresh
 			 * R[8]); the flow needs VERTICAL height too, so correct a local copy on the cached attitude.
@@ -3245,6 +3406,308 @@ static void uart_cmd_poll(void)
 }
 #endif /* ROSE_UART_CMD */
 
+/* =============================================================================================
+ * ROSE_CAMERA: one HM01B0 still at the top of an autoflight.
+ *
+ * The capture is split so the control loop never waits on it:
+ *   boot      photo_prepare()  MCLK, SCCB setup, streaming, AE settle -- ~6.3 s, I2C, BEFORE the
+ *                              ToF thread and the loop, so it contends with nothing.
+ *   mid-hover photo_step()     rb_camera_arm(): four register writes, no I2C, no printk. The core
+ *                              then records one frame (~118 ms at FRAME_LEN 4000, ~30 ms at the
+ *                              photo modes' 1000) by itself and holds it; every later pixel is
+ *                              discarded, so the sensor may keep streaming for the rest of the flight.
+ *   disarmed  photo_finish()   sensor standby over I2C, then ~79k register reads to drain the frame
+ *                              into rose_photo_pixels[]. Only once the motors are off (landed, flight
+ *                              cap, ESTOP) -- never in flight.
+ * The frame then sits in DDR until `rb fly photo` (hardware/flight/photo.gdb) halts the core and
+ * dumps it over JTAG. Everything a dump needs is in the rose_photo_* globals, C linkage, so the gdb
+ * script reads them by name. State values are part of that contract:
+ *   0 off, 1 preparing, 2 ready (streaming), 3 armed, 4 captured (in the core), 5 drained OK;
+ *  -1 prepare failed, -2 capture incomplete, -3 drain failed (stage/detail say why).
+ * ROSE_PHOTO_BENCH_AFTER_MS > 0 is the bench test: arm that long after boot while DISARMED and
+ * finish as soon as the frame is in, so prepare -> arm -> finish -> dump is proven with the pack
+ * out before any flight depends on it.
+ * ============================================================================================= */
+#ifndef ROSE_CAMERA
+#define ROSE_CAMERA 0
+#endif
+#if ROSE_CAMERA
+#if !(defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT)
+#error "ROSE_CAMERA triggers from the autoflight profile; build an autoflight/preset mode"
+#endif
+#include <riskybird/camera.h>
+#include <zephyr/drivers/i2c.h>
+#include <string.h>
+
+#ifndef ROSE_PHOTO_PIXELS
+#define ROSE_PHOTO_PIXELS 78892U          /* 326 x 242: the default window, as camera_photo takes */
+#endif
+#ifndef ROSE_PHOTO_BENCH_AFTER_MS
+#define ROSE_PHOTO_BENCH_AFTER_MS 0
+#endif
+#ifndef ROSE_PHOTO_WAIT_MS
+#define ROSE_PHOTO_WAIT_MS 3000           /* after disarm, how long an armed capture may still take */
+#endif
+/*
+ * PREPARE IN THE CONTEXT THE CAMERA WAS PROVEN IN. The first two photo-bench boots (2026-09-25,
+ * results/fly/20260925-145849 and -150000) both failed "pclk" after every SCCB write had read back
+ * correctly -- so the control path was fine and the sensor produced no pixel clock. camera.c's
+ * sequence is the one bootup_check passes 20/20 with; what differs here is the context:
+ *   - the sensor is never reset, and nothing power-cycles it between loads (a failed prepare even
+ *     leaves it streaming while the next `rb fly load` stops MCLK by reprogramming the FPGA);
+ *   - i2c0 runs at 400 kHz (flight_controller.overlay); every camera success was at 100 kHz;
+ *   - board_sensor_init() holds ADS7128 GPIO1-4 LOW push-pull, where bootup_check's camera stage
+ *     streams with GPIO0-6 released (cam_status_led_on() rewrites PIN_CFG/GPIO_CFG to 0x80, which
+ *     the photo modes compile out with RB_CAMERA_STATUS_LED=0).
+ * So each try resets the sensor at 100 kHz; from try ROSE_PHOTO_RELEASE_XSHUT_TRY on it also
+ * releases the side-ToF XSHUT lines (unused without ROSE_BUMPER; the down ToF is already at 0x30,
+ * so the sides waking at 0x29 contend with nothing). camera.c's early PCLK check (CMakeLists,
+ * RB_CAMERA_EARLY_PCLK_MS) makes a dead try cost ~0.3 s instead of the 6 s settle. The console
+ * line "PHOTO: try N/M" of the try that passes names what fixed it. Each knob is a -D to bisect.
+ */
+#ifndef ROSE_PHOTO_TRIES
+#define ROSE_PHOTO_TRIES 3
+#endif
+#ifndef ROSE_PHOTO_SENSOR_RESET
+#define ROSE_PHOTO_SENSOR_RESET 1         /* SW_RESET the sensor before every try */
+#endif
+#ifndef ROSE_PHOTO_SCCB_100K
+#define ROSE_PHOTO_SCCB_100K 1            /* i2c0 at 100 kHz for prepare, back to the DT rate after */
+#endif
+#ifndef ROSE_PHOTO_RELEASE_XSHUT_TRY
+#define ROSE_PHOTO_RELEASE_XSHUT_TRY 2    /* first try that releases ADS7128 GPIO1-4; 0 = never */
+#endif
+#ifndef ROSE_PHOTO_PREPARE_BY_MS
+#define ROSE_PHOTO_PREPARE_BY_MS 17000    /* no new try that could run past this uptime */
+#endif
+#define ROSE_PHOTO_TRY_MS 6700            /* one full try: reset + config + 6 s settle + checks */
+#if defined(ROSE_BUMPER) && ROSE_BUMPER
+#undef ROSE_PHOTO_RELEASE_XSHUT_TRY
+#define ROSE_PHOTO_RELEASE_XSHUT_TRY 0    /* the side ToFs are live and readdressed: leave them */
+#endif
+
+enum {
+	PHOTO_OFF = 0, PHOTO_PREPARING = 1, PHOTO_READY = 2, PHOTO_ARMED = 3,
+	PHOTO_CAPTURED = 4, PHOTO_DRAINED = 5,
+	PHOTO_ERR_PREPARE = -1, PHOTO_ERR_CAPTURE = -2, PHOTO_ERR_DRAIN = -3,
+};
+
+extern "C" {
+uint8_t rose_photo_pixels[ROSE_PHOTO_PIXELS];
+volatile int32_t  rose_photo_state;
+volatile uint32_t rose_photo_count;
+volatile uint32_t rose_photo_width;
+volatile uint32_t rose_photo_height;
+volatile uint32_t rose_photo_captured;
+volatile uint32_t rose_photo_flags;
+volatile int32_t  rose_photo_arm_t_ms;
+volatile int32_t  rose_photo_arm_z_mm;
+const char * volatile rose_photo_stage;
+const char * volatile rose_photo_detail;
+volatile int32_t  rose_photo_tries;       /* prepare tries used (the passing one, or the last) */
+}
+
+static struct rb_camera_capture g_photo_cap;
+static int64_t g_photo_armed_up;          /* uptime at arming, for ROSE_PHOTO_WAIT_MS */
+
+#define PHOTO_ADS7128_ADDR  0x17U
+#define PHOTO_ADS7128_WR    0x08U
+#define PHOTO_ADS7128_RD    0x10U
+#define PHOTO_ADS7128_PIN   0x05U         /* PIN_CFG:  1 = GPIO, 0 = analog input */
+#define PHOTO_ADS7128_GPIO  0x07U         /* GPIO_CFG: 1 = output, 0 = input */
+#define PHOTO_SIDE_XSHUT    0x1eU         /* GPIO1-4, board_sensor_init's VL53L1X_SIDE_CH */
+
+static const struct device *photo_bus(void)
+{
+	return DEVICE_DT_GET(DT_NODELABEL(i2c0));
+}
+
+/* i2c_configure() takes no bus lock: only call it with no other I2C user running. Here that holds
+ * -- prepare runs before the ToF thread, the LED thread and the control loop, and flow is SPI. */
+static void photo_i2c_speed(uint32_t speed, const char *why)
+{
+	int rc = i2c_configure(photo_bus(), I2C_MODE_CONTROLLER | I2C_SPEED_SET(speed));
+
+	printk("PHOTO: i2c0 -> %s (%s)%s\n", speed == I2C_SPEED_STANDARD ? "100 kHz" : "400 kHz", why,
+	       rc == 0 ? "" : " -- i2c_configure FAILED");
+}
+
+static uint32_t photo_dt_speed(void)
+{
+	return DT_PROP(DT_NODELABEL(i2c0), clock_frequency) >= 400000 ? I2C_SPEED_FAST
+								      : I2C_SPEED_STANDARD;
+}
+
+static int photo_ads_clear(uint8_t reg, uint8_t mask)
+{
+	uint8_t tx[3] = { PHOTO_ADS7128_RD, reg, 0 }, v = 0;
+	int rc = i2c_write(photo_bus(), tx, 2, PHOTO_ADS7128_ADDR);
+
+	rc = rc ? rc : i2c_read(photo_bus(), &v, 1, PHOTO_ADS7128_ADDR);
+	if (rc != 0) {
+		return rc;
+	}
+	tx[0] = PHOTO_ADS7128_WR;
+	tx[2] = (uint8_t)(v & ~mask);
+	return i2c_write(photo_bus(), tx, 3, PHOTO_ADS7128_ADDR);
+}
+
+/* GPIO1-4 to hi-Z inputs, as bootup_check's camera stage has them. GPIO5 (battery ADC), GPIO6 (the
+ * down ToF, readdressed to 0x30 -- releasing it would reset it and lose altitude) and GPIO7 (LED)
+ * are left alone. */
+static void photo_release_side_xshut(void)
+{
+	int rc = photo_ads_clear(PHOTO_ADS7128_GPIO, PHOTO_SIDE_XSHUT);
+
+	rc = rc ? rc : photo_ads_clear(PHOTO_ADS7128_PIN, PHOTO_SIDE_XSHUT);
+	printk("PHOTO: released ADS7128 GPIO1-4 (side-ToF XSHUT) to hi-Z%s\n",
+	       rc == 0 ? "" : " -- write FAILED");
+}
+
+/* A try worth repeating: the sensor answered but did not stream. Not a missing core or bus. */
+static bool photo_retryable(const char *stage)
+{
+	return strcmp(stage, "capacity") != 0 && strcmp(stage, "i2c-dev") != 0;
+}
+
+static void photo_prepare(void)
+{
+	const char *stage = "", *detail = "";
+	int rc = -1;
+
+	rose_photo_state = PHOTO_PREPARING;
+	printk("PHOTO: preparing the camera (~%d ms AE settle) -- one frame at mid-hover\n",
+	       6300);
+#if ROSE_PHOTO_SCCB_100K
+	photo_i2c_speed(I2C_SPEED_STANDARD, "the rate every camera success used");
+#endif
+	for (int t = 1; t <= ROSE_PHOTO_TRIES; t++) {
+		if (t > 1 && k_uptime_get() + ROSE_PHOTO_TRY_MS > ROSE_PHOTO_PREPARE_BY_MS) {
+			printk("PHOTO: no time for try %d before uptime %d ms -- giving up\n", t,
+			       ROSE_PHOTO_PREPARE_BY_MS);
+			break;
+		}
+		rose_photo_tries = t;
+		if (ROSE_PHOTO_RELEASE_XSHUT_TRY > 0 && t == ROSE_PHOTO_RELEASE_XSHUT_TRY) {
+			photo_release_side_xshut();   /* stays released for any later try */
+		}
+#if ROSE_PHOTO_SENSOR_RESET
+		{
+			int rr = rb_camera_sensor_reset();
+
+			printk("PHOTO: try %d/%d: sensor SW reset %s\n", t, ROSE_PHOTO_TRIES,
+			       rr == 0 ? "OK (model id answers)" : "-- id did not come back");
+		}
+#endif
+		rc = rb_camera_prepare(ROSE_PHOTO_PIXELS, &g_photo_cap, &stage, &detail);
+		printk("PHOTO: try %d/%d: %s%s%s -- MODE_SELECT reads 0x%02x, PCLK %u -> %u, FVLD %u LVLD %u\n",
+		       t, ROSE_PHOTO_TRIES, rc == 0 ? "streaming" : stage, rc == 0 ? "" : ": ",
+		       rc == 0 ? "" : detail, g_photo_cap.mode_select, (unsigned)g_photo_cap.pclk_before,
+		       (unsigned)g_photo_cap.pclk_after, (unsigned)g_photo_cap.fvld_count,
+		       (unsigned)g_photo_cap.lvld_count);
+		if (rc == 0 || !photo_retryable(stage)) {
+			break;
+		}
+	}
+	if (rc != 0) {
+		rb_camera_standby();   /* the next image then starts from standby, not a wedged stream */
+	}
+#if ROSE_PHOTO_SCCB_100K
+	photo_i2c_speed(photo_dt_speed(), "restored for the control loop");
+#endif
+	if (rc == 0) {
+		rose_photo_state = PHOTO_READY;
+#if ROSE_PHOTO_BENCH_AFTER_MS
+		printk("PHOTO: ready (model 0x%04x) -- BENCH test, arms at uptime %d ms while disarmed\n",
+		       g_photo_cap.model_id, ROSE_PHOTO_BENCH_AFTER_MS);
+#else
+		printk("PHOTO: ready (model 0x%04x) -- arms at climb + hover/2 of the next flight\n",
+		       g_photo_cap.model_id);
+#endif
+	} else {
+		rose_photo_stage = stage;
+		rose_photo_detail = detail;
+		rose_photo_state = PHOTO_ERR_PREPARE;
+		printk("PHOTO: camera NOT ready (%s: %s) -- flying without the photo\n", stage, detail);
+	}
+}
+
+static void photo_arm(int32_t t_ms, float z_m)
+{
+	rb_camera_arm(ROSE_PHOTO_PIXELS);
+	g_photo_armed_up = k_uptime_get();
+	rose_photo_arm_t_ms = t_ms;
+	rose_photo_arm_z_mm = (int32_t)(z_m * 1000.0f);
+	rose_photo_state = PHOTO_ARMED;
+}
+
+static void photo_finish(void)
+{
+	const char *stage = "", *detail = "";
+	int rc = rb_camera_finish(rose_photo_pixels, ROSE_PHOTO_PIXELS, &g_photo_cap, &stage, &detail);
+
+	rose_photo_count = g_photo_cap.drained;
+	rose_photo_width = g_photo_cap.measured_width;
+	rose_photo_height = g_photo_cap.measured_height;
+	rose_photo_captured = g_photo_cap.captured;
+	rose_photo_flags = g_photo_cap.flags;
+	__asm__ volatile("" ::: "memory");   /* pixels and counts land before the state says so */
+	if (rc == 0) {
+		rose_photo_state = PHOTO_DRAINED;
+		printk("PHOTO: frame in memory -- %u px, %ux%u, range %u..%u, armed at t=%d ms z=%d mm. "
+		       "Dump it with `rb fly photo`\n",
+		       (unsigned)rose_photo_count, (unsigned)rose_photo_width,
+		       (unsigned)rose_photo_height, g_photo_cap.vmin, g_photo_cap.vmax,
+		       (int)rose_photo_arm_t_ms, (int)rose_photo_arm_z_mm);
+	} else {
+		rose_photo_stage = stage;
+		rose_photo_detail = detail;
+		rose_photo_state = (g_photo_cap.captured < ROSE_PHOTO_PIXELS) ? PHOTO_ERR_CAPTURE
+									      : PHOTO_ERR_DRAIN;
+		printk("PHOTO: capture FAILED (%s: %s) -- captured %u of %u, drained %u\n", stage,
+		       detail, (unsigned)g_photo_cap.captured, (unsigned)ROSE_PHOTO_PIXELS,
+		       (unsigned)g_photo_cap.drained);
+	}
+}
+
+/* Once per control iteration. Cheap in flight: when armed it is one or two register reads. */
+static void photo_step(float z_m)
+{
+	const int32_t st = rose_photo_state;
+
+	if (st != PHOTO_READY && st != PHOTO_ARMED && st != PHOTO_CAPTURED) {
+		return;                          /* off, preparing, failed, or already done */
+	}
+	int64_t now = k_uptime_get();
+
+	if (st == PHOTO_READY) {
+#if ROSE_PHOTO_BENCH_AFTER_MS
+		if (!g_armed && now >= ROSE_PHOTO_BENCH_AFTER_MS) {
+			photo_arm((int32_t)now, z_m);
+		}
+#else
+		if (g_armed && g_flight_start_ms != 0) {
+			int64_t tf = now - g_flight_start_ms;
+
+			if (tf >= (int64_t)g_t_climb_ms + g_t_hover_ms / 2) {
+				photo_arm((int32_t)tf, z_m);
+			}
+		}
+#endif
+		return;
+	}
+	if (st == PHOTO_ARMED && rb_camera_done(ROSE_PHOTO_PIXELS)) {
+		rose_photo_state = PHOTO_CAPTURED;
+	}
+	/* Drain only with the motors off. An armed capture that has not completed gets
+	 * ROSE_PHOTO_WAIT_MS, then is finished anyway so the dump can say why it failed. */
+	if (!g_armed && (rose_photo_state == PHOTO_CAPTURED ||
+			 now - g_photo_armed_up >= ROSE_PHOTO_WAIT_MS)) {
+		photo_finish();
+	}
+}
+#endif /* ROSE_CAMERA */
+
 int main(void)
 {
 #if defined(ROSE_FLIGHTLOG_DUMP) && ROSE_FLIGHTLOG_DUMP
@@ -3332,6 +3795,12 @@ int main(void)
 		printk("flight_controller: optical flow %s\n",
 		       rc == 0 ? "up" : "NOT detected (flow disabled)");
 	}
+#endif
+
+#if ROSE_CAMERA
+	/* Before the ToF thread and the control loop: the ~6.3 s AE settle and all of the camera's
+	 * I2C happen here, so nothing in flight ever waits on it or shares the bus with it. */
+	photo_prepare();
 #endif
 
 #if TOF_THREADED
@@ -3525,8 +3994,11 @@ int main(void)
 				if (viol_since == 0) { viol_since = t_now; viol_count = 0; }
 				viol_count++;
 			}
-			if (why != NULL && viol_count >= SAFE_DEBOUNCE_MIN_SAMPLES &&
-			    (t_now - viol_since) >= (int64_t)need_ms) {
+			const bool trip = why != NULL && viol_count >= SAFE_DEBOUNCE_MIN_SAMPLES &&
+					  (t_now - viol_since) >= (int64_t)need_ms;
+			if (trip && soft_land_instead(why, state[2], t_now)) {
+				viol_since = 0; viol_count = 0;
+			} else if (trip) {
 				g_estop = true;
 				/* COMMAND ZERO FIRST, REPORT AFTERWARDS.
 				 *
@@ -3644,6 +4116,7 @@ int main(void)
 					} else if (t_now - arm_since >= hold_ms) {
 						g_armed = true;
 						g_flight_start_ms = t_now;
+						g_land_abort_ms = 0;
 						printk("AUTOFLIGHT: ARMED -- taking off (hover %d mm, cap %d ms)\n",
 						       (int)(g_hover_z_m * 1000.0f), g_flight_max_ms);
 					}
@@ -3658,9 +4131,26 @@ int main(void)
 				/* Landing phase = past the descend ramp (setpoint now LAND_PUSH_M). Cut motors on
 				 * ACTUAL touchdown (height-based), not a fixed time, so it never disarms mid-air. */
 				bool in_landing = tf >= (int64_t)(g_t_climb_ms + g_t_hover_ms + g_t_descend_ms);
-				bool landed = in_landing && f.tof_valid && state[2] < LAND_Z_THRESH_M;
-				if (landed || tf >= g_flight_max_ms) {
+				int64_t cap_ms = g_flight_max_ms;
+				if (g_land_abort_ms != 0) {
+					/* Abort landing: ramp down from where it began, never above the profile, and
+					 * give the cap room to finish the descent (+2 s) rather than cut mid-air. */
+					const float ta = (float)(t_now - g_land_abort_ms) * 0.001f;
+					float za = g_land_abort_z - (float)(LAND_ABORT_MPS) * ta;
+					if (za < LAND_PUSH_M) { za = LAND_PUSH_M; }
+					if (za < zsp) { zsp = za; }
+					in_landing = in_landing || za <= 0.0f;
+					const int64_t need = (g_land_abort_ms - g_flight_start_ms) + 2000 +
+						(int64_t)((g_land_abort_z - LAND_PUSH_M) / (float)(LAND_ABORT_MPS) * 1000.0f);
+					if (need > cap_ms) { cap_ms = need; }
+				}
+				/* Either height counts: the estimate can sit well above the ToF after a rejected
+				 * floor step (flight-logs T85: z 1.01 m against ToF 0.53 m on the way down). */
+				bool landed = in_landing && f.tof_valid &&
+					      (state[2] < LAND_Z_THRESH_M || f.height < LAND_Z_THRESH_M);
+				if (landed || tf >= cap_ms) {
 					g_armed = false;
+					g_land_abort_ms = 0;
 					flight_done = true;   /* one-shot: don't auto re-arm (reset to fly again) */
 					g_setpoint[2] = 0.0f;
 					printk("AUTOFLIGHT: %s (%d ms, z=%dmm) -- motors OFF (reset to fly again)\n",
@@ -3684,6 +4174,9 @@ int main(void)
 #endif
 			pid_set_walls(w.front_mm, w.back_mm, w.left_mm, w.right_mm, apply);
 		}
+#endif
+#if ROSE_CAMERA
+		photo_step(state[2]);
 #endif
 		uint32_t _pc = PF_NOW();
 		solve_control(state, u, dt);
