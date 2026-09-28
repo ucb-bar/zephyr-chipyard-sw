@@ -17,6 +17,39 @@
 #include <zephyr/drivers/sensor/vl53l5cx.h>
 #include <zephyr/sys/printk.h>
 
+/*
+ * Boards without the four side sensors.
+ *
+ * CMakeLists compiles this file unconditionally and says ROSE_BUMPER=0 leaves it "compiled but
+ * idle" -- but the DEVICE_DT_GET(DT_ALIAS(side_*)) calls below are resolved by the preprocessor,
+ * not at runtime, so without the aliases the file does not compile at all and the whole flight
+ * controller fails to build. That is what happens on the RiskyBird FPGA carrier, whose overlay
+ * has no side ToFs, and on any board where the four sensors are simply not populated.
+ *
+ * Guarded the same way main.cpp already guards flow, tof and baro (HAVE_FLOW / HAVE_TOF /
+ * HAVE_BARO): the alias existing is what decides. On the ESP32-C6 board the aliases are present,
+ * so this compiles exactly as before -- the stubs below are unreachable there.
+ */
+#define HAVE_SIDE_TOF DT_NODE_EXISTS(DT_ALIAS(side_front))
+
+#if !HAVE_SIDE_TOF
+
+int side_tof_init(void)
+{
+	printk("side-ToF: no side_* aliases in the device tree -- bumper unavailable\n");
+	return 0;
+}
+
+void side_tof_get(struct side_walls *out)
+{
+	/* seq = 0 is the documented "never read"; every distance <= 0 means "no wall". */
+	if (out != NULL) {
+		*out = (struct side_walls){ 0 };
+	}
+}
+
+#else
+
 #define ADS7128_I2C_ADDR      0x17
 #define ADS7128_CMD_REG_WRITE 0x08
 #define ADS7128_CMD_REG_READ  0x10
@@ -278,3 +311,5 @@ void side_tof_get(struct side_walls *out)
 	*out = g_walls;
 	k_mutex_unlock(&g_walls_mtx);
 }
+
+#endif /* HAVE_SIDE_TOF */

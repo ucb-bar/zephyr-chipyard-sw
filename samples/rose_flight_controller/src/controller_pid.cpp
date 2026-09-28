@@ -36,6 +36,9 @@ static const float dampingRatio_height = 0.7f;
 #ifndef ALT_INT_MAX
 #define ALT_INT_MAX 3.0f          /* anti-windup clamp: max |integral| accel contribution (m/s^2) */
 #endif
+#ifndef ALT_INT_BAND
+#define ALT_INT_BAND 1e9f         /* integrate only when |height error| < this (m); default = always */
+#endif
 #ifndef ALT_INT_GROUND_M
 #define ALT_INT_GROUND_M 0.05f    /* est height below this = on the ground -> hold integrator at 0 */
 #endif
@@ -188,6 +191,36 @@ static float forceToVoltage(float forceNewtons)
 #ifndef PITCH_TRIM_RAD
 #define PITCH_TRIM_RAD 0.0f
 #endif
+/* Yaw-authority clamp, as a fraction of each motor's share of collective thrust (0.25*u[0]). The
+ * yaw moment is the last priority on a quad: it is made by speeding up one diagonal pair and slowing
+ * the other, so an unbounded yaw command can drive one pair to the ceiling and the other to zero --
+ * leaving no differential for roll/pitch and cutting total thrust. Measured 2026-09-24 (flight-logs
+ * T10, the first FPGA-carrier liftoff): a yaw kick at 0.18 m drove duty to 0.89/0.02/0.95/0.27, total
+ * thrust fell to ~55% (|a| 11.6 -> 4.9 m/s^2) and roll went -8 -> -50 deg with nothing left to stop it.
+ * With this set, yaw can shift each motor by at most +-YAW_AUTH_FRAC of that share; roll, pitch and
+ * thrust are untouched. Default OFF (1e9) so builds that have flown behave exactly as before. */
+/* Thrust trim on the LEFT pair (duty[2] back-left, duty[3] front-left), from the original firmware's
+ * motor mapping for the ESP32-C6 airframe it was tuned on. It makes the left side ~13% weaker by
+ * design, and the roll loop has no integral term, so on an airframe whose motors do not need it the
+ * vehicle settles banked instead: measured 2026-09-24 on the FPGA carrier (flight-logs T10/T11) as a
+ * steady -6 deg roll (left wing down) and ~1 m/s drift to the left, with the right pair already
+ * 0.07 duty above the left at spin-up before any attitude error existed. Default 0.87 keeps builds
+ * that have flown byte-identical; set 1.0 for an airframe with matched motors. */
+#ifndef MOTOR_TRIM_LEFT
+#define MOTOR_TRIM_LEFT 0.87f
+#endif
+/* Yaw actuation sign. The mixer assumes the Crazyflie spin set (FR CCW, BR CW, BL CCW, FL CW). An
+ * airframe whose motors all spin the other way, with props of the matching hand, still makes thrust
+ * DOWN on every corner but its yaw reaction torque is reversed -- the yaw loop becomes positive
+ * feedback. Measured on the FPGA carrier (flight-logs T02..T31): in every upset the yaw moved WITH
+ * the diagonal differential the controller used to oppose it (T31: 15 of 15 steps, spinning to
+ * +75 deg on the floor). -1 flips the yaw moment; default +1 keeps builds that have flown identical. */
+#ifndef YAW_MIX_SIGN
+#define YAW_MIX_SIGN 1.0f
+#endif
+#ifndef YAW_AUTH_FRAC
+#define YAW_AUTH_FRAC 1e9f
+#endif
 /* Horizontal velocity loop: 1 = regulate velocity -> tilt (needs a REAL velocity, i.e. optical flow);
  * 0 = DISABLE it (desRoll=desPitch=0) -> hold LEVEL attitude + altitude only, no velocity/position
  * hold. Pure dead-reckoning velocity is physically blind to bank translation and drifts, so closing
@@ -308,7 +341,12 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	if (estHeight < ALT_INT_GROUND_M) {
 		alt_int = 0.0f;        /* on the ground: no windup before takeoff */
 	} else {
-		alt_int += KI_HEIGHT * (desHeight - estHeight) * dt;
+		/* Conditional integration: only trim hover thrust near the setpoint. While the drone lags a
+		 * ramping setpoint the P/D terms do the work; integrating that lag winds alt_int up and it
+		 * carries the climb straight through the target (flight-logs T18: +0.39 m over 0.8 m). */
+		if (fabsf(desHeight - estHeight) < (float)(ALT_INT_BAND)) {
+			alt_int += KI_HEIGHT * (desHeight - estHeight) * dt;
+		}
 		if (alt_int >  ALT_INT_MAX) { alt_int =  ALT_INT_MAX; }
 		else if (alt_int < -ALT_INT_MAX) { alt_int = -ALT_INT_MAX; }
 	}
@@ -374,7 +412,14 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	u[0] = u[0] * MASS;                 /* normalized accel -> force */
 	u[1] = u[1] * J[0] * ATT_GAIN;      /* roll moment  (ATT_GAIN = attitude authority scale) */
 	u[2] = u[2] * J[1] * ATT_GAIN;      /* pitch moment */
-	u[3] = u[3] * J[2];                 /* yaw moment (unscaled) */
+	u[3] = (float)(YAW_MIX_SIGN) * u[3] * J[2];   /* yaw moment (unscaled); sign = prop spin set */
+	{
+		/* per-motor yaw force is (0.25/k_drag)*u[3]; bound it by YAW_AUTH_FRAC of 0.25*u[0] */
+		const float share = 0.25f * (u[0] > 0.0f ? u[0] : 0.0f);
+		const float ymax  = (float)(YAW_AUTH_FRAC) * share * k_drag / 0.25f;
+		if (u[3] >  ymax) { u[3] =  ymax; }
+		if (u[3] < -ymax) { u[3] = -ymax; }
+	}
 
 	const float M[4][4] = {
 		{0.25f,  0.25f / l_arm, -0.25f / l_arm,  0.25f / k_drag},
@@ -396,8 +441,8 @@ void HierarchicalPidController::compute(const float state[CTRL_NSTATES],
 	float duty[4];
 	duty[0] = forceToVoltage(0.9f * ctrl[1]);
 	duty[1] = forceToVoltage(0.9f * ctrl[2]);
-	duty[2] = forceToVoltage(0.9f * ctrl[3] * 0.87f);
-	duty[3] = forceToVoltage(0.9f * ctrl[0] * 0.87f);
+	duty[2] = forceToVoltage(0.9f * ctrl[3] * (float)(MOTOR_TRIM_LEFT));
+	duty[3] = forceToVoltage(0.9f * ctrl[0] * (float)(MOTOR_TRIM_LEFT));
 
 	/* Emit in the shared normalized-thrust convention (send_control adds 0.583 back to recover
 	 * duty, then clamps + applies the bench MOTOR_MAX_DUTY cap / timeout). */

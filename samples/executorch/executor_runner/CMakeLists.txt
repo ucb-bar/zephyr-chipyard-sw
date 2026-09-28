@@ -43,6 +43,37 @@ get_filename_component(ET_BUILD_DIR_PATH ${ET_BUILD_DIR_PATH} REALPATH)
 get_filename_component(ET_DIR_PATH ${ET_DIR_PATH} REALPATH)
 get_filename_component(ET_INCLUDE_PATH ${ET_INCLUDE_PATH} REALPATH)
 
+# Operator-level profiling: makes the XNNPACK delegate create its runtime with
+# XNN_FLAG_BASIC_PROFILING and print per-operator timings (`>>, <op>, <ticks>`)
+# on delegate destroy — the ExecuTorch counterpart to modelblaster's per-kernel
+# cycle CSV. Applies to the executorch/xnnpack_backend libs in the subbuild.
+# Per-op profiling emits ET_LOG(">>, <op>, <cycles>") every invoke over the HTIF
+# console, which is very slow on FireSim (each tohost write costs ~millions of
+# cycles) and inflates the execute() measurement. Keep it ON for op-level
+# characterization; build -DMB_XNN_PROFILE=OFF for a clean end-to-end timing.
+option(MB_XNN_PROFILE "Enable XNNPACK per-op profiling (adds HTIF log overhead)" ON)
+if(MB_XNN_PROFILE)
+  add_compile_definitions(ENABLE_XNNPACK_PROFILING)
+endif()
+
+# Opt-in: TACIT / L-Trace of the (warm) method->execute() iteration. Pass
+# -DMB_TACIT_TRACE_MODEL=1 and run on the TACIT spike with `--trace=l`.
+# See samples/tacit/TACIT_TRACING.md.
+if(MB_TACIT_TRACE_MODEL)
+  add_compile_definitions(MB_TACIT_TRACE_MODEL=1)
+  message(STATUS "executor_runner: TACIT model tracing enabled")
+endif()
+
+# The ExecuTorch/XNNPACK targets below are added as a plain subdirectory and do
+# NOT link Zephyr's `zephyr_interface`, so they would otherwise compile with the
+# SDK toolchain's default multilib (rv32 + soft-float) and fail the final link
+# against Zephyr's rv64/lp64d objects with "file in wrong format". Force the
+# spike_riscv64 target ABI into the subbuild. `-mcmodel=medany` matches Zephyr's
+# rv64 code model and keeps R_RISCV_CALL_PLT relocations in range for the large
+# executorch+XNNPACK image.
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -march=rv64imafdc -mabi=lp64d -mcmodel=medany")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64imafdc -mabi=lp64d -mcmodel=medany")
+
 add_subdirectory(${ET_DIR_PATH} ${ET_BUILD_DIR_PATH})
 
 
@@ -57,18 +88,68 @@ add_dependencies(compile_commands zephyr_property_target)
 
 target_link_libraries(pthreadpool PUBLIC compile_commands)
 
+# --- Threadpool variant toggle (vanilla vs modelblaster-style spin) ---------
+# XNNPACK parallelizes every operator through pthreadpool, whose wait loop
+# spins PTHREADPOOL_SPIN_WAIT_ITERATIONS (=1000 here) times then falls to a
+# futex/condvar wait. On bare-metal Zephyr that futex wait blocks until the
+# next 100 Hz system tick (~10 ms), so each op eats ~one tick — the dominant
+# cost for small models (see modelblaster/microbench/threadpool: pthreadpool
+# ~13M cyc/dispatch vs a raw spin rendezvous ~20k). modelblaster's lightweight
+# pool avoids this by never sleeping. We can't drop modelblaster_pool into
+# XNNPACK (it only implements parallelize_1d; XNNPACK needs 30+ variants), so
+# we bring modelblaster's *property* — spin instead of tick-sleep — by bumping
+# the spin-iteration ceiling via the same -include override the microbench
+# uses. Default OFF = vanilla pthreadpool (the baseline to compare against).
+option(MB_XNNPACK_SPIN_THREADPOOL
+       "Use spin-wait pthreadpool (modelblaster-style, no condvar/tick sleep)" OFF)
+# Where the ModelBlaster checkout is. It used to be a submodule of this repo, at
+# <backend>/modelblaster; it is now a backend in its own right, a sibling of this
+# one (riskybird's backends/modelblaster). The default below finds it in that
+# layout, and MODELBLASTER_DIR overrides it for any other -- including a
+# standalone clone of this backend, where it is simply absent.
+set(MODELBLASTER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../modelblaster"
+    CACHE PATH "ModelBlaster checkout, for the spin-wait pthreadpool override")
+if(MB_XNNPACK_SPIN_THREADPOOL)
+  set(_MB_SPIN_INJECT
+      "${MODELBLASTER_DIR}/microbench/threadpool/spin_overrides/spin_inject.h")
+  # Checked rather than assumed: -include on a path that does not exist fails at
+  # the first compile with a message about a header nobody asked for, which is a
+  # poor way to learn that a checkout moved.
+  if(NOT EXISTS "${_MB_SPIN_INJECT}")
+    message(FATAL_ERROR
+      "MB_XNNPACK_SPIN_THREADPOOL is ON but ${_MB_SPIN_INJECT} does not exist. "
+      "Point -DMODELBLASTER_DIR= at a ModelBlaster checkout, or leave the "
+      "option OFF for vanilla pthreadpool.")
+  endif()
+  target_compile_options(pthreadpool PRIVATE -include "${_MB_SPIN_INJECT}")
+  message(STATUS "executor_runner: pthreadpool variant = SPIN (modelblaster-style)")
+else()
+  message(STATUS "executor_runner: pthreadpool variant = vanilla (condvar/tick fallback)")
+endif()
+
 
 
 
 
 target_link_libraries(app PRIVATE
-  # "-Wl,--whole-archive" 
-  extension_runner_util executorch executorch_core quantized_ops_lib portable_ops_lib quantized_kernels portable_kernels 
-  xnnpack_backend XNNPACK microkernels-prod
+  # "-Wl,--whole-archive"
+  extension_runner_util executorch executorch_core quantized_ops_lib portable_ops_lib quantized_kernels portable_kernels
+  # microkernels-prod was renamed xnnpack-microkernels-prod in the XNNPACK
+  # used by ExecuTorch 1.0.1 (ucb-bar torch-1.0.0-bump fork).
+  xnnpack_backend XNNPACK xnnpack-microkernels-prod
   # "-Wl,--no-whole-archive"`
 )
 
 target_include_directories(app PRIVATE ${ET_INCLUDE_PATH} ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-target_sources(app PRIVATE riscv_executor_runner.cpp model_pte.c)
+# MB_MULTI_MODEL=ON bakes a registry of N models (models_pte.c, generated by
+# model/gen_multi_pte.py) and the runner loops over them under one boot /
+# FireSim infrasetup. Default (off) is the single-model model_pte.c path.
+if(MB_MULTI_MODEL)
+    target_sources(app PRIVATE riscv_executor_runner.cpp models_pte.c)
+    target_compile_definitions(app PRIVATE MB_MULTI_MODEL=1)
+    message(STATUS "modelblaster ET runner: MB_MULTI_MODEL (batched multi-.pte)")
+else()
+    target_sources(app PRIVATE riscv_executor_runner.cpp model_pte.c)
+endif()
 zephyr_linker_sources(DATA_SECTIONS  custom-sections.ld)
 

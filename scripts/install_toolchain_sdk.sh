@@ -5,17 +5,44 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+log() { printf "\n\033[1;32m[%s]\033[0m %s\n" "$(date +%H:%M:%S)" "$*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
 TOOLS_MANUAL_DIR="${REPO_ROOT}/tools-manual"
 PATCHES_DIR="${REPO_ROOT}/tools/patches"
 
-SDK_VERSION="1.0.0-beta1"
+SDK_VERSION="${RB_SDK_VERSION:-1.0.0-beta1}"
+
+# Which prebuilt SDK to fetch. The upstream release publishes one tarball per
+# host, and picking the wrong one installs a toolchain that cannot execute --
+# on macOS the Linux tarball extracts happily and then every tool fails with
+# "bad CPU type in executable", which reads as a corrupt download.
+#
+# Detected rather than hardcoded so a Mac needs no local edit to this file:
+# an edited installer is a permanently dirty working tree that drifts from
+# upstream. Override with RB_SDK_HOST for a host this does not know, e.g.
+#   RB_SDK_HOST=linux-aarch64 ./scripts/install_toolchain_sdk.sh
+if [ -n "${RB_SDK_HOST:-}" ]; then
+  SDK_HOST="${RB_SDK_HOST}"
+else
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)          SDK_HOST="linux-x86_64"   ;;
+    Linux-aarch64)         SDK_HOST="linux-aarch64"  ;;
+    Darwin-arm64)          SDK_HOST="macos-aarch64"  ;;
+    Darwin-x86_64)         SDK_HOST="macos-x86_64"   ;;
+    *) die "unsupported host $(uname -s)-$(uname -m); set RB_SDK_HOST to one of
+       linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64" ;;
+  esac
+fi
+# Note on tarball sizes: the macOS "minimal" archives are a few KB where the
+# Linux ones are tens of MB. That is not a broken asset -- minimal means the
+# cmake scaffolding and setup.sh only, and `setup.sh -t ... -l -h` below
+# downloads the toolchains themselves. Do not "fix" it by moving macOS to a
+# different SDK version.
 SDK_NAME="zephyr-sdk-${SDK_VERSION}"
-SDK_MINIMAL_TARBALL="${SDK_NAME}_linux-x86_64_minimal.tar.xz"
+SDK_MINIMAL_TARBALL="${SDK_NAME}_${SDK_HOST}_minimal.tar.xz"
 SDK_URL="https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${SDK_VERSION}/${SDK_MINIMAL_TARBALL}"
 SDK_INSTALL_DIR="${TOOLS_MANUAL_DIR}/${SDK_NAME}"
-
-log() { printf "\n\033[1;32m[%s]\033[0m %s\n" "$(date +%H:%M:%S)" "$*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
 
 # Check dependencies
 command -v wget >/dev/null 2>&1 || die "wget not found. Please install wget."
@@ -51,7 +78,22 @@ cd "${SDK_INSTALL_DIR}"
 # - Host tools (-h)
 # - CMake package registration (-c)
 log "Installing SDK components (GNU riscv64, LLVM, host tools)..."
-./setup.sh -t riscv64-zephyr-elf -l -h -c
+# setup.sh prints "ERROR: CMake package registration failed" and still exits 0,
+# so `set -e` does not catch it and this script used to go on to report
+# "CMake package registered" regardless. Capture the output and say what really
+# happened. This is a warning rather than a failure: rb passes
+# ZEPHYR_SDK_INSTALL_DIR explicitly, so a build finds this SDK whether or not
+# the user-global CMake package registry points at it -- and that registry holds
+# one entry, so a second checkout installing its own SDK overwrites the first
+# without either being broken.
+SDK_SETUP_LOG="$(mktemp)"
+./setup.sh -t riscv64-zephyr-elf -l -h -c 2>&1 | tee "${SDK_SETUP_LOG}"
+CMAKE_PKG_REGISTERED=yes
+if grep -qF "CMake package registration failed" "${SDK_SETUP_LOG}"; then
+  CMAKE_PKG_REGISTERED=no
+fi
+rm -f "${SDK_SETUP_LOG}"
+
 
 # Copy cmake files from tools/patches to cmake/zephyr/ in SDK
 if [ -d "${PATCHES_DIR}" ]; then
@@ -80,4 +122,17 @@ log "SDK includes:"
 log "  - GNU toolchain: riscv64-zephyr-elf"
 log "  - LLVM toolchain"
 log "  - Host tools"
-log "  - CMake package registered"
+if [ "${CMAKE_PKG_REGISTERED}" = yes ]; then
+  log "  - CMake package registered"
+else
+  log "  - CMake package NOT registered (setup.sh reported a failure)"
+  echo "" >&2
+  echo "WARNING: the Zephyr SDK CMake package was not registered." >&2
+  echo "  rb builds do not need it -- they pass ZEPHYR_SDK_INSTALL_DIR" >&2
+  echo "  directly -- but a plain 'west build' outside rb will not find" >&2
+  echo "  this SDK." >&2
+  echo "  The usual cause is a vendor cmake first on PATH. Check with:" >&2
+  echo "    which cmake && cmake --version" >&2
+  echo "  If it resolves under /ecad, Vitis or another vendor toolchain:" >&2
+  echo "    PATH=/usr/bin:\$PATH ./scripts/install_toolchain_sdk.sh" >&2
+fi

@@ -2,6 +2,17 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+
+# No GP relaxation. With CONFIG_RISCV_GP the linker rewrites small-global accesses to be
+# gp-relative, and a later layout change can push their targets outside gp's +-2 KiB: on
+# 2026-09-25 the t21/t23 flight presets failed to link ("relocation truncated to fit:
+# R_RISCV_GPREL_S against pmw3901_cfg", and in libc malloc/free) while t16/t27 -- the same
+# sources with different knobs -- linked. Whether a flight build links must not depend on its
+# tuning values. (A Kconfig fix is not available: RISCV_GP is a one-member choice on a
+# single-hart SoC.) gp is still initialised; only the relaxation is off.
+if(CONFIG_RISCV_GP)
+  zephyr_ld_options(-Wl,--no-relax-gp)
+endif()
 project(rose_flight_controller)
 
 # Reuse the TinyMPC controller from samples/drone_control (requires:
@@ -38,9 +49,38 @@ set(ROSE_USE_PID 0 CACHE STRING "1=hierarchical PID, 0=TinyMPC")
 # ROSE_CTRL_DIV (control runs every Nth estimator tick -> control rate = estimation / N).
 set(ROSE_THREADED 0 CACHE STRING "1=threaded blocks, 0=single loop (default; see main.cpp note)")
 set(ROSE_CTRL_DIV 1 CACHE STRING "control every Nth estimator tick (multi-rate)")
+# Estimator-only: run sensors + estimator + telemetry and never call the
+# controller. For characterising the estimator by itself; see solve_control().
+set(ROSE_ESTIMATOR_ONLY 0 CACHE STRING "1=estimator only (controller never runs)")
+# Uplink commands over uart1: the ground station's ESTOP/DISARM/RESET/HOVER_Z/
+# PROFILE/PING, read from the ESP link instead of from a radio this carrier does
+# not have. Empty = let main.cpp decide, which enables it exactly when the
+# esp-uart alias exists and is not the console. Set 0 to compile the reader out.
+set(ROSE_UART_CMD "" CACHE STRING "1=read uplink commands from uart1, 0=off, empty=auto")
 # Bench safety: stop driving motors this many ms after boot (0 = never). Real-HW bench
 # bring-up builds with 10000 so the props auto-stop 10 s after reset. Keep 0 for flight.
+#
+# READ THE DEFAULT. It is 0, which is DISABLED, in every build that does not override it -- and
+# nothing in tools/rb/boards.py overrides it for any mode. main.cpp guards the feature with
+# `#if ROSE_ACTUATE_TIMEOUT_MS > 0`, so with the default the whole cutoff is preprocessed out of
+# the image. There is no "#ifndef" fallback in the source; this line is the only definition, and
+# it turns the feature off. That is why the commitment gate below exists and is NOT defaulted off.
 set(ROSE_ACTUATE_TIMEOUT_MS 0 CACHE STRING "stop motor actuation N ms after boot (0=never)")
+
+# ---- Commitment gate ---------------------------------------------------------------------------
+# How long motors may run without a deliberate commitment, and what committing takes.
+#
+# ROSE_FLIGHT_COMMIT is the BUILD-TIME half of a two-part interlock and is deliberately NOT set by
+# any --mode in tools/rb/boards.py: no mode name may quietly imply permission to fly. It has to be
+# typed, as RB_CMAKE_ARGS="-DROSE_FLIGHT_COMMIT=1". With it at 0 the run-time commit variable is not
+# compiled into the image at all, so hardware/flight/commit.gdb fails with "No symbol" -- the
+# absence of that symbol is the proof that the image cannot be made to fly.
+#
+# The RUN-TIME half is the operator writing the key from a debugger, on the bench. Neither act alone
+# does anything.
+set(ROSE_FLIGHT_COMMIT   0     CACHE STRING "1=build CAN be committed to a flight test at run time")
+set(ROSE_MOTOR_WINDOW_MS 5000  CACHE STRING "uncommitted: ms of motor-live time before the latch")
+set(ROSE_COMMIT_MAX_MS   60000 CACHE STRING "committed: ms of motor-live time before the latch")
 # Control-loop iteration count. Default 5000 suits the RoSE co-sim; on real HW the loop runs
 # ~1 kHz, so raise this for a longer bench run (e.g. 120000 ~= 2 min).
 set(CTRL_ITERS 5000 CACHE STRING "control-loop iteration count")
@@ -53,11 +93,156 @@ set(ROSE_BUMPER 0 CACHE STRING "1=enable side-ToF wall bumper, 0=disabled")
 set(ROSE_BUMPER_READDRESS_ONLY 0 CACHE STRING "1=re-address sides only (fast boot, no ranging)")
 # Optical flow: 1 = bring up the PMW3901 (SPI2) + feed body-frame velocity to the estimator.
 set(ROSE_FLOW 0 CACHE STRING "1=enable PMW3901 optical flow, 0=disabled")
+# Which pin on the `gpio0` controller is the PMW3901's software chip-select.
+#
+# 19 is the ESP32-C6's, and is the value the untethered hops in docs/FLIGHT_BUILD.md flew with,
+# so the default changes no existing build. The RiskyBird FPGA carrier's DroneLogic GPIO block is
+# a different controller with its own numbering and puts the flow CS at index 0 -- see
+# hardware/zephyr/targets/fpga/workloads/pmw3901_test.overlay in the riskybird tree, which is the
+# wiring the standalone PMW3901 bring-up reads the chip ID through.
+#
+# Declared here for the same reason as PID_MASS_KG below: flight_controller-flow.overlay and
+# docs/flight-on-fpga.md both instruct the operator to pass -DCS_GPIO_PIN=0 for an FPGA flow
+# build, and until flow.c grew an #ifndef around its default that -D was silently discarded. A
+# bare -D on the CMake line is STILL discarded unless the name is listed in
+# target_compile_definitions, which is what this pair of lines fixes -- so a --mode can now carry
+# the right chip-select instead of it being a remembered command-line flag.
+set(CS_GPIO_PIN "" CACHE STRING "PMW3901 chip-select override (empty: FPGA 0, ESP32 19)")
 # Barometer altitude fusion: 1 = read the BMP388 (needs a `baro` DT alias + CONFIG_BMP388) and fuse
 # its smooth relative altitude with the down-ToF in the estimator (robust altitude under tilt /
 # obstacle step-jumps). 0 = ToF-only (unchanged). Fine-tuning knobs (BARO_Z_GAIN, BARO_VZ_GAIN,
 # BARO_BIAS_GAIN, BARO_TOF_STEP_M, R_BARO) are passed via -DEXTRA_CPPFLAGS like the flow knobs.
 set(ROSE_BARO 0 CACHE STRING "1=enable BMP388 barometer altitude fusion, 0=disabled")
+
+# Flight knobs. These existed in main.cpp with #ifndef defaults but were absent
+# from target_compile_definitions below, so -DROSE_AUTOFLIGHT=1 set a cache
+# variable that nothing read: the build silently kept the bench path and the
+# arming gate was never compiled in. Verified by symbol table -- rose_cmd_reset
+# and g_arm_enabled were both absent from an image built with the flag set.
+# That is the failure FLIGHT_BUILD.md warns about, so the knobs are declared
+# here where they are visibly wired to the definitions.
+#
+# Defaults match main.cpp's #ifndef values exactly, so adding them changes no
+# existing build.
+set(ROSE_AUTOFLIGHT 0 CACHE STRING "1=lift-and-place arm gate + autonomous altitude profile")
+set(ROSE_BATT_SENSE 0 CACHE STRING "1=battery ADC: arm gate, in-flight cutoff, thrust sag comp")
+# Split the OBSERVABILITY out of the CONTROL. With this set, ROSE_BATT_SENSE=1 still reads the
+# ADS7128 and still publishes vbat= on the telemetry line, but the reading reaches no actuator:
+# no thrust sag compensation, no low-voltage estop, no arm gate. That is what lets a mode whose
+# AIN5 scaling has not yet been checked against a meter give a remote operator the one fact they
+# need -- is a pack connected, i.e. can a motor turn -- without a plausible-but-wrong reading
+# quietly boosting duty or estopping a healthy bench run. Default 0 = full behaviour, so
+# --mode autoflight is byte-identical to before.
+set(ROSE_BATT_REPORT_ONLY 0 CACHE STRING "1=battery ADC feeds TELEMETRY ONLY (no sag comp/estop/arm gate)")
+set(ROSE_FLIGHTLOG  0 CACHE STRING "1=background flight log to RAM, flushed at flight end")
+set(ROSE_TELEM      1 CACHE STRING "1=in-loop console telemetry (MUST be 0 untethered)")
+set(ROSE_TELEM_DIV  10 CACHE STRING "print one telemetry line every Nth iteration")
+# Bench escape hatch: auto-arm after ARM_SETTLE_MS of level+still, with no
+# lift-and-place gesture AND no on-ground check. main.cpp already names the
+# reason -- "near-field ToF validity when sitting flush is unreliable, and it
+# was the likely arm blocker". Measured on riskybird v3: a drone set down reads
+# 190-310 mm on the down-ToF against an ARM_MAX_HEIGHT_M of 20 mm, so `ground`
+# is never true and the gesture can never complete.
+#
+# Deliberately NOT part of any mode. It removes the interlock that makes a
+# glitch-reboot safe, so it has to be an explicit choice at the command line
+# rather than something a mode name quietly implies:
+#   RB_CMAKE_ARGS="-DROSE_ARM_NO_GESTURE=1" ./rb debug flight_controller ...
+set(ROSE_ARM_NO_GESTURE 0 CACHE STRING "1=auto-arm on level+still, no gesture, no ground check")
+
+# Flight envelope. All three are already #ifndef-guarded in main.cpp but were
+# not reachable from the build, so tuning them meant editing the source -- the
+# one thing you cannot do safely between two attempts on a bench.
+#
+# ARM_MAX_HEIGHT_M especially: at 0.020 it is tighter than the hardware's own
+# resting reading. Measured on riskybird v3, drone flat on the bench, the
+# down-ToF reports 0.022 m -- an honest number, the sensor sits about that far
+# above the surface -- so the "on the ground" test failed by 2 mm and the
+# lift-and-place gesture could never complete.
+set(ARM_MAX_HEIGHT_M    0.020f CACHE STRING "on-ground height below which arming is allowed (m)")
+set(HOVER_Z_M           0.30f  CACHE STRING "autoflight hover altitude target (m)")
+# Non-autoflight hover setpoint. 1.0 m is the co-sim's number and is a 1 m step error for a drone
+# sitting on a bench, which saturates the altitude loop from the first iteration. Reachable here so
+# a bench run can regulate to where the drone actually is (-DTARGET_Z=0.0f) rather than to a
+# simulator's start height. Default matches main.cpp, so no existing build changes.
+set(TARGET_Z            1.0f   CACHE STRING "non-autoflight hover setpoint altitude (m)")
+set(AUTOFLIGHT_MAX_DUTY 0.45f  CACHE STRING "per-motor duty ceiling in flight (hover ~0.15)")
+
+# Airframe mass, in kg, feeding the PID cascade's altitude thrust feedforward.
+#
+# This is the SAME class of trap as ROSE_AUTOFLIGHT above, and it caught the flight build:
+# PID_MASS_KG existed ONLY as an `#ifndef` inside controller_pid.cpp and appeared nowhere in
+# target_compile_definitions, so `-DPID_MASS_KG=0.060f` on the CMake line set a cache variable
+# that nothing read and the image silently kept the 32 g Crazyflie default. docs/FLIGHT_BUILD.md
+# works around that by smuggling it through EXTRA_CPPFLAGS, under a heading that says in capitals
+# that these are NOT CMake knobs. Declaring it here makes it one, so a --mode can set it.
+#
+# It matters because the altitude loop is a PD with no integrator: the feedforward IS how the
+# loop reaches hover thrust, and a mass that is half the truth cannot get there at all. riskybird
+# v3 measures ~60 g against the 32 g default.
+#
+# The default below matches controller_pid.cpp's #ifndef exactly, so adding this changes no
+# existing build.
+set(PID_MASS_KG         0.032f CACHE STRING "airframe mass for the PID altitude feedforward (kg)")
+
+# Airframe property, measured per drone -- see the note in main.cpp. Driving a
+# motor below its break-away duty stalls it, and a stalled BRUSHED motor on a
+# low-side SI2302 is a resistor across the pack: motor and FET heat within
+# seconds. (There are no ESCs on this airframe; nothing latches. The old comment
+# here said otherwise.) So this is not a comfort setting.
+set(MOTOR_BREAKAWAY_DUTY 0.15f CACHE STRING "lowest duty at which every motor reliably starts")
+set(MOTOR_CHIRP_MS       400   CACHE STRING "chirp pulse length, ms")
+# NOTE: the bench cap below defaults to 0.10, which on this airframe is BELOW
+# break-away -- so `--mode motors` cannot start motor 4 at the default. Raise it
+# to at least MOTOR_BREAKAWAY_DUTY to drive motors in that mode. Left alone here
+# rather than raised silently, because it is a thrust-limiting safety cap.
+set(MOTOR_MAX_DUTY       0.10f CACHE STRING "bench-mode duty SCALE (non-autoflight)")
+
+# THE KNOB THAT MEANS WHAT "CAP" SOUNDS LIKE -- read the long note beside
+# MOTOR_MAX_DUTY in main.cpp before setting either.
+#
+# MOTOR_MAX_DUTY above is a SCALE applied last, to a duty that is already
+# physical: the controller's u + 0.583 round-trips controller_pid.cpp's
+# forceToVoltage() exactly. Hover on this airframe needs ~0.65-0.71 duty
+# (docs/FLIGHT_BUILD.md "hover needs ~65%", docs/FLIGHT_TUNING_LOG.md "~71 %
+# hover duty"), so setting MOTOR_MAX_DUTY to 0.75 "as a 75 % cap" delivers
+# 0.71 x 0.75 = 0.53 at the controller's hover command -- about 55 % of hover
+# THRUST, since thrust goes as duty^2. The drone cannot hover, and it fails by
+# porpoising rather than by sitting still: saturated while the altitude error is
+# large, collapsing as the command falls back toward hover.
+#
+# MOTOR_DUTY_CEILING is the ceiling the bench path's attitude-priority
+# anti-saturation cut works against, so exceeding it lowers the COLLECTIVE and
+# preserves the roll/pitch/yaw differential -- the semantics AUTOFLIGHT_MAX_DUTY
+# already has on the autoflight path.
+#
+# Default 1.0f = the hard-coded value it replaces, so every existing build is
+# bit-identical. A flight attempt sets BOTH:
+#
+#   RB_CMAKE_ARGS="-DMOTOR_MAX_DUTY=1.0f -DMOTOR_DUTY_CEILING=0.75f \
+#                  -DROSE_FLIGHT_COMMIT=1"
+#
+# and raises workloads/esp_motors' ESP_MOTORS_MAX_DUTY_PCT in the same session,
+# because that ceiling is independent and the LOWER of the two wins.
+set(MOTOR_DUTY_CEILING   1.0f  CACHE STRING "collective duty ceiling, differential-preserving (non-autoflight)")
+
+# Motor offload to the ESP32-C6. FPGA ball F13 -- motor4's gate -- is dead as an
+# output, so the FPGA can never drive all four motors. With this set the actuator
+# layer drives NO pin at all: it encodes the same duties into a 14-byte frame and
+# sends them on uart1 to the ESP, which owns every gate and generates the PWM.
+# The wire format is shared with workloads/esp_motors through the header in
+# ROSE_MOTOR_LINK_DIR, so neither end can drift from the other.
+set(ROSE_ESP_MOTORS 0 CACHE STRING "1=send motor duty frames on uart1 instead of driving PWM")
+set(ROSE_MOTOR_LINK_DIR "" CACHE STRING "riskybird integration/zephyr/motor_link directory")
+set(ROSE_ESP_MOTORS_HZ 50 CACHE STRING "motor duty frame rate on the ESP link, Hz")
+
+# One HM01B0 still at the top of an autoflight. The capture sequence is riskybird's
+# integration/zephyr/camera (split prepare/arm/done/finish so the control loop only
+# ever pays four register writes); the sensor register map is camera_bringup's.
+# Off by default, so every existing preset builds byte-identical.
+set(ROSE_CAMERA 0 CACHE STRING "1=capture one camera frame mid-hover (autoflight)")
+set(ROSE_CAMERA_DIR "" CACHE STRING
+  "riskybird integration/zephyr/camera directory (default: RB_ROOT/integration/zephyr/camera)")
 
 target_sources(app PRIVATE
   src/main.cpp
@@ -87,10 +272,79 @@ target_compile_definitions(app PRIVATE ROSE_USE_EKF=${ROSE_USE_EKF}
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
   ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW} ROSE_BARO=${ROSE_BARO}
-  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY})
+  ROSE_ESTIMATOR_ONLY=${ROSE_ESTIMATOR_ONLY}
+  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY}
+  ROSE_AUTOFLIGHT=${ROSE_AUTOFLIGHT} ROSE_BATT_SENSE=${ROSE_BATT_SENSE}
+  ROSE_BATT_REPORT_ONLY=${ROSE_BATT_REPORT_ONLY}
+  ROSE_FLIGHTLOG=${ROSE_FLIGHTLOG}
+  ROSE_TELEM=${ROSE_TELEM} ROSE_TELEM_DIV=${ROSE_TELEM_DIV}
+  ROSE_ARM_NO_GESTURE=${ROSE_ARM_NO_GESTURE}
+  ARM_MAX_HEIGHT_M=${ARM_MAX_HEIGHT_M} HOVER_Z_M=${HOVER_Z_M} TARGET_Z=${TARGET_Z}
+  AUTOFLIGHT_MAX_DUTY=${AUTOFLIGHT_MAX_DUTY}
+  MOTOR_BREAKAWAY_DUTY=${MOTOR_BREAKAWAY_DUTY} MOTOR_CHIRP_MS=${MOTOR_CHIRP_MS}
+  MOTOR_MAX_DUTY=${MOTOR_MAX_DUTY} MOTOR_DUTY_CEILING=${MOTOR_DUTY_CEILING}
+  PID_MASS_KG=${PID_MASS_KG}
+  ROSE_ESP_MOTORS=${ROSE_ESP_MOTORS} ROSE_ESP_MOTORS_HZ=${ROSE_ESP_MOTORS_HZ}
+  ROSE_FLIGHT_COMMIT=${ROSE_FLIGHT_COMMIT}
+  ROSE_MOTOR_WINDOW_MS=${ROSE_MOTOR_WINDOW_MS}
+  ROSE_COMMIT_MAX_MS=${ROSE_COMMIT_MAX_MS}
+  ROSE_CAMERA=${ROSE_CAMERA})
+
+if(NOT CS_GPIO_PIN STREQUAL "")
+  target_compile_definitions(app PRIVATE CS_GPIO_PIN=${CS_GPIO_PIN})
+endif()
+
+if(ROSE_CAMERA)
+  # Named, for the same reason as ROSE_MOTOR_LINK_DIR below: this sample is built from a
+  # submodule and has no fixed path to the riskybird checkout around it.
+  if(NOT ROSE_CAMERA_DIR)
+    if(NOT RB_ROOT)
+      message(FATAL_ERROR
+        "ROSE_CAMERA=1 needs -DROSE_CAMERA_DIR=<riskybird>/integration/zephyr/camera (or -DRB_ROOT)")
+    endif()
+    set(ROSE_CAMERA_DIR ${RB_ROOT}/integration/zephyr/camera)
+  endif()
+  target_sources(app PRIVATE ${ROSE_CAMERA_DIR}/src/camera.c)
+  target_include_directories(app PRIVATE
+    ${ROSE_CAMERA_DIR}/include
+    ${ROSE_CAMERA_DIR}/../../../workloads/camera_bringup/src)   # hm01b0.h
+  # Fail a dead sensor ~150 ms after MODE_SELECT instead of after the 6 s AE settle, so
+  # photo_prepare() can reset and retry at boot (see ROSE_PHOTO_TRIES in main.cpp). The
+  # 100 ms is camera_photo's proven MODE_SELECT -> PCLK check timing.
+  target_compile_definitions(app PRIVATE RB_CAMERA_EARLY_PCLK_MS=100)
+endif()
+
+# Only forwarded when explicitly set. Passing ROSE_UART_CMD= (empty) would expand
+# to `-DROSE_UART_CMD=` and turn `#if ROSE_UART_CMD` into a syntax error, so the
+# empty default is left for main.cpp's own #ifndef to resolve.
+if(NOT ROSE_UART_CMD STREQUAL "")
+  target_compile_definitions(app PRIVATE ROSE_UART_CMD=${ROSE_UART_CMD})
+endif()
+
+if(ROSE_ESP_MOTORS)
+  # Named rather than assumed: this sample is built in place from a submodule and
+  # has no fixed relationship to the riskybird checkout around it. Failing loudly
+  # here beats a "no such file: riskybird/motor_link.h" 200 lines into main.cpp.
+  if(NOT ROSE_MOTOR_LINK_DIR)
+    message(FATAL_ERROR
+      "ROSE_ESP_MOTORS=1 needs -DROSE_MOTOR_LINK_DIR=<riskybird>/integration/zephyr/motor_link")
+  endif()
+  target_include_directories(app PRIVATE ${ROSE_MOTOR_LINK_DIR}/include)
+endif()
 
 target_include_directories(app PRIVATE
   ${TINYMPC}/external/admm/include
   ${TINYMPC}/external/matlib/include
   ${TINYMPC}/include
   ${TINYMPC}/examples)
+
+# Both parents used ROSE_CAMERA for different capture implementations.
+# Keep still-photo ROSE_CAMERA; select upstream DMA with ROSE_CAMERA_DMA.
+# Empty values preserve existing EXTRA_CPPFLAGS overrides.
+set(ROSE_CAMERA_DMA "" CACHE STRING "1=upstream background camera DMA")
+set(ROSE_UART_TELEM "" CACHE STRING "1=upstream raw uart1 telemetry/snapshots")
+foreach(_mode ROSE_CAMERA_DMA ROSE_UART_TELEM)
+  if(NOT "${${_mode}}" STREQUAL "")
+    target_compile_definitions(app PRIVATE ${_mode}=${${_mode}})
+  endif()
+endforeach()

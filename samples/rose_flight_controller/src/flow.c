@@ -6,6 +6,7 @@
  * (samples/riskybird/pmw3901_test) with the optimized busy_wait_us read path (~285 us/read).
  */
 #include "flow.h"
+#include "fc_shared_math.h"
 #include "pmw3901.h"
 
 #include <zephyr/kernel.h>
@@ -15,6 +16,52 @@
 #include <zephyr/sys/printk.h>
 #include <errno.h>
 #include <math.h>
+
+/*
+ * Which SPI controller the PMW3901 hangs off.
+ *
+ * This used to be a bare DT_NODELABEL(spi2) -- the ESP32-C6's controller -- resolved in the
+ * preprocessor. Any board without a node labelled exactly `spi2` therefore failed to BUILD the
+ * whole flight controller, even with the flow feature off, because CMakeLists compiles this file
+ * unconditionally. The RiskyBird FPGA carrier's flow sensor is on spi@10031000, labelled spi0.
+ *
+ * A board now points at its own controller with a `flow-spi` alias; boards that do not are
+ * unchanged, because the fallback is the original spi2 label. The ESP build therefore selects
+ * exactly the same node as before.
+ *
+ * NOTE this is deliberately NOT the `flow` alias. That alias means the RoSE *virtual* flow
+ * device and drives HAVE_FLOW in main.cpp (spike co-sim only); the real PMW3901 path is selected
+ * by the ROSE_FLOW CMake knob and talks to the bus directly, with no Zephyr driver and no `flow`
+ * node. The ESP flies with ROSE_FLOW=1 and no `flow` alias at all, so guarding this file on that
+ * alias would silently disable optical flow on the configuration that actually flew.
+ */
+#if DT_NODE_EXISTS(DT_ALIAS(flow_spi))
+#define FLOW_SPI_NODE   DT_ALIAS(flow_spi)
+#define HAVE_FLOW_HW    1
+#elif DT_NODE_EXISTS(DT_NODELABEL(spi2))
+#define FLOW_SPI_NODE   DT_NODELABEL(spi2)
+#define HAVE_FLOW_HW    1
+#else
+#define HAVE_FLOW_HW    0
+#endif
+
+#if !HAVE_FLOW_HW
+
+int flow_init(void)
+{
+	printk("flow: no flow-spi alias and no spi2 node -- optical flow unavailable\n");
+	return -ENODEV;
+}
+
+void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid)
+{
+	if (ang_x) { *ang_x = 0.0f; }
+	if (ang_y) { *ang_y = 0.0f; }
+	if (squal) { *squal = 0; }
+	if (valid) { *valid = false; }
+}
+
+#else
 
 /* --- tunables (override via -D) --- */
 #ifndef FLOW_RAD_PER_COUNT
@@ -49,14 +96,28 @@
 #define FLOW_LP_TAU_Y 0.0f       /* y low-pass time constant (s); 0 = off */
 #endif
 
-/* Software chip-select pin index on the gpio0 controller.
- *   ESP32 target : ESP GPIO 19 (v3 wiring SCLK=6 MOSI=7 MISO=18 CS=19).
- *   FPGA target  : gpio@10010000 bit 0 (ball D16) — PMW3901 NCS routed in the DMA shell
- *                  (SCK=F16, MOSI=E17, MISO=E16). See boards/chipyard_riscv64.overlay. */
+/*
+ * Software chip-select pin, on the controller named by `gpio0`.
+ *
+ * 19 is the ESP32-C6's (v3: SCLK=6 MOSI=7 MISO=18 CS=19). The FPGA carrier's
+ * DroneLogic GPIO block is a DIFFERENT controller with its own numbering, and
+ * the flow sensor's CS is logical index 0 there -- which is what
+ * hardware/zephyr/targets/fpga/workloads/pmw3901_test.overlay declares and what
+ * workloads/bootup_check reads the chip ID through successfully.
+ *
+ * THIS WAS NOT OVERRIDABLE. Both flight_controller-flow.overlay and
+ * docs/flight-on-fpga.md tell the operator to pass -DCS_GPIO_PIN=0 for the FPGA
+ * build, and a bare `#define` here silently won that argument: the command-line
+ * definition is redefined by this line (a warning, not an error), so an FPGA
+ * flow build drove gpio0 pin 19 as chip select and the sensor never answered.
+ * The #ifndef makes the documented override actually work.
+ */
+#ifndef CS_GPIO_PIN
 #if defined(CONFIG_BOARD_CHIPYARD_RISCV64)
 #define CS_GPIO_PIN 0
 #else
 #define CS_GPIO_PIN 19
+#endif
 #endif
 
 /* Manually-constructed pmw3901 device (the driver takes cfg/data via a struct device, same as the
@@ -91,20 +152,11 @@ static void flow_thread_fn(void *a, void *b, void *c)
 		t_prev = t_now;
 
 		if (rc == 0 && dt > 1e-4f && dt < 0.5f) {
-			/* remap sensor deltas -> drone body frame, convert counts -> angular rate (rad/s).
-			 * drone +x (fwd) = -deltaX ; drone +y (left) = +deltaY  (validated on HW). */
-			float ax = -(float)m.deltaX * FLOW_RAD_PER_COUNT / dt;
-			float ay =  (float)m.deltaY * FLOW_RAD_PER_COUNT / dt;
-			/* Per-sample low-pass at the sensor rate. k = 1 - exp(-dt/tau): a longer tau (smaller k)
-			 * smooths harder + lags more. tau=0 -> k=1 -> pass-through (raw). Seeded on first sample. */
-			static float axf, ayf; static bool lp_seed;
-			if (!lp_seed) { axf = ax; ayf = ay; lp_seed = true; }
-			float kx = (FLOW_LP_TAU_X > 0.0f) ? (1.0f - expf(-dt / FLOW_LP_TAU_X)) : 1.0f;
-			float ky = (FLOW_LP_TAU_Y > 0.0f) ? (1.0f - expf(-dt / FLOW_LP_TAU_Y)) : 1.0f;
-			axf += kx * (ax - axf);
-			ayf += ky * (ay - ayf);
-			k_mutex_lock(&flow_mtx, K_FOREVER);
-			g_ax = axf; g_ay = ayf;
+            static struct fc_flow_filter filtered;
+            fc_flow_counts(&filtered, m.deltaX, m.deltaY, dt, FLOW_RAD_PER_COUNT,
+                           FLOW_LP_TAU_X, FLOW_LP_TAU_Y);
+            k_mutex_lock(&flow_mtx, K_FOREVER);
+            g_ax = filtered.x; g_ay = filtered.y;
 			g_squal = m.squal; g_squal_ok = (m.squal >= FLOW_MIN_SQUAL);
 			g_last_ms = k_uptime_get();
 			g_seq++;
@@ -116,7 +168,7 @@ static void flow_thread_fn(void *a, void *b, void *c)
 
 int flow_init(void)
 {
-	const struct device *spi_dev  = DEVICE_DT_GET(DT_NODELABEL(spi2));
+	const struct device *spi_dev  = DEVICE_DT_GET(FLOW_SPI_NODE);
 	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 	if (!device_is_ready(spi_dev) || !device_is_ready(gpio_dev)) {
 		printk("flow: SPI/GPIO not ready -- flow disabled\n");
@@ -162,3 +214,5 @@ void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid)
 	*valid = g_squal_ok && fresh && (g_seq != 0);
 	k_mutex_unlock(&flow_mtx);
 }
+
+#endif /* HAVE_FLOW_HW */

@@ -13,7 +13,7 @@
 [submodule "zephyr_ws/zephyr"]
 	path = zephyr_ws/zephyr
 	url = https://github.com/ucb-bar/zephyr.git
-	branch = rose-2-dev
+	branch = integration/riskybird-20260928
 [submodule "tools/pyuartsi"]
 	path = tools/pyuartsi
 	url = https://github.com/ucb-bar/pyuartsi.git
@@ -34,6 +34,8 @@
 	path = third-party/micro_ros_zephyr_module
 	url = https://github.com/ucb-bar/micro_ros_zephyr_module.git
 	branch = jazzy
+
 [submodule "modelblaster"]
 	path = modelblaster
-	url = git@github.com:ucb-bar/ModelBlaster.git
+	url = https://github.com/lorenshung/ModelBlaster.git
+	branch = integration/riskybird-20260928

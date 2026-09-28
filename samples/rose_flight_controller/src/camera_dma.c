@@ -2,12 +2,12 @@
  * Copyright (c) 2026 UC Berkeley
  * SPDX-License-Identifier: Apache-2.0
  *
- * See camera_dma.h. Body compiled only when ROSE_CAMERA=1; otherwise empty stubs so non-camera
+ * See camera_dma.h. Body compiled only when ROSE_CAMERA_DMA=1; otherwise empty stubs so non-camera
  * builds are unaffected. Requires a DMA-capable OSPI shell (RocketArty200TDroneFullDDRDmaConfig).
  */
 #include "camera_dma.h"
 
-#if ROSE_CAMERA
+#if ROSE_CAMERA_DMA
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/i2c.h>
@@ -293,7 +293,7 @@ void camera_dma_request_snapshot(uint32_t seq, int w, int h)
 	g_snap_req = seq ? seq : 1;   /* nonzero -> serviced by the camera thread */
 }
 
-#else  /* ROSE_CAMERA == 0 */
+#else  /* ROSE_CAMERA_DMA == 0 */
 
 void camera_dma_init(void) {}
 uint32_t camera_dma_frames(void) { return 0; }

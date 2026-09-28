@@ -3,7 +3,7 @@
 # Install Miniforge3 (Linux/x86_64) into ./tools/miniforge3 non-interactively,
 # then configure solver and install clang (lib + python bindings) + dotmap.
 # Re-runnable and idempotent.
-scripts/install_conda.sh#
+#
 # NOTE: This script is meant to be SOURCED, not executed.
 # When sourced, we must be careful not to set options that affect the parent shell.
 
@@ -30,8 +30,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TOOLS_DIR="${REPO_ROOT}/tools"
 INSTALL_DIR="${TOOLS_DIR}/miniforge3"
-INSTALLER="${TOOLS_DIR}/Miniforge3-Linux-x86_64.sh"
-MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+# Miniforge publishes one installer per host. Hardcoding the Linux one means a
+# Mac gets no conda, hence no west, hence no `west build` -- with the failure
+# appearing three steps later as a missing binary rather than here. Detected
+# from uname; override with RB_CONDA_HOST for a host this does not know.
+if [[ -n "${RB_CONDA_HOST:-}" ]]; then
+  CONDA_HOST="${RB_CONDA_HOST}"
+else
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)   CONDA_HOST="Linux-x86_64"   ;;
+    Linux-aarch64)  CONDA_HOST="Linux-aarch64"  ;;
+    Darwin-arm64)   CONDA_HOST="MacOSX-arm64"   ;;
+    Darwin-x86_64)  CONDA_HOST="MacOSX-x86_64"  ;;
+    *) echo "ERROR: unsupported host $(uname -s)-$(uname -m); set RB_CONDA_HOST" >&2
+       return 1 2>/dev/null || exit 1 ;;
+  esac
+fi
+INSTALLER="${TOOLS_DIR}/Miniforge3-${CONDA_HOST}.sh"
+MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-${CONDA_HOST}.sh"
 
 # Versions to keep clang pieces consistent (avoid solver conflicts)
 CLANG_MAJOR="18"

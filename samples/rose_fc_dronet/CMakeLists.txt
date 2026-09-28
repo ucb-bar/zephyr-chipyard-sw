@@ -196,3 +196,14 @@ target_include_directories(app PRIVATE
   ${TINYMPC}/external/matlib/include
   ${TINYMPC}/include
   ${TINYMPC}/examples)
+
+# Both parents used ROSE_CAMERA for different capture implementations.
+# Keep still-photo ROSE_CAMERA; select upstream DMA with ROSE_CAMERA_DMA.
+# Empty values preserve existing EXTRA_CPPFLAGS overrides.
+set(ROSE_CAMERA_DMA "" CACHE STRING "1=upstream background camera DMA")
+set(ROSE_UART_TELEM "" CACHE STRING "1=upstream raw uart1 telemetry/snapshots")
+foreach(_mode ROSE_CAMERA_DMA ROSE_UART_TELEM)
+  if(NOT "${${_mode}}" STREQUAL "")
+    target_compile_definitions(app PRIVATE ${_mode}=${${_mode}})
+  endif()
+endforeach()

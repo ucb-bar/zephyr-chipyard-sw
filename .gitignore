@@ -32,3 +32,7 @@
 /samples/rose_fc_dronet/dronet_model_poll/test_input.bin
 /samples/rose_fc_dronet/dronet_model_poll/test_io.S
 /samples/rose_fc_dronet/dronet_model_poll/test_io.h
+
+# COCO-pretrained YOLOv8n weights; ultralytics downloads this on demand
+# (YOLO("yolov8n.pt") in modelblaster/examples/yolov8_nano).
+/yolov8n.pt
