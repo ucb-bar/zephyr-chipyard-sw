@@ -196,6 +196,41 @@
       <span id="pack" class="muted" style="font-family:var(--mono)">defaults</span>
     </div>
   </div>
+
+  <!-- camera snapshot -->
+  <div class="card c12">
+    <h2>Camera &nbsp;<span class="muted" style="text-transform:none;letter-spacing:0">HM01B0 · snapshot over uart1 → WiFi</span></h2>
+    <div id="cam" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start">
+      <div style="display:flex;flex-direction:column;gap:8px;min-width:180px">
+        <button class="reset" onclick="snap()" style="font-size:15px">📷 CAPTURE</button>
+        <label>resolution
+          <select id="cam_res" style="margin-left:6px">
+            <option value="80 60">80×60 (fast ~0.05 s)</option>
+            <option value="160 120" selected>160×120 (~0.2 s)</option>
+            <option value="240 180">240×180 (~0.4 s)</option>
+            <option value="326 319">326×319 full (~1.2 s)</option>
+          </select>
+        </label>
+        <span id="cam_status" class="muted" style="font-family:var(--mono)">no snapshot yet</span>
+        <a id="cam_dl" class="muted" style="font-family:var(--mono);display:none" download="snapshot.png">⤓ save PNG</a>
+      </div>
+      <img id="cam_img" alt="(no snapshot)"
+           style="max-width:min(100%,480px);image-rendering:pixelated;background:#000;
+                  border:1px solid var(--line);border-radius:6px;display:none">
+    </div>
+  </div>
+
+  <!-- side-ToF walls -->
+  <div class="card c12">
+    <h2>Side ToF &nbsp;<span class="muted" style="text-transform:none;letter-spacing:0">4× VL53L5CX wall bumper · mm (−1 = clear)</span></h2>
+    <div id="walls" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;text-align:center">
+      <div><div class="muted">front</div><div id="w_front" class="v" style="font-size:22px">--</div></div>
+      <div><div class="muted">back</div><div id="w_back" class="v" style="font-size:22px">--</div></div>
+      <div><div class="muted">left</div><div id="w_left" class="v" style="font-size:22px">--</div></div>
+      <div><div class="muted">right</div><div id="w_right" class="v" style="font-size:22px">--</div></div>
+    </div>
+    <div class="muted" style="margin-top:6px;font-family:var(--mono)">seq <span id="w_seq">--</span></div>
+  </div>
 </div>
 
 <script>
@@ -229,6 +264,29 @@ async function sendProfile(){
   await cmd('PROFILE '+c+' '+h+' '+d+' '+m);
   await cmd('HOVER_Z '+hz);
   $('pack').textContent=`set: climb ${c} / hover ${h} / descend ${d} / cap ${m} ms, alt ${hz} mm`;
+}
+
+// ---- camera snapshot ----
+let lastSnapSeq = 0, snapPending = false, snapT0 = 0;
+function snap(){
+  const res = $('cam_res').value;             // "W H"
+  snapPending = true; snapT0 = performance.now();
+  $('cam_status').textContent = 'requesting ' + res.replace(' ','×') + ' …';
+  cmd('SNAP ' + res);                          // FPGA captures next frame + streams IMG chunks
+}
+function onSnapStatus(s){
+  if(!s) return;
+  if(s.progress && snapPending){
+    $('cam_status').textContent = 'receiving ' + s.progress.have + '/' + s.progress.total + ' chunks…';
+  }
+  if(s.have_png && s.seq && s.seq !== lastSnapSeq){
+    lastSnapSeq = s.seq; snapPending = false;
+    const img = $('cam_img'), url = '/snapshot.png?' + s.seq;   // ?seq busts the cache
+    img.src = url; img.style.display = 'block';
+    const dl = $('cam_dl'); dl.href = url; dl.style.display = 'inline';
+    const dt = snapT0 ? ' in ' + ((performance.now()-snapT0)/1000).toFixed(1) + ' s' : '';
+    $('cam_status').textContent = 'frame #' + s.seq + '  ' + s.w + '×' + s.h + dt;
+  }
 }
 
 // ---- trend ring buffers ----
@@ -315,6 +373,7 @@ function stateClass(t){
 }
 function render(p){
   const L=p.link, t=p.t;
+  onSnapStatus(p.snap);   // refresh the camera image whenever a new snapshot completes
   $('dot').className='dot'+(L.connected?' on':'');
   $('linktxt').textContent = L.connected? 'linked' : (L.age_ms==null?'no link':'stale');
   $('rate').textContent = L.rate.toFixed(0)+' Hz';
@@ -340,9 +399,15 @@ function render(p){
   $('zsp').textContent=(t.zsp==null?'--':t.zsp.toFixed(2))+' m';
   $('tofh').textContent=t.tofh.toFixed(2)+' m';
   $('tofv').innerHTML = t.tofv? '<span style="color:var(--ok)">yes</span>':'<span style="color:var(--bad)">no</span>';
+  if(t.walls){ const wf=v=>(v==null||v<0)?'--':v+' mm';
+    $('w_front').textContent=wf(t.walls.front); $('w_back').textContent=wf(t.walls.back);
+    $('w_left').textContent=wf(t.walls.left);   $('w_right').textContent=wf(t.walls.right);
+    $('w_seq').textContent=t.walls.seq; }
   const mids=['m0','m1','m2','m3'];
-  for(let i=0;i<4;i++){ const v=t.u[i]; $(mids[i]).textContent=v.toFixed(3);
-    const b=$(mids[i]+'b'); b.style.width=Math.max(0,Math.min(100,v*100))+'%';
+  for(let i=0;i<4;i++){ const v=t.u[i]; const b=$(mids[i]+'b');
+    if(v==null){ $(mids[i]).textContent='--'; b.style.width='0'; continue; }  // FPGA line has no motor duty
+    $(mids[i]).textContent=v.toFixed(3);
+    b.style.width=Math.max(0,Math.min(100,v*100))+'%';
     b.style.background = v<0.4?'#3fb950':v<0.75?'#d29922':'#f85149'; }
   if(t.vbat!=null && t.vbat>=1){ $('vbat').textContent=t.vbat.toFixed(2);
     $('vbatbar').style.width=Math.max(0,Math.min(100,(t.vbat-3.2)/(4.2-3.2)*100))+'%';

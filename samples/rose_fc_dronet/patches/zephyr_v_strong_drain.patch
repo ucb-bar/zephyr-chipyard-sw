@@ -1,0 +1,66 @@
+V-race #2 sub-hyp (b) STRONGER-DRAIN probe (firmware-only, NO rebuild): the CHEAP,
+free last lever before declaring the ceiling. The bare fence before the eager-V
+save/restore only MITIGATES the wild-store fault, consistent with a Saturn busy
+signal deasserting before a prior store's mem transaction fully retires -> the
+eager-V vse8.v/vle8.v issues into a not-yet-drained VMU and collides (in-range,
+8-aligned switch_handle corruption; interrupt-defer proven ineffective, so this is
+NOT an interrupt window). This adds z_riscv_v_strong_drain() = fence + a DEPENDENT
+load-after-store to a canary (load can't retire until the store is globally visible)
++ fence, called right before the bulk vse8.v (save) and vle8.v (restore), on top of
+the current fix set (is_dirty init-guard + vstart/fence). Orthogonal to all RTL.
+
+APPLY: cd <zephyr>; git apply zephyr_v_strong_drain.patch  (already applied to the
+local tree v.c; if you build from a different tree, apply there -- not both).
+TEST: rebuild FIRMWARE only, multi-run PREEMPTIBLE build_rocc_pre xN (and ATOMIC
+build_rocc_gated xN). If the mcause-5 tally IMPROVES markedly -> sub-hyp (b) confirmed
+(store-drain-completeness), and we scope a proper barrier / RTL busy-signal fix. If it
+does NOT move from ~3-4/8 -> sub-hyp (b) is OUT, and the wild vse8.v store must be
+pinned by waveform (xsim); interrupt-defer + drain both exhausted.
+NOTE: this is a low-confidence probe -- a scalar canary load/store may not fully drain
+the decoupled VECTOR VMU path if their store buffers are separate; it's the cheapest
+test of (b) with no rebuild. The wild-thread guard may stay for this run's cross-check
+but is dropped from the final set.
+
+--- a/arch/riscv/core/v.c
++++ b/arch/riscv/core/v.c
+@@ -147,6 +147,24 @@
+ 	} while (vs != 0 && ++n < 8);
+ }
+ 
++/* V-race #2 sub-hyp (b) "stronger drain" probe: some Saturn busy signals may
++ * deassert before a prior store's mem transaction fully retires, so the eager-V
++ * save's vse8.v / restore's vle8.v issues into a not-yet-drained VMU and collides
++ * (the bare fence only mitigates the fault, never fixes it). Force a fuller drain:
++ * fence, then a DEPENDENT load-after-store to a canary (the load cannot retire until
++ * the store is globally visible -> forces the store path to actually settle), then a
++ * fence consuming the loaded value. Cheap firmware probe; if the fault tally does not
++ * move, sub-hyp (b) is out and the wild store must be pinned by waveform. */
++static volatile unsigned long z_riscv_v_drain_canary;
++static inline void z_riscv_v_strong_drain(void)
++{
++	unsigned long v;
++	__asm volatile("fence rw, rw" ::: "memory");
++	z_riscv_v_drain_canary = 1UL;			/* store */
++	v = z_riscv_v_drain_canary;			/* dependent load-after-store */
++	__asm volatile("fence rw, rw" :: "r"(v) : "memory");	/* consume v -> ordering + drain */
++}
++
+ /* V-race #2 residual (atomic mcause-5): a valid k_thread lives in
+  * [CONFIG_SRAM_BASE_ADDRESS, +CONFIG_SRAM_SIZE KiB). The residual fault is an
+  * eager V save/restore invoked with a WILD thread pointer (a scheduler
+@@ -189,6 +207,7 @@
+ 		 * path could miss real reg modifications. */
+ 		z_riscv_vstate_csr_save(save_to);
+ 		z_riscv_force_vstart0();	/* V-race #2: ensure full save (vstart==0) */
++		z_riscv_v_strong_drain();	/* V-race #2 sub-hyp (b): fully settle prior stores before vse8.v */
+ 		unsigned long vl;
+ 		__asm volatile(
+ 			".option push\n\t"
+@@ -289,6 +308,7 @@
+ 		__asm volatile("fence rw, rw" ::: "memory");
+ #endif
+ 		z_riscv_force_vstart0();	/* V-race #2: force vstart==0 so vle8.v@m8 doesn't trap/corrupt */
++		z_riscv_v_strong_drain();	/* V-race #2 sub-hyp (b): fully settle prior stores before vle8.v */
+ 		__asm volatile(
+ 			".option push\n\t"
+ 			".option arch, +v\n\t"

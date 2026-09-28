@@ -16,6 +16,11 @@
 #include <zephyr/sys/printk.h>
 #include <string.h>
 
+/* The logger targets the "storage" flash partition. Targets without flash (e.g. the FPGA Rocket,
+ * chipyard_riscv64) have no such partition -- compile the body out there. The FC only *calls*
+ * these functions under ROSE_FLIGHTLOG, which those targets don't set, so empty is safe. */
+#if DT_NODE_EXISTS(DT_NODELABEL(storage_partition))
+
 #define LOG_PARTITION   storage_partition
 #define REC_SIZE        ((uint32_t)sizeof(struct flight_rec))   /* 20 (multiple of 4) */
 /* Flush chunk kept small so each flash write (a whole-CPU XIP stall on ESP32, ~1.5us/byte) is
@@ -208,3 +213,5 @@ int flightlog_dump(void)
 	flash_area_close(fa);
 	return n;
 }
+
+#endif /* DT_NODE_EXISTS(storage_partition) */

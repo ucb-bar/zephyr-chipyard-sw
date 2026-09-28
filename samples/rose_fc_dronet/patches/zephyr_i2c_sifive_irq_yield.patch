@@ -1,0 +1,222 @@
+diff --git a/drivers/i2c/Kconfig.sifive b/drivers/i2c/Kconfig.sifive
+index ad6a5d91b97..819945ca644 100644
+--- a/drivers/i2c/Kconfig.sifive
++++ b/drivers/i2c/Kconfig.sifive
+@@ -7,3 +7,19 @@ config I2C_SIFIVE
+ 	depends on DT_HAS_SIFIVE_I2C0_ENABLED
+ 	help
+ 	  Enable I2C support on SiFive Freedom
++
++config I2C_SIFIVE_IRQ_YIELD
++	bool "Yield the hart during the SiFive I2C busy-wait"
++	default n
++	depends on I2C_SIFIVE
++	help
++	  Instead of hard-spinning on the transfer-in-progress (TIP) status bit,
++	  block on a semaphore (up to one tick) inside the busy-wait so the
++	  scheduler can run a lower-priority compute thread (e.g. a co-resident
++	  DroNet inference) during the ~microsecond-per-byte I2C bus wait. The
++	  transfer-complete interrupt (control IE / status IP) gives the semaphore
++	  to wake the waiter early; TIP stays authoritative, so if the I2C PLIC
++	  interrupt is not wired the wait still falls back to a tick-bounded
++	  re-poll (yields, never hangs). Default n keeps the proven hard-spin.
++	  NOTE: needs bench validation that the I2C PLIC interrupt actually fires
++	  on this bitstream before relying on the early-wake path.
+diff --git a/drivers/i2c/i2c_sifive.c b/drivers/i2c/i2c_sifive.c
+index 000031a27d6..39ec1f4cd97 100644
+--- a/drivers/i2c/i2c_sifive.c
++++ b/drivers/i2c/i2c_sifive.c
+@@ -64,6 +64,9 @@ struct i2c_sifive_cfg {
+ 	uint32_t base;
+ 	uint32_t f_sys;
+ 	uint32_t f_bus;
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++	void (*irq_config)(void);
++#endif
+ };
+ 
+ struct i2c_sifive_data {
+@@ -72,6 +75,14 @@ struct i2c_sifive_data {
+ 	 * VL53L1X ranging transaction in the ToF thread) interleave on the shared controller and
+ 	 * corrupt each other, surfacing as NACKs / VL53L1_ERROR_CONTROL_INTERFACE. */
+ 	struct k_mutex bus_mutex;
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++	/* Given by the completion ISR so the busy-wait YIELDS the hart (see
++	 * i2c_sifive_wait_hint) instead of hard-spinning on TIP. This lets a
++	 * co-resident low-priority compute thread (e.g. the DroNet inference) run
++	 * during the ~us-per-byte i2c bus wait, which otherwise burns ~1 ms of
++	 * hart time per control-loop IMU read. */
++	struct k_sem xfer_done;
++#endif
+ };
+ 
+ /* Helper functions */
+@@ -83,6 +94,39 @@ static inline bool i2c_sifive_busy(const struct device *dev)
+ 	return IS_SET(config, REG_STATUS, SF_STATUS_TIP);
+ }
+ 
++/* Called inside each `while (i2c_sifive_busy(dev))` spin. Default: nothing
++ * (hard spin -- unchanged, proven). With CONFIG_I2C_SIFIVE_IRQ_YIELD: block on a
++ * semaphore for up to one tick so the scheduler runs a lower-priority thread
++ * (DroNet) while the byte transfers; the completion ISR gives the sem to wake us
++ * early, and TIP stays authoritative so a missing/unwired IRQ just falls back to
++ * the tick-bounded re-poll (still yields, never hangs). */
++static inline void i2c_sifive_wait_hint(const struct device *dev)
++{
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++	struct i2c_sifive_data *data = dev->data;
++
++	(void)k_sem_take(&data->xfer_done, K_TICKS(1));
++#else
++	ARG_UNUSED(dev);
++#endif
++}
++
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++static void i2c_sifive_isr(const struct device *dev)
++{
++	const struct i2c_sifive_cfg *config = dev->config;
++	struct i2c_sifive_data *data = dev->data;
++
++	if (IS_SET(config, REG_STATUS, SF_STATUS_IP)) {
++		/* Interrupt-acknowledge clears IP (write-only command bit), then wake
++		 * the waiter. TIP is re-checked by the waiter, so a spurious give is
++		 * harmless. */
++		sys_write8(SF_CMD_IACK, I2C_REG(config, REG_COMMAND));
++		k_sem_give(&data->xfer_done);
++	}
++}
++#endif
++
+ static int i2c_sifive_send_addr(const struct device *dev,
+ 				uint16_t addr,
+ 				uint16_t rw_flag)
+@@ -90,7 +134,7 @@ static int i2c_sifive_send_addr(const struct device *dev,
+ 	const struct i2c_sifive_cfg *config = dev->config;
+ 
+ 	/* Wait for previous transfer */
+-	while (i2c_sifive_busy(dev)) {}
++	while (i2c_sifive_busy(dev)) { i2c_sifive_wait_hint(dev);}
+ 
+ 	/* Transmit address (7-bit << 1 | rw) */
+ 	uint8_t addr_byte = (addr << 1) | (rw_flag & 0x1);
+@@ -99,7 +143,7 @@ static int i2c_sifive_send_addr(const struct device *dev,
+ 	/* Issue START + WRITE */
+ 	sys_write8(SF_CMD_WRITE | SF_CMD_START, I2C_REG(config, REG_COMMAND));
+ 
+-	while (i2c_sifive_busy(dev)) {}
++	while (i2c_sifive_busy(dev)) { i2c_sifive_wait_hint(dev);}
+ 
+ 	/* Read status immediately after transfer to check for NACK */
+ 	uint8_t status = sys_read8(I2C_REG(config, REG_STATUS));
+@@ -127,7 +171,7 @@ static int i2c_sifive_write_msg(const struct device *dev,
+ 
+ 	for (uint32_t i = 0; i < msg->len; i++) {
+ 		/* Wait for a previous transfer */
+-		while (i2c_sifive_busy(dev)) {
++		while (i2c_sifive_busy(dev)) { i2c_sifive_wait_hint(dev);
+ 		}
+ 
+ 		/* Put data in transmit reg */
+@@ -148,7 +192,7 @@ static int i2c_sifive_write_msg(const struct device *dev,
+ 		sys_write8(command, I2C_REG(config, REG_COMMAND));
+ 
+ 		/* Wait for a previous transfer */
+-		while (i2c_sifive_busy(dev)) {
++		while (i2c_sifive_busy(dev)) { i2c_sifive_wait_hint(dev);
+ 		}
+ 
+ 		if (IS_SET(config, REG_STATUS, SF_STATUS_RXACK)) {
+@@ -175,7 +219,7 @@ static int i2c_sifive_read_msg(const struct device *dev,
+ 		return rc;
+ 	}
+ 
+-	while (i2c_sifive_busy(dev)) {
++	while (i2c_sifive_busy(dev)) { i2c_sifive_wait_hint(dev);
+ 	}
+ 
+ 	for (int i = 0; i < msg->len; i++) {
+@@ -197,7 +241,7 @@ static int i2c_sifive_read_msg(const struct device *dev,
+ 		sys_write8(command, I2C_REG(config, REG_COMMAND));
+ 
+ 		/* Wait for the read to complete */
+-		while (i2c_sifive_busy(dev)) {
++		while (i2c_sifive_busy(dev)) { i2c_sifive_wait_hint(dev);
+ 		}
+ 
+ 		/* Store the received byte */
+@@ -268,8 +312,13 @@ static int i2c_sifive_configure(const struct device *dev, uint32_t dev_config)
+ 		return -ENOTSUP;
+ 	}
+ 
+-	/* Enable the I2C peripheral */
++	/* Enable the I2C peripheral (+ completion interrupt when the yield path is
++	 * built, so the ISR can wake the busy-wait early). */
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++	sys_write8(SF_CONTROL_EN | SF_CONTROL_IE, I2C_REG(config, REG_CONTROL));
++#else
+ 	sys_write8(SF_CONTROL_EN, I2C_REG(config, REG_CONTROL));
++#endif
+ 
+ 	return 0;
+ }
+@@ -300,6 +349,12 @@ static int i2c_sifive_transfer(const struct device *dev,
+ 	 * (write-then-read) sequence from one thread can't be split by another thread. */
+ 	k_mutex_lock(&data->bus_mutex, K_FOREVER);
+ 
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++	/* Drop any stale completion signal from a prior transaction; TIP stays
++	 * authoritative, this just avoids a spurious first wake. */
++	k_sem_reset(&data->xfer_done);
++#endif
++
+ 	for (int i = 0; i < num_msgs; i++) {
+ 		if (msgs[i].flags & I2C_MSG_READ) {
+ 			rc = i2c_sifive_read_msg(dev, &(msgs[i]), addr);
+@@ -326,6 +381,18 @@ static int i2c_sifive_init(const struct device *dev)
+ 
+ 	k_mutex_init(&data->bus_mutex);
+ 
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++	/* COUNTING sem (not binary): the completion ISR fires once per byte; if two
++	 * bytes complete before the busy-wait consumes a give, a binary sem (limit 1)
++	 * silently drops the second -> the next wait_hint blocks a full tick (lost
++	 * wakeup), which showed as intermittent 15 ms i2c reads. A counting sem
++	 * accumulates every give so each byte's completion is consumed exactly once. */
++	k_sem_init(&data->xfer_done, 0, K_SEM_MAX_LIMIT);
++	if (config->irq_config != NULL) {
++		config->irq_config();
++	}
++#endif
++
+ 	dev_config = (I2C_MODE_CONTROLLER | i2c_map_dt_bitrate(config->f_bus));
+ 
+ 	rc = i2c_sifive_configure(dev, dev_config);
+@@ -347,11 +414,27 @@ static DEVICE_API(i2c, i2c_sifive_api) = {
+ 
+ /* Device instantiation */
+ 
++#ifdef CONFIG_I2C_SIFIVE_IRQ_YIELD
++#define I2C_SIFIVE_IRQ_FIELD(n) .irq_config = i2c_sifive_irq_config_##n,
++#define I2C_SIFIVE_IRQ_FUNC(n) \
++	static void i2c_sifive_irq_config_##n(void) \
++	{ \
++		IRQ_CONNECT(DT_INST_IRQN(n), DT_INST_IRQ(n, priority), \
++			    i2c_sifive_isr, DEVICE_DT_INST_GET(n), 0); \
++		irq_enable(DT_INST_IRQN(n)); \
++	}
++#else
++#define I2C_SIFIVE_IRQ_FIELD(n)
++#define I2C_SIFIVE_IRQ_FUNC(n)
++#endif
++
+ #define I2C_SIFIVE_INIT(n) \
++	I2C_SIFIVE_IRQ_FUNC(n) \
+ 	static struct i2c_sifive_cfg i2c_sifive_cfg_##n = { \
+ 		.base = DT_INST_REG_ADDR(n), \
+ 		.f_sys = SIFIVE_PERIPHERAL_CLOCK_FREQUENCY, \
+ 		.f_bus = DT_INST_PROP(n, clock_frequency), \
++		I2C_SIFIVE_IRQ_FIELD(n) \
+ 	}; \
+ 	static struct i2c_sifive_data i2c_sifive_data_##n; \
+ 	I2C_DEVICE_DT_INST_DEFINE(n, \

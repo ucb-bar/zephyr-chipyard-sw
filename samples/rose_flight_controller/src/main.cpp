@@ -29,6 +29,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <string.h>
+#include <stdlib.h>   /* strtol -- parse SNAP/HOVER_Z command args from the uplink */
 
 #include "estimator.hpp"
 #include "controller.hpp"
@@ -38,6 +39,8 @@
 #if defined(CONFIG_WIFI)
 #include "telem_wifi.h"         /* WiFi SoftAP UDP telemetry downlink (opt-in telem.conf; see plan) */
 #endif
+#include "telem_uart.h"         /* uart1 telemetry -> ESP wireless bridge (ROSE_UART_TELEM; FPGA target) */
+#include "camera_dma.h"         /* HM01B0 DMA frame capture on a bg thread (ROSE_CAMERA; DMA OSPI shell) */
 
 /* Repulsion bridge into the PID controller (defined in controller_pid.cpp). Feeding walls only has
  * an effect when the PID controller is active + built with ROSE_BUMPER; harmless otherwise. */
@@ -159,6 +162,16 @@ static inline bool batt_ok_to_arm(void)
 #define FP3(x) ((x) < 0 ? "-" : ""), (int)fabsf(x), ((int)(fabsf(x) * 1000.0f)) % 1000
 
 /* ---- Sensor devices (Zephyr sensor API; bound per board overlay) ---- */
+#ifdef ROSE_SIM_STUB
+/* Layout pin: ROSE_SIM_STUB drops ~0x1800 of sensor-driver .bss, shifting the
+ * k_thread cluster down. Compensate so main@0x80085e00 / switch_handle@0x80085f28
+ * stays put (the fixed corruption target must match the non-stub build). Tune
+ * ROSE_SIM_PAD if the map moves. */
+#ifndef ROSE_SIM_PAD
+#define ROSE_SIM_PAD 0x1800
+#endif
+static volatile char rose_sim_layout_pad[ROSE_SIM_PAD] __attribute__((used));
+#endif
 static const struct device *accel_dev = DEVICE_DT_GET(DT_ALIAS(bmi088_accel));
 static const struct device *gyro_dev  = DEVICE_DT_GET(DT_ALIAS(bmi088_gyro));
 
@@ -278,6 +291,9 @@ static void battery_poll(void)
  * guarantee a clean boot regardless of prior state. */
 static int board_sensor_init(void)
 {
+#ifdef ROSE_SIM_STUB
+	return 0;   /* sim: no i2c bus -> skip ToF power-up / status-LED / battery front-end */
+#endif
 	const struct device *bus = DEVICE_DT_GET(DT_BUS(DT_INST(0, st_vl53l1x)));
 	if (!device_is_ready(bus)) {
 		printk("board_sensor_init: I2C bus not ready — ToF stays unpowered\n");
@@ -837,14 +853,36 @@ static struct k_thread tof_thread_data;
 static void tof_thread_fn(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	uint32_t dbg_n = 0, dbg_ok = 0; int dbg_last = 123;
 	for (;;) {
-		if (sensor_sample_fetch(tof_dev) == 0) {   /* blocks ~1 ranging budget on this thread */
+#ifdef ROSE_SIM_STUB
+		int rc = -1;   /* sim: no i2c ToF; skip the blocking fetch, height stays invalid */
+#else
+		int rc = sensor_sample_fetch(tof_dev);   /* blocks ~1 ranging budget on this thread */
+#endif
+		dbg_n++; dbg_last = rc; if (rc == 0) { dbg_ok++; }
+#if defined(ROSE_TOF_DBG) && ROSE_TOF_DBG
+		if ((dbg_n % 50) == 0) {
+			printk("tofdbg: fetch calls=%u ok=%u last_rc=%d\n", dbg_n, dbg_ok, dbg_last);
+		}
+#endif
+		if (rc == 0) {
 			struct sensor_value h;
 			sensor_channel_get(tof_dev, SENSOR_CHAN_DISTANCE, &h);
 			float hv = (float)sensor_value_to_double(&h);
 			k_mutex_lock(&tof_mtx, K_FOREVER);
 			g_tof_h = hv; g_tof_valid = true;
 			k_mutex_unlock(&tof_mtx);
+			/* FC+DroNet tight-loop (blocker a): the single-shot VL53L1X fetch holds
+			 * the i2c bus-mutex long enough that the 2 kHz IMU read blocks ~20 ms
+			 * per ranging, capping the control loop at ~87 Hz mean. Pacing the
+			 * down-ToF to ~ROSE_TOF_PERIOD_MS (default 66 = its native ~15 Hz;
+			 * lower to trade altitude rate for a tighter loop) makes those
+			 * contention windows rare so the loop holds its ~350 Hz baseline. */
+#ifndef ROSE_TOF_PERIOD_MS
+#define ROSE_TOF_PERIOD_MS 66
+#endif
+			k_msleep(ROSE_TOF_PERIOD_MS);
 		} else {
 			k_msleep(5);   /* back off on error so a failing ToF can't spin the I2C bus */
 		}
@@ -852,6 +890,37 @@ static void tof_thread_fn(void *a, void *b, void *c)
 }
 #else
 #define TOF_THREADED 0
+#endif
+
+/* ---- Baro decoupling (blocker a): the blocking BMP388 fetch (~8 ms with osr) was
+ * inline in the control loop, stalling it on the shared i2c. Move it to its own
+ * thread; the loop consumes the latest cached pressure, seq-gated so each fetch is
+ * processed exactly once (preserves the reference-pressure cal average). Mirrors
+ * the down-ToF thread. */
+#if ROSE_BARO && HAVE_BARO
+K_MUTEX_DEFINE(baro_mtx);
+static float    g_baro_p_cached;
+static uint32_t g_baro_seq;
+K_THREAD_STACK_DEFINE(baro_stack, 2048);
+static struct k_thread baro_thread_data;
+static void baro_thread_fn(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	for (;;) {
+		if (sensor_sample_fetch(baro_dev) == 0) {
+			struct sensor_value pv;
+			sensor_channel_get(baro_dev, SENSOR_CHAN_PRESS, &pv);
+			float p = (float)sensor_value_to_double(&pv);
+			if (p > 0.0f) {
+				k_mutex_lock(&baro_mtx, K_FOREVER);
+				g_baro_p_cached = p;
+				g_baro_seq++;
+				k_mutex_unlock(&baro_mtx);
+			}
+		}
+		k_msleep(BARO_FETCH_PERIOD_MS);
+	}
+}
 #endif
 
 /* ---- optical-flow attitude compensation (ROSE_FLOW) --------------------------------------------
@@ -968,6 +1037,26 @@ static float baro_rel_altitude_m(float p_kpa, float p0_kpa)
 static bool read_sensor_frame(struct sensor_frame *f)
 {
 	uint32_t _pf = PF_NOW();
+	float araw[3], graw[3];
+#ifdef ROSE_SIM_STUB
+	/* sim faithfulness stub: canned IMU (gravity + zero rate), NO i2c. Only the
+	 * sensor front-end is canned so boot doesn't stall on the absent i2c on the
+	 * robotMpc sim; the co-residency compute + preemption path downstream is
+	 * byte-for-byte identical (same estimator/RoCC + DroNet + poll-yield).
+	 * DELAY-MATCH: the real BMI088 i2c read is ~640us and DOMINATES the ~1kHz FC
+	 * loop cadence (profiling: 640us read vs 186us compute). Busy-wait that long
+	 * (NOT an i2c txn) so the FC loop cadence -- hence the timer preempt-phase
+	 * alignment vs the DroNet Gemmini-DMA window that carries the race -- stays
+	 * faithful, keeping stubbed NEGATIVES trustworthy on the faithfulness gate. */
+#ifndef ROSE_SIM_IMU_US
+#define ROSE_SIM_IMU_US 640
+#endif
+	k_busy_wait(ROSE_SIM_IMU_US);
+	araw[0] = 0.0f; araw[1] = 0.0f; araw[2] = 9.81f;
+	graw[0] = 0.0f; graw[1] = 0.0f; graw[2] = 0.0f;
+	PF_ACC(pf_imu_fetch, _pf);
+	f->tof_valid = false;
+#else
 	int rc_a = sensor_sample_fetch(accel_dev);
 	int rc_g = sensor_sample_fetch(gyro_dev);
 #if HAVE_FLOW
@@ -982,11 +1071,11 @@ static bool read_sensor_frame(struct sensor_frame *f)
 	struct sensor_value av[3], gv[3];
 	sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, av);
 	sensor_channel_get(gyro_dev,  SENSOR_CHAN_GYRO_XYZ,  gv);
-	float araw[3], graw[3];
 	for (int i = 0; i < 3; i++) {
 		araw[i] = (float)sensor_value_to_double(&av[i]);
 		graw[i] = (float)sensor_value_to_double(&gv[i]);
 	}
+#endif
 	IMU_REMAP(f->accel, araw);   /* sensor -> drone body frame (no-op on RoSE) */
 	IMU_REMAP(f->gyro,  graw);
 	/* Startup gyro-bias cal: average the (should-be-zero) gyro while still, then subtract it from
@@ -1090,29 +1179,29 @@ static bool read_sensor_frame(struct sensor_frame *f)
 #if ROSE_BARO
 #if HAVE_BARO
 	{
-		static int64_t baro_next_ms = 0;
-		static float   baro_last = 0.0f;  /* last relative altitude (m), zero-order held */
-		int64_t now_ms = k_uptime_get();
-		if (now_ms >= baro_next_ms) {
-			baro_next_ms = now_ms + BARO_FETCH_PERIOD_MS;
-			if (sensor_sample_fetch(baro_dev) == 0) {
-				struct sensor_value pv;
-				sensor_channel_get(baro_dev, SENSOR_CHAN_PRESS, &pv);
-				float p = (float)sensor_value_to_double(&pv);   /* kPa */
-				if (p > 0.0f) {
-					if (!g_gyro_cal_done) {
-						/* accumulate the reference pressure over the gyro-cal still window */
-						g_bcal_sum += p; g_bcal_n++;
-					} else {
-						if (!g_baro_have) {   /* cal just finished -> freeze the averaged reference */
-							g_baro_p0 = (g_bcal_n > 0) ? (float)(g_bcal_sum / g_bcal_n) : p;
-							g_baro_have = true;
-							printk("baro-cal: p0=%d.%03d kPa (%d samples) -- altitude referenced (fused with ToF)\n",
-							       (int)g_baro_p0, ((int)(g_baro_p0 * 1000.0f)) % 1000, g_bcal_n);
-						}
-						baro_last = baro_rel_altitude_m(p, g_baro_p0);
-					}
+		/* Non-blocking: consume the latest cached pressure from baro_thread_fn
+		 * (the blocking i2c fetch is off the control loop now). seq-gated so each
+		 * fetch is processed exactly once -> the reference-pressure cal average is
+		 * unchanged vs the old inline read. */
+		static uint32_t baro_last_seq = 0;
+		static float    baro_last = 0.0f;  /* last relative altitude (m), zero-order held */
+		float p = 0.0f; uint32_t seq;
+		k_mutex_lock(&baro_mtx, K_FOREVER);
+		p = g_baro_p_cached; seq = g_baro_seq;
+		k_mutex_unlock(&baro_mtx);
+		if (seq != baro_last_seq && p > 0.0f) {
+			baro_last_seq = seq;
+			if (!g_gyro_cal_done) {
+				/* accumulate the reference pressure over the gyro-cal still window */
+				g_bcal_sum += p; g_bcal_n++;
+			} else {
+				if (!g_baro_have) {   /* cal just finished -> freeze the averaged reference */
+					g_baro_p0 = (g_bcal_n > 0) ? (float)(g_bcal_sum / g_bcal_n) : p;
+					g_baro_have = true;
+					printk("baro-cal: p0=%d.%03d kPa (%d samples) -- altitude referenced (fused with ToF)\n",
+					       (int)g_baro_p0, ((int)(g_baro_p0 * 1000.0f)) % 1000, g_bcal_n);
 				}
+				baro_last = baro_rel_altitude_m(p, g_baro_p0);
 			}
 		}
 		f->baro_valid = g_baro_have;
@@ -1372,9 +1461,10 @@ static void ctrl_block(void *a, void *b, void *c)
 }
 #endif /* ROSE_THREADED */
 
-#if defined(CONFIG_WIFI)
-/* Uplink command hooks (declared in telem_wifi.h); the command-RX thread calls these. Each just
- * pokes a control-loop shared flag consumed on the next iteration -- no locks, no blocking. */
+#if defined(CONFIG_WIFI) || ROSE_UART_TELEM
+/* Uplink command hooks (declared in telem_wifi.h); the command-RX path calls these -- the ESP-native
+ * WiFi build via its UDP thread, the FPGA build via the uart1 command poll in the control loop. Each
+ * just pokes a control-loop shared flag consumed on the next iteration -- no locks, no blocking. */
 extern "C" void rose_cmd_estop(void) { g_estop = true; }   /* latched remote kill */
 extern "C" void rose_cmd_disarm(void)
 {
@@ -1420,6 +1510,14 @@ int main(void)
 	printk("flight_controller: FLIGHTLOG DUMP MODE\n");
 	flightlog_dump();
 	return 0;
+#endif
+#ifdef ROSE_FC_DISABLE
+	/* E3 (co-residency cut): NO flight controller. The DroNet thread (auto-started
+	 * via K_THREAD_DEFINE) runs alone; main idles so the only context switches are
+	 * DroNet <-> idle (timer self-preemption), exercising the eager-V switch with a
+	 * single real V-using thread + idle. No FC, no aux (tof/baro/camera) threads. */
+	printk("flight_controller: FC DISABLED (E3: DroNet-alone + timer self-preempt)\n");
+	for (;;) { k_msleep(1000); }
 #endif
 	if (!device_is_ready(accel_dev) || !device_is_ready(gyro_dev)) {
 		printk("flight_controller: FAIL (IMU not ready)\n");
@@ -1504,6 +1602,15 @@ int main(void)
 	printk("flight_controller: down-ToF on dedicated thread (control loop reads cached height)\n");
 #endif
 
+#if ROSE_BARO && HAVE_BARO
+	/* Start the BMP388 fetcher on its own thread (prio below the control loop) so the
+	 * blocking baro read is off the hot path; the loop reads the cached pressure. */
+	k_thread_create(&baro_thread_data, baro_stack, K_THREAD_STACK_SIZEOF(baro_stack),
+			baro_thread_fn, NULL, NULL, NULL, K_PRIO_PREEMPT(9), 0, K_NO_WAIT);
+	k_thread_name_set(&baro_thread_data, "baro");
+	printk("flight_controller: BMP388 baro on dedicated thread (control loop reads cached pressure)\n");
+#endif
+
 #if defined(CONFIG_WIFI)
 	/* Bring up the WiFi SoftAP + UDP telemetry downlink ONCE, before the control loop starts. The
 	 * heavy WiFi TX runs on telem_wifi's OWN low-priority thread; the control loop only ever does a
@@ -1514,6 +1621,21 @@ int main(void)
 		printk("flight_controller: WiFi telemetry SoftAP %s\n",
 		       rc == 0 ? "starting (join 'riskybird-<id>', UDP :14550)" : "FAILED to start");
 	}
+#endif
+
+#if ROSE_UART_TELEM
+	/* FPGA target: emit telemetry over uart1 (E13/F14) to the ESP wireless bridge, which relays it
+	 * over its SoftAP (UDP :14550). The ESP runs samples/riskybird/fpga_telem_bridge. */
+	telem_uart_init();
+	printk("flight_controller: UART telemetry on uart1 -> ESP bridge (every %d ticks)\n",
+	       ROSE_UART_TELEM_DIV);
+#endif
+
+#if ROSE_CAMERA
+	/* Start the HM01B0 DMA capture thread (needs the DMA-capable OSPI shell). Runs alongside the
+	 * control loop; frames land in DDR by hardware DMA (no CPU drain). Results not consumed yet. */
+	camera_dma_init();
+	printk("flight_controller: camera DMA capture thread started\n");
 #endif
 
 	/* Status LED: start the state-derived pattern renderer (only if the ADS7128 LED config ACK'd
@@ -1785,6 +1907,70 @@ int main(void)
 			telem_wifi_publish(&ts);
 		}
 #endif
+#if ROSE_UART_TELEM
+		/* FPGA target: newline-framed telemetry line to uart1 -> ESP bridge -> SoftAP UDP. Same
+		 * fields as the ROSE_TELEM console line; FP3() formats floats without %f. Decimated so the
+		 * blocking-polled TX (~1 line = ~1 ms @ 115200) never dominates the loop. */
+		if ((iter % ROSE_UART_TELEM_DIV) == 0) {
+			int fl = (g_armed ? 1 : 0) | (g_estop ? 2 : 0) |
+				 (g_arming ? 4 : 0) | (g_gyro_cal_done ? 8 : 0);
+			char tbuf[248];
+			int tn = snprintf(tbuf, sizeof(tbuf),
+				 "RBT it=%d r=%s%d.%03d p=%s%d.%03d y=%s%d.%03d z=%s%d.%03d "
+				 "vz=%s%d.%03d h=%s%d.%03d tv=%d fl=%d cam=%u camm=%u rx=%u",
+				 iter, FP3(state[3]), FP3(state[4]), FP3(state[5]), FP3(state[2]),
+				 FP3(state[8]), FP3(f.height), (int)f.tof_valid, fl,
+				 camera_dma_frames(), camera_dma_last_mean(), telem_uart_rx_count());
+#if ROSE_BUMPER
+			/* Side-ToF walls (mm; -1 = no target) + seq so the GCS shows the full ToF flow. */
+			struct side_walls wl;
+			side_tof_get(&wl);
+			tn += snprintf(tbuf + tn, sizeof(tbuf) - tn, " wl=%d,%d,%d,%d wsq=%u",
+				       wl.front_mm, wl.back_mm, wl.left_mm, wl.right_mm, wl.seq);
+#endif
+			snprintf(tbuf + tn, sizeof(tbuf) - tn, "\n");
+			telem_uart_line(tbuf);
+		}
+		/* Poll the ESP uplink (GCS :14551 commands relayed onto uart1 RX). Non-blocking; a
+		 * complete line dispatches once. This is the FPGA equivalent of telem_wifi.c's UDP cmd
+		 * thread -- without it the panel's buttons (and camera SNAP) have no path to the FC. */
+		{
+			const char *cmd = telem_uart_poll_cmd();
+			if (cmd) {
+				if (strncmp(cmd, "SNAP", 4) == 0) {
+					int w = 128, h = 126;               /* default: near-square, hi-res */
+					const char *p = cmd + 4;
+					while (*p == ' ') p++;
+					if (*p) { w = (int)strtol(p, (char **)&p, 10);
+						  h = (int)strtol(p, (char **)&p, 10); }
+					if (w <= 0) w = 80;
+					if (h <= 0) h = 60;
+					static uint32_t snap_seq;
+					camera_dma_request_snapshot(++snap_seq, w, h);
+					telem_uart_line("ACK SNAP\n");
+				} else if (strncmp(cmd, "ESTOP", 5) == 0) {
+					rose_cmd_estop();      telem_uart_line("ACK ESTOP\n");
+				} else if (strncmp(cmd, "DISARM", 6) == 0) {
+					rose_cmd_disarm();     telem_uart_line("ACK DISARM\n");
+				} else if (strncmp(cmd, "RESET", 5) == 0) {
+					rose_cmd_reset();      telem_uart_line("ACK RESET\n");
+				} else if (strncmp(cmd, "HOVER_Z", 7) == 0) {
+					int mm = (int)strtol(cmd + 7, nullptr, 10);
+					rose_cmd_set_hover_z((float)mm / 1000.0f);
+					telem_uart_line("ACK HOVER_Z\n");
+				} else if (strncmp(cmd, "PING", 4) == 0) {
+					telem_uart_line("ACK PONG\n");
+				}
+			}
+		}
+#endif
+#if ROSE_CAMERA || ROSE_BUMPER || ROSE_FLOW || HAVE_TOF
+		/* Yield CPU to the lower-priority background sensor threads (camera DMA capture, side-ToF
+		 * ranging, down-ToF). The flat-out ~2 kHz control loop is higher priority and would
+		 * otherwise starve them on the shared I2C mutex. ~300 us/iter paces the loop to ~1.3 kHz --
+		 * still ample for control. */
+		k_usleep(300);
+#endif
 #if defined(ROSE_FLIGHTLOG) && ROSE_FLIGHTLOG
 		if (!g_estop && (iter % ROSE_FLIGHTLOG_DIV) == 0) {
 			struct flight_rec rec;
@@ -1827,6 +2013,28 @@ int main(void)
 			       k_cyc_to_us_floor32(pf_send / pf_iters));
 			pf_imu_fetch = pf_imu_get = pf_tof = pf_tof_n = 0;
 			pf_est = pf_ctrl = pf_send = pf_flow = pf_iters = 0;
+		}
+#endif
+		/* ---- Flight-build periodic summary (build -DROSE_SUMMARY_MS=1000) ---------------------------
+		 * Compact once-per-interval status (measured loop Hz + altitude) so the control rate stays
+		 * visible WITHOUT the per-iteration ROSE_TELEM printk, whose blocking TX on a full console
+		 * buffer stalls the hot path and starves co-resident DroNet. Default 0 -> compiled out (no
+		 * change to tethered/bring-up builds); the flight + fp16 measurement builds set it to 1000. */
+#ifndef ROSE_SUMMARY_MS
+#define ROSE_SUMMARY_MS 0
+#endif
+#if ROSE_SUMMARY_MS > 0
+		{
+			static int64_t summ_next = 0, summ_t0 = 0; static uint32_t summ_iter0 = 0;
+			int64_t _sn = k_uptime_get();
+			if (summ_next == 0) { summ_next = _sn + ROSE_SUMMARY_MS; summ_t0 = _sn; summ_iter0 = iter; }
+			else if (_sn >= summ_next) {
+				uint32_t dq = (uint32_t)(iter - summ_iter0); int64_t dtm = _sn - summ_t0;
+				printk("SUMMARY: loop=%uHz iters=%u z=%s%d.%03d tofv=%d tofh=%s%d.%03d\n",
+				       (unsigned)(dtm > 0 ? (uint64_t)dq * 1000u / (uint64_t)dtm : 0u), iter,
+				       FP3(state[2]), (int)f.tof_valid, FP3(f.height));
+				summ_next = _sn + ROSE_SUMMARY_MS; summ_t0 = _sn; summ_iter0 = iter;
+			}
 		}
 #endif
 #if defined(ROSE_BUMPER_GRID) && ROSE_BUMPER_GRID

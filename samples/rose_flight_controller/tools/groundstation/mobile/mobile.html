@@ -81,6 +81,12 @@ main{padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;max-width:
 .sub{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:6px;display:flex;justify-content:space-between;gap:6px}
 .sub b{color:var(--ink);font-weight:700}
 canvas{width:100%;display:block;border-radius:8px;background:#05080d;touch-action:none}
+/* camera tile: upscale the small grayscale frame; aspect-ratio is set from the frame dims in JS
+ * (the sensor is ~square, not 4:3), so the scene isn't stretched */
+#cam{image-rendering:auto;aspect-ratio:1/1;object-fit:contain}
+.camrow{display:flex;align-items:center;gap:8px;margin-top:8px}
+.camrow .btn{flex:0 0 auto;padding:8px 14px}
+.camrow .camstat{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto}
 .bar{height:9px;border-radius:6px;background:#05080d;border:1px solid var(--line);overflow:hidden;margin-top:8px;position:relative}
 .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .12s linear}
 .bar>.mark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--warn);opacity:.9}
@@ -232,6 +238,16 @@ canvas{width:100%;display:block;border-radius:8px;background:#05080d;touch-actio
       <div class="mot"><div class="lbl"><span>RR · m1</span><span class="mval" id="m1">--</span></div><div class="mbar"><i id="m1b"></i></div></div>
     </div>
   </div>
+
+  <!-- Camera snapshot -->
+  <div class="card wide">
+    <h2>Camera</h2>
+    <canvas id="cam" width="80" height="60"></canvas>
+    <div class="camrow">
+      <button class="btn" id="capbtn" onpointerdown="camCapture()">📷 CAPTURE</button>
+      <span class="camstat" id="camstat">no image</span>
+    </div>
+  </div>
 </main>
 
 <!-- ======================= CONTROL ======================= -->
@@ -316,6 +332,27 @@ const TAIL_RE = new RegExp(
   "vx="+_F+"\\s+vy="+_F+"\\s+vz="+_F+"\\s+zsp="+_F+"\\s+vbat="+_F+"\\s+st=(\\d+)");
 const POS_RE = new RegExp("\\bx="+_F+"\\s+y="+_F);
 const FLAG_ARMED=1, FLAG_ESTOP=2, FLAG_ARMING=4, FLAG_CALDONE=8;
+/* Compact FPGA telemetry line (src/telem_uart.c via main.cpp). fl= is the status-flag bitfield
+ * (ARMED/ESTOP/ARMING/CALDONE), not flow. Fewer fields than the ESP format -> motors/drift/battery
+ * are absent and render blank. Optional wl=/wsq= carries the side-ToF walls (mm; -1 = clear). */
+const RBT_RE = new RegExp(
+  "RBT\\s+it=(-?\\d+)\\s+r="+_F+"\\s+p="+_F+"\\s+y="+_F+"\\s+z="+_F+
+  "\\s+vz="+_F+"\\s+h="+_F+"\\s+tv=(\\d+)\\s+fl=(-?\\d+)"+
+  "(?:\\s+cam=(\\d+)\\s+camm=(\\d+))?");
+const WALLS_RE = new RegExp("wl=(-?\\d+),(-?\\d+),(-?\\d+),(-?\\d+)\\s+wsq=(\\d+)");
+function parseRBT(line){
+  const m=RBT_RE.exec(line); if(!m) return null;
+  const g=m.slice(1), e=gibbsToEuler(+g[1],+g[2],+g[3]), fl=+g[8];
+  const d={ it:+g[0]|0, dt_ms:0, roll:e.roll,pitch:e.pitch,yaw:e.yaw,
+    qw:e.qw,qx:e.qx,qy:e.qy,qz:e.qz, z:+g[4], vz:+g[5], tofh:+g[6], tofv:+g[7]|0,
+    u:[null,null,null,null], vx:null,vy:null,zsp:null,vbat:null, st:fl, x:null,y:null,
+    cam:g[9]!=null?+g[9]:null, camm:g[10]!=null?+g[10]:null };
+  d.armed=!!(fl&FLAG_ARMED); d.estop=!!(fl&FLAG_ESTOP);
+  d.arming=!!(fl&FLAG_ARMING); d.caldone=!!(fl&FLAG_CALDONE);
+  const w=WALLS_RE.exec(line);
+  if(w){ d.walls={front:+w[1],back:+w[2],left:+w[3],right:+w[4],seq:+w[5]}; }
+  return d;
+}
 
 /* The FC emits attitude as the Gibbs/Rodrigues vector (q_xyz/q_w); reconstruct the true
  * unit quaternion + proper ZYX Euler so the horizon is correct at all attitudes. */
@@ -328,7 +365,7 @@ function gibbsToEuler(rx,ry,rz){
   return {qw,qx,qy,qz,roll,pitch,yaw};
 }
 function parseLine(line){
-  const m=CORE_RE.exec(line); if(!m) return null;
+  const m=CORE_RE.exec(line); if(!m) return parseRBT(line);
   const g=m.slice(1).map(Number);
   const e=gibbsToEuler(g[2],g[3],g[4]);
   const d={ it:g[0]|0, dt_ms:g[1]|0, roll:e.roll, pitch:e.pitch, yaw:e.yaw,
@@ -443,7 +480,7 @@ const Transport = (()=>{
   }
   const f3=v=>{ const s=v<0?"-":""; const a=Math.abs(v);
     return s+Math.floor(a)+"."+String(Math.floor(a*1000)%1000).padStart(3,"0"); };
-  return { start, stop, sendCmd, get mode(){return mode;} };
+  return { start, stop, sendCmd, get mode(){return mode;}, get base(){return base;} };
 })();
 
 /* ---------- command UI ---------- */
@@ -457,6 +494,64 @@ function sendHover(){ cmd("HOVER_Z "+hoverMM); }
 function estop(){ const b=$("estop"); b.classList.remove("confirmed"); void b.offsetWidth; b.classList.add("confirmed");
   cmd("ESTOP"); if(navigator.vibrate) navigator.vibrate([40,30,40]); }
 setHover();
+
+/* ---------- camera snapshot ----------
+ * poll mode (ESP)  : GET base+'/snap' -> "<w> <h>\n<base64 grayscale>" -> ImageData on the canvas.
+ * sse  mode (panel): panel.py serves a reassembled PNG at /snapshot.png -> drawImage.
+ * demo mode        : a static checker placeholder (no drone). CAPTURE POSTs 'SNAP' to force a frame,
+ *                    which the FC downsamples + streams; the bridge reassembles it for /snap. */
+const CAM = (()=>{
+  let timer=null, curMode="demo", lastSig="";
+  const cv=()=>$("cam"), stat=s=>{ $("camstat").textContent=s; };
+  function drawGray(w,h,bin){
+    const c=cv(); c.width=w; c.height=h; c.style.aspectRatio=w+" / "+h;
+    const x=c.getContext("2d"), id=x.createImageData(w,h), d=id.data;
+    for(let i=0;i<w*h;i++){ const v=bin.charCodeAt(i)&255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255; }
+    x.putImageData(id,0,0);
+  }
+  async function pullSnap(){
+    try{
+      const r=await fetch(Transport.base+"/snap",{cache:"no-store"}); if(!r.ok) return;
+      const t=await r.text(), nl=t.indexOf("\n");
+      if(nl<3){ if(!lastSig) stat("waiting for frame…"); return; }   // no complete frame yet
+      const [w,h]=t.slice(0,nl).trim().split(/\s+/).map(Number);
+      const b64=t.slice(nl+1).replace(/\s+/g,"");
+      if(!(w>0)||!(h>0)||!b64) return;
+      let bin; try{ bin=atob(b64); }catch(e){ return; }
+      if(bin.length<w*h) return;
+      const sig=w+"x"+h+":"+b64.length+":"+b64.slice(-10);
+      if(sig!==lastSig){ lastSig=sig; drawGray(w,h,bin);
+        stat(w+"×"+h+" · "+new Date().toLocaleTimeString()); }
+    }catch(e){/* dropped poll: keep last frame */}
+  }
+  function pullPng(){
+    const img=new Image();
+    img.onload=()=>{ const c=cv(), w=img.naturalWidth||80, h=img.naturalHeight||60;
+      c.width=w; c.height=h; c.style.aspectRatio=w+" / "+h; c.getContext("2d").drawImage(img,0,0,w,h);
+      lastSig="png"; stat(w+"×"+h+" · "+new Date().toLocaleTimeString()); };
+    img.onerror=()=>{ if(!lastSig) stat("no image yet"); };
+    img.src=Transport.base+"/snapshot.png?"+Date.now();
+  }
+  function tick(){ if(curMode==="poll") pullSnap(); else if(curMode==="sse") pullPng(); }
+  function placeholder(){
+    const c=cv(), w=128, h=126; c.width=w; c.height=h; c.style.aspectRatio=w+" / "+h;
+    const x=c.getContext("2d"), id=x.createImageData(w,h), d=id.data;
+    for(let yy=0;yy<h;yy++) for(let xx=0;xx<w;xx++){ const i=(yy*w+xx)*4;
+      const v=(((xx>>4)+(yy>>4))&1)?58:30; d[i]=d[i+1]=d[i+2]=v; d[i+3]=255; }
+    x.putImageData(id,0,0);
+  }
+  function start(m){ stop(); curMode=m; lastSig="";
+    if(m==="demo"){ placeholder(); stat("demo — no camera"); return; }
+    stat("connecting…"); tick(); timer=setInterval(tick,1500); }
+  function stop(){ if(timer){ clearInterval(timer); timer=null; } }
+  function capture(){
+    if(curMode==="demo"){ placeholder(); stat("demo — no camera"); return; }
+    stat("requesting snapshot…"); Transport.sendCmd("SNAP 128 126");
+    // a 128x126 frame streams in ~2-3 s over the 115200 link; poll a few times to catch it
+    [1000,2200,3200,4200].forEach(ms=>setTimeout(tick,ms)); }
+  return { start, stop, capture };
+})();
+function camCapture(){ CAM.capture(); }
 
 /* ---------- render loop (rAF, throttled ~25 fps — decoupled from 50 Hz packets) ---------- */
 function stateClass(t,link){
@@ -581,21 +676,24 @@ function pickMode(m){ [...document.querySelectorAll('#modeseg button')].forEach(
     b.classList.toggle("on", b.dataset.mode===m)); }
 function applyMode(m){ pickMode(m); const base=$("baseurl").value.trim();
   try{ localStorage.setItem("rb_mode",m); localStorage.setItem("rb_base",base); }catch(e){}
-  Transport.start(m,base); }
+  Transport.start(m,base); CAM.start(m); }
 document.querySelectorAll('#modeseg button').forEach(b=>
   b.addEventListener("click",()=>applyMode(b.dataset.mode)));
 $("baseurl").addEventListener("change",()=>applyMode(
   [...document.querySelectorAll('#modeseg button.on')][0]?.dataset.mode||"demo"));
 
-/* boot: restore saved config, else auto-pick (http origin -> SSE, file:// -> demo) */
+/* boot: restore saved config, else auto-pick. Served from the ESP SoftAP (192.168.4.1) there is
+ * no SSE endpoint -- only the light /t poll + /cmd -- so default to poll there; the laptop panel.py
+ * serves /sse too, so prefer SSE on any other http origin; file:// falls back to the demo feed. */
 (function boot(){
   const q=new URLSearchParams(location.search);
   let mode=q.get("mode"), base=q.get("base");
   try{ if(mode==null) mode=localStorage.getItem("rb_mode");
        if(base==null) base=localStorage.getItem("rb_base"); }catch(e){}
-  if(mode==null) mode = location.protocol.startsWith("http") ? "sse" : "demo";
+  if(mode==null) mode = !location.protocol.startsWith("http") ? "demo"
+                      : (location.hostname==="192.168.4.1" ? "poll" : "sse");
   if(base) $("baseurl").value=base;
-  pickMode(mode); Transport.start(mode, base||"");
+  pickMode(mode); Transport.start(mode, base||""); CAM.start(mode);
 })();
 
 /* prevent double-tap zoom on the control buttons; keep page from bouncing */

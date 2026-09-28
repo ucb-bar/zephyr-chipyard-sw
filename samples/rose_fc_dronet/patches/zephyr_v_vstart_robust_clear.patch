@@ -1,0 +1,98 @@
+V-race #2 fix (firmware-only, no bitstream rebuild): robustly force vstart==0
+before the eager V-context bulk save/reload, plus a restore-entry vstart probe.
+
+WHY: DroNet's eager-V restore (z_riscv_vstate_restore_thread) traps mcause-2
+illegal on `vle8.v v24@m8` (int-only Saturn) / silently corrupts (full Saturn,
+mcause-5) ONLY after a real DroNet V-op preemption => vstart!=0 at the bulk
+reload. The existing single `csrw vstart,x0` is apparently being defeated. This
+forces vstart==0 with drain(fence)+clear+verify+bounded-retry(8) immediately
+before the bulk vse8.v (save) and vle8.v (restore). Applies ON TOP of
+zephyr_v_save_fence.patch (context includes the MB_V_SAVE_FENCE lines).
+
+PROBE: z_riscv_v_dbg_restore_entry_vstart / z_riscv_v_dbg_restore_nonzero capture
+vstart at restore entry (before the clear) -> read them to confirm vstart is
+actually !=0 on the faulting switch. If it is ALWAYS 0 there, the vstart theory
+is wrong. If the bounded retry hits its cap (vstart un-clearable) -> HW-latched
+vstart -> escalate to the RTL fix (CSR.scala: csrw vstart must win set_vstart).
+
+APPLY:  cd <zephyr>; git apply zephyr_v_vstart_robust_clear.patch
+        (or: patch -p1 < zephyr_v_vstart_robust_clear.patch)
+TEST:   rebuild FIRMWARE only (build_fp16_int_fence), flash+run on the misaVfix
+        bit. Fixed = z_riscv_vstate_restore_thread mcause-2 trap gone; DroNet
+        (atomic AND preemptible) run clean.
+
+diff --git a/arch/riscv/core/v.c b/arch/riscv/core/v.c
+--- a/arch/riscv/core/v.c
++++ b/arch/riscv/core/v.c
+@@ -119,6 +119,34 @@
+  *       non-zero vstart from a preempted V op would cause partial
+  *       saves/loads and silently corrupt v0..v(vstart-1).
+  */
++/* ============================================================================
++ * V-race #2 fix (staged, trailer-free): robust vstart clear + entry probe.
++ * The eager save/restore's bulk vse8.v/vle8.v MUST run at vstart==0. A single
++ * `csrw vstart,x0` can be defeated on the decoupled Saturn (the VU's set_vstart
++ * wins the same-cycle CSR write, or a lingering op re-presents vstart), leaving
++ * z_riscv_vstate_restore_thread's `vle8.v v24@m8` to trap illegal (int-only
++ * Saturn) or silently corrupt (full Saturn) -- the "V-race #2" mcause-2/mcause-5.
++ * Force vstart==0 with a drain+clear+verify bounded retry. If it cannot clear
++ * (retry cap hit), vstart is HW-latched -> RTL fix required (CSR.scala: a
++ * `csrw vstart` must win over the same-cycle VU set_vstart).
++ * ============================================================================ */
++volatile unsigned long z_riscv_v_dbg_restore_entry_vstart;  /* last vstart seen at restore entry */
++volatile unsigned long z_riscv_v_dbg_restore_nonzero;       /* count of restores entered with vstart!=0 */
++
++static inline void z_riscv_force_vstart0(void)
++{
++	unsigned long vs;
++	int n = 0;
++	do {
++		__asm volatile("fence rw, rw" ::: "memory");
++		__asm volatile(".option push\n\t"
++			       ".option arch, +v\n\t"
++			       "csrw	vstart, x0\n\t"
++			       "csrr	%0, vstart\n\t"
++			       ".option pop\n\t" : "=r"(vs));
++	} while (vs != 0 && ++n < 8);
++}
++
+ void z_riscv_vstate_save_thread(struct k_thread *thread)
+ {
+ 	if (!HAS_V()) {
+@@ -135,6 +163,7 @@
+ 		 * MSTATUS.VS=DIRTY for every V op, so a DIRTY-only fast
+ 		 * path could miss real reg modifications. */
+ 		z_riscv_vstate_csr_save(save_to);
++		z_riscv_force_vstart0();	/* V-race #2: ensure full save (vstart==0) */
+ 		unsigned long vl;
+ 		__asm volatile(
+ 			".option push\n\t"
+@@ -188,6 +217,20 @@
+ 	 * below don't raise illegal-instruction. */
+ 	csr_set(mstatus, MSTATUS_VS_CLEAN);
+ 
++	/* V-race #2 SOURCE PROBE: capture vstart at restore entry (VS is now CLEAN so
++	 * the read is legal) BEFORE we clear it, to see whether it is already !=0 on
++	 * the faulting switch. Inspect z_riscv_v_dbg_restore_entry_vstart / _nonzero.
++	 * If it is ALWAYS 0 here, the vstart-clear theory is wrong -> re-think. */
++	{
++		unsigned long ev;
++		__asm volatile(".option push\n\t.option arch, +v\n\t"
++			       "csrr %0, vstart\n\t.option pop\n\t" : "=r"(ev));
++		z_riscv_v_dbg_restore_entry_vstart = ev;
++		if (ev != 0) {
++			z_riscv_v_dbg_restore_nonzero++;
++		}
++	}
++
+ 	/* Always reset vstart=0 — vsetvli does NOT clear vstart per the
+ 	 * RVV spec, so a leftover non-zero vstart from a preempted V op
+ 	 * on the previous thread would make the next vector op start at
+@@ -213,6 +256,7 @@
+ 		 * previously-saved vregs have landed in memory before the eager reload reads them. */
+ 		__asm volatile("fence rw, rw" ::: "memory");
+ #endif
++		z_riscv_force_vstart0();	/* V-race #2: force vstart==0 so vle8.v@m8 doesn't trap/corrupt */
+ 		__asm volatile(
+ 			".option push\n\t"
+ 			".option arch, +v\n\t"

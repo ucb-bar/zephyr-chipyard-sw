@@ -68,6 +68,8 @@ target_sources(app PRIVATE
   src/controller_pid.cpp
   src/controller_factory.cpp
   src/flightlog.c
+  src/telem_uart.c
+  src/camera_dma.c
   src/side_tof.c
   src/flow.c
   src/pmw3901.c
