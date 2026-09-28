@@ -37,5 +37,5 @@
 
 [submodule "modelblaster"]
 	path = modelblaster
-	url = https://github.com/lorenshung/ModelBlaster.git
-	branch = integration/riskybird-20260928
+	url = https://github.com/ucb-bar/ModelBlaster.git
+	branch = riskybirdv3

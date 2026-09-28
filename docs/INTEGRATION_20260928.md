@@ -1,5 +1,17 @@
 # RiskyBird history-preserving integration, 2026-09-28
 
+## Lab branch
+
+`ucb-bar/zephyr-chipyard-sw:riskybirdv3` continues the tested `35bf7c9` history.
+Its nested ModelBlaster now uses `ucb-bar/ModelBlaster:riskybirdv3`, retaining
+the exact tested `80cec139799e6ecf3d8625b14cdaa78ba3bf596a` pin. The RTOS pin
+and implementation source are unchanged. The fork branch names below record
+the original merge process. Additional numerical/build findings, including
+the header-selection and fresh-model include-path issues, are recorded in the
+[software pin validation](https://github.com/lorenshung/riskybird-dev/blob/205b020a1a8bc6264df8371a079b65f9ccff85da/docs/software-pin-validation.md).
+
+## Original integration record
+
 This branch merges the original upstream branches first, then the existing
 RiskyBird fork. It does not import the previous migration implementation,
 relocate firmware/model sources, or create a second flight-controller sample.
