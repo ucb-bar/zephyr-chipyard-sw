@@ -3194,6 +3194,11 @@ static void uart_cmd_dispatch(char *line)
 		} else {
 			uart_cmd_reply("PROFILE", false);
 		}
+	} else if (strncmp(line, "SNAP", 4) == 0) {
+		/* The merged panel also serves the DMA/raw-UART application.
+		 * This motor-link transport cannot return its snapshot chunks. */
+		printk("UARTCMD: SNAP requires the DMA/raw-UART camera transport\n");
+		uart_cmd_reply("SNAP", false);
 	} else if (strcmp(line, "PING") == 0) {
 		uart_cmd_reply("PING", true);
 	} else {
