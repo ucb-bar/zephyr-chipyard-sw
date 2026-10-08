@@ -1,0 +1,10 @@
+sample:
+  name: Merlin VMFB runner for FireSim Shuttle (Gemmini/OPU/RVV/scalar)
+common:
+  tags: chipyard merlin iree
+  harness: console
+  harness_config:
+    fixture: fixture_1
+tests:
+  sample.chipyard.merlin_model_runner:
+    platform_allow: spike_riscv64/rocketchip_virt_riscv64

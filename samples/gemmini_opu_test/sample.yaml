@@ -1,0 +1,10 @@
+sample:
+  name: Hetero Gemmini + OPU int8 smoke test
+common:
+  tags: chipyard accelerator
+  harness: console
+  harness_config:
+    fixture: fixture_1
+tests:
+  sample.chipyard.gemmini_opu_test:
+    platform_allow: spike_riscv64/rocketchip_virt_riscv64

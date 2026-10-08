@@ -33,6 +33,17 @@ void thread_function(void *arg1, void *arg2, void *arg3)
 	unsigned char buf[4]
 		__attribute__((aligned(16))) = {thread_id, thread_id, thread_id, thread_id};
 
+	/* Load v1 with this thread's id, then yield so other threads on the
+	 * same hart run (and overwrite v1 in hardware).  arch/riscv/core/v.c
+	 * must save/restore v1 per-thread across the context switch for the
+	 * value to survive to the vse32.v below.
+	 *
+	 * NOTE: the v-register clobber ("v1") is intentionally omitted — the
+	 * Zephyr SDK 0.17.0 GCC 12.2.0 inline-asm parser does not know RVV
+	 * register names (that landed in GCC 14). volatile + the "memory"
+	 * clobber keep both asm blocks in order around k_yield(), and GCC
+	 * 12.2.0 emits no vector code of its own here, so v1 is touched only
+	 * by these two blocks — the same convention arch/riscv/core/v.c uses. */
 	__asm volatile(".option push\n\t"
 		       ".option arch, +v\n\t"
 		       "vsetivli x0, 4, e32, m1\n\t"
@@ -40,7 +51,7 @@ void thread_function(void *arg1, void *arg2, void *arg3)
 		       ".option pop"
 		       :
 		       : [buf] "r"(buf)
-		       : "v1", "memory");
+		       : "memory");
 
 	k_yield();
 
@@ -50,7 +61,7 @@ void thread_function(void *arg1, void *arg2, void *arg3)
 		       ".option pop"
 		       :
 		       : [buf] "r"(buf)
-		       : "v1", "memory");
+		       : "memory");
 
 	k_mutex_lock(&print_mutex, K_FOREVER);
 	hart_id = arch_curr_cpu()->id;
