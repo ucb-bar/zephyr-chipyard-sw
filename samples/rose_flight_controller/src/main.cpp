@@ -2219,6 +2219,153 @@ so the envelope guard would be absent while motors are commanded. Build the sing
  * on non-autoflight builds it stays at TARGET_Z. */
 static float g_setpoint[NSTATES] = {0.0f, 0.0f, TARGET_Z, 0,0,0, 0,0,0, 0,0,0};
 
+/* ---- DroNet navigation (ROSE_DRONET_NAV; samples/rose_fc_dronet only) -------------------------
+ * The DroNet thread publishes (steer, collision) per camera frame (dronet_cmd.h). Every control tick
+ * turns the latest one into the forward-velocity setpoint g_setpoint[6] and the yaw setpoint
+ * g_setpoint[5] (fc_dronet_nav.h); g_setpoint[7] stays 0. In autoflight it is engaged only in the
+ * HOVER segment, above DRONET_NAV_MIN_Z_M, with no abort landing or estop and optical flow valid
+ * within DRONET_FLOW_MAX_GAP_MS, so climb and descent are the profile flown before; leaving that
+ * state zeroes the velocity request at once. A command whose camera frame is older than
+ * DRONET_CMD_TIMEOUT_MS decays the setpoints to hover; one the DroNet thread withdrew (its dual-run
+ * or golden check failed) counts as none.
+ *
+ * The controller runs in the current heading frame (ROSE_VEL_HEADING_FRAME, see solve_control()):
+ * the estimators report world-frame vx/vy and a Gibbs attitude whose roll/pitch mix with yaw, and the
+ * PID was tuned on both at heading 0 -- and DroNet steers. */
+#ifndef ROSE_DRONET_NAV
+#define ROSE_DRONET_NAV 0
+#endif
+#ifndef ROSE_VEL_HEADING_FRAME
+#define ROSE_VEL_HEADING_FRAME ROSE_DRONET_NAV
+#endif
+#if ROSE_DRONET_NAV
+#if !(defined(ROSE_HAVE_DRONET) && ROSE_HAVE_DRONET)
+#error "ROSE_DRONET_NAV needs the DroNet inference thread: build samples/rose_fc_dronet"
+#endif
+#if !(defined(ROSE_FLOW) && ROSE_FLOW)
+#error "ROSE_DRONET_NAV commands a velocity; without ROSE_FLOW=1 that velocity is dead-reckoned and drifts"
+#endif
+#if !ROSE_CAMERA_DMA
+#error "ROSE_DRONET_NAV needs live camera frames: build with ROSE_CAMERA_DMA=1"
+#endif
+#if !(defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT) && !ROSE_MOTORS_INHIBIT
+#error "ROSE_DRONET_NAV without ROSE_AUTOFLIGHT is engaged from boot; allowed only with ROSE_MOTORS_INHIBIT=1"
+#endif
+/* The committed gray DroNet is a seeded-random-weight benchmark model: bit-exact, meaningless as a
+ * policy. Motors may follow it only once a trained model is built in and declared as such. */
+#if !ROSE_MOTORS_INHIBIT && !(defined(DRONET_MODEL_VALIDATED) && DRONET_MODEL_VALIDATED)
+#error "ROSE_DRONET_NAV with live motors needs a trained, validated DroNet: set DRONET_MODEL_VALIDATED=1 only for one (the committed gray model has random weights)"
+#endif
+#if !ROSE_VEL_HEADING_FRAME
+#error "ROSE_DRONET_NAV commands velocity along the nose: it requires ROSE_VEL_HEADING_FRAME=1"
+#endif
+#if defined(ROSE_VEL_LOOP) && !ROSE_VEL_LOOP
+#error "ROSE_DRONET_NAV with ROSE_VEL_LOOP=0: the forward-velocity setpoint would have no loop regulating it"
+#endif
+#endif
+#if ROSE_VEL_HEADING_FRAME
+#if defined(ROSE_USE_ROCC) && ROSE_USE_ROCC
+#error "ROSE_VEL_HEADING_FRAME: the RoCC controller reads its own state copy and would never see the rotation"
+#endif
+#if defined(ROSE_POS_LOOP) && ROSE_POS_LOOP
+#error "ROSE_VEL_HEADING_FRAME: ROSE_POS_LOOP's world-frame position would be mixed with heading-frame velocity"
+#endif
+#endif
+
+#if ROSE_DRONET_NAV
+#include "dronet_cmd.h"
+#include "fc_dronet_nav.h"
+#ifndef DRONET_V_MAX
+#define DRONET_V_MAX          0.30f   /* forward speed at collision 0 (m/s); SAFE_MAX_VEL_MPS is 2.5 */
+#endif
+#ifndef DRONET_YAW_RATE_MAX
+#define DRONET_YAW_RATE_MAX   0.50f   /* yaw rate at |steer| = 1 (rad/s) */
+#endif
+#ifndef DRONET_YAW_SIGN
+#define DRONET_YAW_SIGN       1.0f    /* +steer yaws nose-left (+z); flip for a right-positive model */
+#endif
+#ifndef DRONET_YAW_MAX
+#define DRONET_YAW_MAX        1.00f   /* |yaw reference| bound (rad) */
+#endif
+#ifndef DRONET_TAU_V
+#define DRONET_TAU_V          0.50f   /* forward-speed smoothing (s) */
+#endif
+#ifndef DRONET_TAU_W
+#define DRONET_TAU_W          0.30f   /* yaw-rate smoothing (s) */
+#endif
+/* Age limit from camera CAPTURE, not publish: covers grab + two inferences (DRONET_DUAL_RUN, ~13 fps
+ * each measured) + the wait for the next frame. */
+#ifndef DRONET_CMD_TIMEOUT_MS
+#define DRONET_CMD_TIMEOUT_MS 600
+#endif
+#ifndef DRONET_FLOW_MAX_GAP_MS
+#define DRONET_FLOW_MAX_GAP_MS 200    /* disengage when the last valid optical-flow sample is older */
+#endif
+/* Output dequantization, zero point 0: linear1 (steer) and sigmoid1 (collision) scales of the gray
+ * graph the committed gemmini_q31_rvv_softfp-gray-nhwc model was generated from. A different model
+ * directory needs its own values. */
+#ifndef DRONET_STEER_SCALE
+#define DRONET_STEER_SCALE    0.0034265661f
+#endif
+#ifndef DRONET_COLL_SCALE
+#define DRONET_COLL_SCALE     0.0031727139f
+#endif
+#ifndef DRONET_NAV_MIN_Z_M
+#define DRONET_NAV_MIN_Z_M    0.20f   /* engage only above this estimated height (m) */
+#endif
+/* Console status period; 0 = off. The line is a polled ~9 ms console write inside the control loop,
+ * so it defaults on only for motors-inhibited console builds. */
+#ifndef DRONET_NAV_PRINT_MS
+#define DRONET_NAV_PRINT_MS   ((ROSE_MOTORS_INHIBIT && ROSE_TELEM_CONSOLE) ? 1000 : 0)
+#endif
+
+static const struct fc_dronet_nav_params g_nav_params = {
+	DRONET_STEER_SCALE, DRONET_COLL_SCALE, DRONET_V_MAX, DRONET_YAW_RATE_MAX, DRONET_YAW_SIGN,
+	DRONET_TAU_V, DRONET_TAU_W, DRONET_YAW_MAX, DRONET_CMD_TIMEOUT_MS,
+};
+static struct fc_dronet_nav g_nav;
+#if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
+static bool g_nav_engaged;                 /* set by the autoflight block every iteration */
+#else
+static const bool g_nav_engaged = true;    /* motors-inhibited bench build: engaged from boot */
+#endif
+
+/* Latest DroNet command -> g_setpoint[5..7]. Called once per control iteration, before the solve.
+ * flow_valid = this frame carried a valid optical-flow sample: without recent flow the velocity the
+ * loop regulates is dead-reckoned, so DroNet is disengaged until flow returns. The gap is measured
+ * from the sample's own acquisition time -- flow_get() keeps reporting a cached sample valid for
+ * FLOW_STALE_MS after it. */
+static void dronet_nav_tick(float dt, int64_t t_now, bool flow_valid)
+{
+	static int64_t last_flow_ms = -DRONET_FLOW_MAX_GAP_MS - 1;
+	struct dronet_cmd c;
+	const bool have = dronet_cmd_latest(&c);
+
+	if (flow_valid) {
+		last_flow_ms = flow_sample_ms();
+	}
+	if (!g_armed) {
+		fc_dronet_nav_reset(&g_nav);   /* each flight starts from hover, heading 0 */
+	}
+	const bool engaged = g_nav_engaged && !g_estop && t_now - last_flow_ms <= DRONET_FLOW_MAX_GAP_MS;
+	const struct fc_dronet_nav_out o = fc_dronet_nav_step(&g_nav, &g_nav_params,
+		engaged, have, t_now - c.t_ms, c.steer_q, c.coll_q, dt);
+	g_setpoint[5] = o.yaw_gibbs;
+	g_setpoint[6] = o.vx;
+	g_setpoint[7] = 0.0f;
+
+	static int64_t last_print;
+	if (DRONET_NAV_PRINT_MS > 0 && t_now - last_print >= DRONET_NAV_PRINT_MS) {
+		last_print = t_now;
+		printk("DRONET_NAV: eng=%d fresh=%d seq=%u age=%dms steer_m=%d coll_m=%d vx=%dmm/s psi=%dmrad\n",
+		       (int)engaged, (int)o.fresh, (unsigned int)c.seq,
+		       have ? (int)(t_now - c.t_ms) : -1, (int)(o.steer * 1000.0f),
+		       (int)(o.collision * 1000.0f), (int)(o.vx * 1000.0f),
+		       (int)(g_nav.psi_ref * 1000.0f));
+	}
+}
+#endif
+
 #if defined(ROSE_AUTOFLIGHT) && ROSE_AUTOFLIGHT
 /* Runtime-tunable flight profile (climb/hover/descend ms, cap ms, hover altitude m), initialized
  * from the compile-time defaults but adjustable LIVE from the ground station (PROFILE / HOVER_Z
@@ -2873,6 +3020,20 @@ static void solve_control(const float *state, float *u, float dt)
 	 */
 	(void)state; (void)dt;
 	for (int i = 0; i < NACTIONS; i++) { u[i] = 0.0f; }
+#elif ROSE_VEL_HEADING_FRAME
+	/* Run the controller in the CURRENT heading frame, with the yaw target given relative to it. That
+	 * is the heading-0 problem the PID was tuned on: velocity along the nose maps to pitch, roll and
+	 * pitch are not mixed with yaw, and the body-direction terms (DroNet's forward request, the wall
+	 * bumper, the velocity integral that trims a body-fixed CG/mount offset) stay body-aligned even
+	 * while yaw lags its target. The guard, telemetry and log keep the estimator's world-frame state. */
+	float st[NSTATES], sp[NSTATES];
+	const float yaw = fc_yaw_from_gibbs(&state[3]);
+	float dyaw = 2.0f * atanf(g_setpoint[5]) - yaw;
+	dyaw = atan2f(sinf(dyaw), cosf(dyaw));
+	fc_state_to_yaw_frame(state, yaw, st);
+	memcpy(sp, g_setpoint, sizeof(sp));
+	sp[5] = tanf(0.5f * dyaw);
+	ctrl.compute(st, sp, u, dt);
 #else
 	ctrl.compute(state, g_setpoint, u, dt);
 #endif
@@ -3817,6 +3978,9 @@ int main(void)
 			est.init(0.0f, 0.0f, 0.0f);
 			ctrl.init();
 			g_setpoint[2] = 0.0f;
+#if ROSE_DRONET_NAV
+			fc_dronet_nav_reset(&g_nav);   /* the estimator's yaw restarts at 0; so does the reference */
+#endif
 			printk("flight_controller: SOFT RESET -- estop cleared, disarmed"
 			       "%s\n", ROSE_RECAL_ON_RESET ? ", recalibrating gyro" : " (keeping boot gyro cal)");
 			motor_gate_note_reset();   /* the window latch is NOT one of the things this clears */
@@ -3936,6 +4100,9 @@ int main(void)
 				announced = false; arm_since = 0; flight_done = false;
 			}
 			g_arming = false;             /* status LED: default; set true below while counting down */
+#if ROSE_DRONET_NAV
+			g_nav_engaged = false;        /* set below, in the hover segment only */
+#endif
 			if (!g_armed && !g_estop && !flight_done) {
 				/* Level by BOTH references. The estimator's tilt (converted out of Gibbs)
 				 * and the accelerometer's tilt straight from gravity must agree that the
@@ -4017,6 +4184,10 @@ int main(void)
 					       landed ? "landed" : "flight cap", (int)tf, (int)(state[2] * 1000.0f));
 				} else {
 					g_setpoint[2] = zsp;
+#if ROSE_DRONET_NAV
+					g_nav_engaged = fc_profile_in_hover(tf, g_t_climb_ms, g_t_hover_ms) &&
+							g_land_abort_ms == 0 && state[2] > DRONET_NAV_MIN_Z_M;
+#endif
 				}
 			}
 		}
@@ -4037,6 +4208,9 @@ int main(void)
 #endif
 #if ROSE_CAMERA
 		photo_step(state[2]);
+#endif
+#if ROSE_DRONET_NAV
+		dronet_nav_tick(dt, t_now, f.flow_valid);
 #endif
 		uint32_t _pc = PF_NOW();
 		solve_control(state, u, dt);

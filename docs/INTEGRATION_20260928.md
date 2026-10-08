@@ -164,3 +164,5 @@ still-photo capture, DMA frame/snapshot integrity and raw UART commands with a
 matched clock, then sustained disarmed simultaneous FC/inference timing and
 vector-state behavior. Flight/motor qualification is separate. Existing
 working trees, default branches and hardware images remain unchanged.
+
+See [DroNet navigation](DRONET_NAV.md) for the opt-in live-camera path, command gating, build checks, updated UART clock handling and remaining hardware limits.
