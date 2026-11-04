@@ -11,7 +11,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 TOOLS_MANUAL_DIR="${REPO_ROOT}/tools-manual"
 PATCHES_DIR="${REPO_ROOT}/tools/patches"
 
-SDK_VERSION="${RB_SDK_VERSION:-1.0.0-beta1}"
+SDK_VERSION="${ZCS_SDK_VERSION:-1.0.0-beta1}"
 
 # Which prebuilt SDK to fetch. The upstream release publishes one tarball per
 # host, and picking the wrong one installs a toolchain that cannot execute --
@@ -20,17 +20,17 @@ SDK_VERSION="${RB_SDK_VERSION:-1.0.0-beta1}"
 #
 # Detected rather than hardcoded so a Mac needs no local edit to this file:
 # an edited installer is a permanently dirty working tree that drifts from
-# upstream. Override with RB_SDK_HOST for a host this does not know, e.g.
-#   RB_SDK_HOST=linux-aarch64 ./scripts/install_toolchain_sdk.sh
-if [ -n "${RB_SDK_HOST:-}" ]; then
-  SDK_HOST="${RB_SDK_HOST}"
+# upstream. Override with ZCS_SDK_HOST for a host this does not know, e.g.
+#   ZCS_SDK_HOST=linux-aarch64 ./scripts/install_toolchain_sdk.sh
+if [ -n "${ZCS_SDK_HOST:-}" ]; then
+  SDK_HOST="${ZCS_SDK_HOST}"
 else
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)          SDK_HOST="linux-x86_64"   ;;
     Linux-aarch64)         SDK_HOST="linux-aarch64"  ;;
     Darwin-arm64)          SDK_HOST="macos-aarch64"  ;;
     Darwin-x86_64)         SDK_HOST="macos-x86_64"   ;;
-    *) die "unsupported host $(uname -s)-$(uname -m); set RB_SDK_HOST to one of
+    *) die "unsupported host $(uname -s)-$(uname -m); set ZCS_SDK_HOST to one of
        linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64" ;;
   esac
 fi
