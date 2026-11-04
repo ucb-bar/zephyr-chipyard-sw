@@ -61,6 +61,11 @@ void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid)
 	if (valid) { *valid = false; }
 }
 
+int64_t flow_sample_ms(void)
+{
+	return INT64_MIN / 2;
+}
+
 #else
 
 /* --- tunables (override via -D) --- */
@@ -213,6 +218,14 @@ void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid)
 	bool fresh = (k_uptime_get() - g_last_ms) < FLOW_STALE_MS;
 	*valid = g_squal_ok && fresh && (g_seq != 0);
 	k_mutex_unlock(&flow_mtx);
+}
+
+int64_t flow_sample_ms(void)
+{
+	k_mutex_lock(&flow_mtx, K_FOREVER);
+	const int64_t t = g_last_ms;
+	k_mutex_unlock(&flow_mtx);
+	return t;
 }
 
 #endif /* HAVE_FLOW_HW */

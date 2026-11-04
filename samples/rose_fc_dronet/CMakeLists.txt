@@ -92,6 +92,10 @@ set(ROSE_USE_FP16 0 CACHE STRING "1=fp16(Zvfh)+fp32-vector estimator+PID, 0=scal
 # over FP16/EKF/PID. Only the float<->Q24.24 boundary is scalar soft-float. REQUIRES the
 # validated-core RoCC bitstream (assembled ROM+boot image) to actually compute.
 set(ROSE_USE_ROCC 0 CACHE STRING "1=FcRoCC(Q24.24) estimator+PID on the custom-0 accelerator, 0=off")
+# DroNet navigation: camera frames in, (steer, collision) out to the control loop's forward-
+# velocity and yaw setpoints. 0 keeps the static-input co-residency benchmark. Needs ROSE_FLOW=1
+# and ROSE_CAMERA_DMA=1; main.cpp and dronet_thread.c refuse to build without them.
+set(ROSE_DRONET_NAV 0 CACHE STRING "1=DroNet drives velocity/yaw setpoints from live camera frames")
 
 # ---------------------------------------------------------------------------
 # Sources: the full FC + the DroNet model/kernels/runtime + the DroNet thread.
@@ -111,6 +115,7 @@ target_sources(app PRIVATE
   ${FC}/src/side_tof.c
   ${FC}/src/flow.c
   ${FC}/src/pmw3901.c
+  ${FC}/src/dronet_cmd.c
   ${TINYMPC}/external/admm/src/admm_rvv.cpp
   # ---- DroNet inference (generated) + the background thread ----
   src/dronet_thread.c
@@ -187,7 +192,8 @@ target_compile_definitions(app PRIVATE
   ROSE_THREADED=${ROSE_THREADED} ROSE_CTRL_DIV=${ROSE_CTRL_DIV}
   ROSE_ACTUATE_TIMEOUT_MS=${ROSE_ACTUATE_TIMEOUT_MS} CTRL_ITERS=${CTRL_ITERS}
   ROSE_BUMPER=${ROSE_BUMPER} ROSE_FLOW=${ROSE_FLOW} ROSE_BARO=${ROSE_BARO}
-  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY})
+  ROSE_BUMPER_READDRESS_ONLY=${ROSE_BUMPER_READDRESS_ONLY}
+  ROSE_DRONET_NAV=${ROSE_DRONET_NAV} ROSE_HAVE_DRONET=1)
 
 target_include_directories(app PRIVATE
   ${FC}/src

@@ -11,6 +11,40 @@ static inline float fc_tilt_rad(const float *state)
 {
     return 2.0f * atanf(sqrtf(state[3]*state[3] + state[4]*state[4]));
 }
+/* Heading (rad) of the body x axis in the world frame, from the Gibbs attitude r = state[3..5].
+ * q = (1, r)/|(1, r)|, so yaw = atan2(R[1][0], R[0][0]) with the common 1/|q|^2 cancelled. Exact at
+ * any tilt; for pure yaw it reduces to 2*atan(r3). */
+static inline float fc_yaw_from_gibbs(const float *r)
+{
+    const float n2 = 1.0f + r[0]*r[0] + r[1]*r[1] + r[2]*r[2];
+    return atan2f(2.0f*(r[2] + r[0]*r[1]), n2 - 2.0f*(r[1]*r[1] + r[2]*r[2]));
+}
+/* World-frame horizontal vector -> a frame yawed by `yaw` (x along that heading, y to its left). */
+static inline void fc_world_to_heading(float vx, float vy, float yaw, float out[2])
+{
+    const float c = cosf(yaw), s = sinf(yaw);
+    out[0] =  c*vx + s*vy;
+    out[1] = -s*vx + c*vy;
+}
+/* The 12-state [p(3), r(3), v(3), w(3)] re-expressed in a frame yawed by `yaw` about world z:
+ * attitude q' = qz(yaw)^-1 * q (Gibbs in and out, q = (1, r) up to scale), horizontal position and
+ * velocity rotated, body rates unchanged. The identity at yaw = 0. With yaw = the current heading
+ * (fc_yaw_from_gibbs) a controller tuned at heading 0 sees at any heading exactly what it would see
+ * there -- including roll/pitch, which in Gibbs form mix with yaw (pitch 0.2 rad at yaw 1 rad reads
+ * r1 = -0.055). Gibbs is sign-free (x/w = -x/-w); only a relative rotation of 180 deg (w = 0) is
+ * singular, as it is for the state itself. */
+static inline void fc_state_to_yaw_frame(const float *s, float yaw, float *out)
+{
+    for (int i = 0; i < 12; ++i) out[i] = s[i];
+    const float c = cosf(0.5f*yaw), sn = sinf(0.5f*yaw);
+    float w = c + sn*s[5];
+    if (fabsf(w) < 1e-6f) w = w < 0.0f ? -1e-6f : 1e-6f;
+    out[3] = (c*s[3] + sn*s[4]) / w;
+    out[4] = (c*s[4] - sn*s[3]) / w;
+    out[5] = (c*s[5] - sn) / w;
+    fc_world_to_heading(s[0], s[1], yaw, &out[0]);
+    fc_world_to_heading(s[6], s[7], yaw, &out[6]);
+}
 static inline void fc_actuator_duty(const float *u, float duty[4], float battery_scale,
                                    float ceiling, bool autoflight, float bench_scale)
 {

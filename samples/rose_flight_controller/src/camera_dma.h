@@ -30,6 +30,14 @@ uint32_t camera_dma_last_mean(void); /* mean pixel of the last frame (cheap live
  * the frame so the GCS can group its chunks; w/h are clamped to [8, sensor size]. */
 void camera_dma_request_snapshot(uint32_t seq, int w, int h);
 
+/* On-board consumer (DroNet): capture the next frame, box-average it to w x h grayscale into dst, set
+ * *t_capture_ms to its k_uptime_get() capture time, and return its frame number (> 0). Blocks up to
+ * timeout_ms. Returns -EAGAIN on timeout, -EIO when the capture was not edge-aligned, filled and fully
+ * DMA'd (dst untouched), -EINVAL for a bad size (w * h > CAMERA_DMA_GRAB_MAX), and < 0 when camera
+ * capture is compiled out. One caller at a time. */
+#define CAMERA_DMA_GRAB_MAX (112 * 112)
+int32_t camera_dma_grab_gray(uint8_t *dst, int w, int h, int32_t timeout_ms, int64_t *t_capture_ms);
+
 #ifdef __cplusplus
 }
 #endif

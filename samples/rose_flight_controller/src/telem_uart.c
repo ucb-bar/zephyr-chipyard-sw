@@ -26,7 +26,14 @@
 #define U1_TXCTRL 0x08   /* [0]=txen */
 #define U1_RXCTRL 0x0C   /* [0]=rxen */
 #define U1_DIV    0x18   /* baud divisor = f_pclk/f_baud - 1 */
+/* The clock the Zephyr SiFive console driver divides, so uart1 follows the shell's bus clock (35 MHz
+ * on the FC+DroNet At35 shell) instead of assuming 50 MHz. */
+#include <soc.h>
+#ifdef SIFIVE_PERIPHERAL_CLOCK_FREQUENCY
+#define PCLK_HZ   ((unsigned long)(SIFIVE_PERIPHERAL_CLOCK_FREQUENCY))
+#else
 #define PCLK_HZ   50000000UL
+#endif
 /* 921600: fast enough that a downsampled camera snapshot streams in a fraction of a second and the
  * ~100 Hz telemetry never back-pressures the loop. DIV=53 -> 925926 baud (+0.47%, within tol). */
 #define BAUD      921600UL
@@ -63,7 +70,8 @@ static struct k_mutex tx_mutex;
 void telem_uart_init(void)
 {
 	k_mutex_init(&tx_mutex);
-	u1_w(U1_DIV, (PCLK_HZ / BAUD) - 1UL);   /* 53 @ 921600 */
+	/* Rounded: truncating 35 MHz / 921600 = 37.98 would run 2.6% fast. 53 at 50 MHz, 37 at 35 MHz. */
+	u1_w(U1_DIV, ((PCLK_HZ + BAUD / 2UL) / BAUD) - 1UL);
 	u1_w(U1_TXCTRL, 0x1);                    /* txen */
 	u1_w(U1_RXCTRL, 0x1);                    /* rxen -- command uplink from the ESP bridge */
 }

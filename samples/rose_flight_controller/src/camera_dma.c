@@ -12,7 +12,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/sys/printk.h>
+#include <errno.h>
 #include <stdint.h>
+#include <string.h>
 
 /* OSPI capture + DMA register map (base 0x10080000). */
 #define OSPI_BASE       0x10080000UL
@@ -36,6 +38,8 @@
 #define DMA_CLEAR (1u<<3)
 #define DMA_BUSY  (1u<<0)
 #define DMA_DONE  (1u<<1)
+#define DMA_ERROR (1u<<2)   /* a denied/corrupt bus response during the transfer */
+#define O_DMA_BYTES     0x58 /* bytes the current/last transfer wrote to DDR */
 
 #define CAM_ADDR   0x24
 #define CAP_PIXELS 104000
@@ -78,6 +82,29 @@ static volatile uint32_t g_last_mean;
 static volatile int      g_snap_w, g_snap_h;
 static volatile uint32_t g_snap_req;   /* nonzero seq = a snapshot is requested */
 
+/* On-board grab (camera_dma_grab_gray). Everything below is under grab_mtx: the caller posts a
+ * request {gen, w, h}; the capture thread answers the gen it captured for (done_*) and gives
+ * grab_sem. A caller only accepts the answer to its own gen, and cancels its request on timeout, so a
+ * late answer to an abandoned request can never be taken for a newer one. cam_wake cuts the idle poll
+ * short so a grab does not wait out the 100 ms snapshot poll. */
+static uint8_t  grab_buf[CAMERA_DMA_GRAB_MAX];
+static uint32_t grab_req_gen;      /* pending request; 0 = none */
+static int      grab_req_w, grab_req_h;
+static uint32_t grab_done_gen;     /* request the result below answers */
+static bool     grab_done_ok;
+static uint32_t grab_done_frame;
+static int64_t  grab_done_t_ms;
+K_MUTEX_DEFINE(grab_mtx);
+K_SEM_DEFINE(grab_sem, 0, 1);
+K_SEM_DEFINE(cam_wake, 0, 1);
+
+/* Bound on the scheduler-locked frame-edge spin when a grab is being served. That spin keeps the
+ * control loop off the CPU; the pre-sleep leaves ~3 ms to the edge, so a longer wait means the edge
+ * was missed or streaming stopped, and the grab fails rather than stalling the loop. */
+#ifndef CAM_GRAB_EDGE_SPIN_US
+#define CAM_GRAB_EDGE_SPIN_US 5000
+#endif
+
 static const char B64[] =
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -94,6 +121,50 @@ static int b64_triplet(const uint8_t *in, int n, char *out)
 	return 4;
 }
 
+/* Output pixel (ox, oy) of a w x h downsample of cam_buf. */
+static uint8_t box_avg(int ox, int oy, int w, int h)
+{
+	int sy0 = oy * SRC_H / h, sy1 = (oy + 1) * SRC_H / h;
+	if (sy1 <= sy0) { sy1 = sy0 + 1; }
+	/* Force an EVEN-length row span so the block holds equal even/odd source rows -- otherwise a
+	 * 3-row block (2:1 parity) leaves a residual of the period-2 row FPN. See column note below. */
+	if (((sy1 - sy0) & 1) && sy1 < SRC_H) { sy1++; }
+	int sx0 = ox * SRC_W / w, sx1 = (ox + 1) * SRC_W / w;
+	if (sx1 <= sx0) { sx1 = sx0 + 1; }
+	if (((sx1 - sx0) & 1) && sx1 < SRC_W) { sx1++; }
+	/* Box-average the whole source block into one output pixel (not nearest-neighbour). The
+	 * HM01B0 has period-2 fixed-pattern noise on BOTH axes -- even/odd row offsets (~92 vs 74)
+	 * AND even/odd column offsets (per-column ADCs) -- which together read as a checkerboard
+	 * grid. Averaging over an EVEN number of rows and columns puts equal even/odd members in
+	 * every block, cancelling both; a plain variable 2-or-3 span left a residual grid. It also
+	 * anti-aliases the downscale. (A single-row/col pick would alias the FPN into stripes.) */
+	uint32_t sum = 0, cnt = 0;
+	for (int sy = sy0; sy < sy1; sy++) {
+		const uint8_t *row = &cam_buf[(uint32_t)sy * SRC_W];
+		for (int sx = sx0; sx < sx1; sx++) { sum += row[sx]; cnt++; }
+	}
+	return (uint8_t)(sum / cnt);
+}
+
+/* Answer grab request gen (if it is still the pending one): downsample cam_buf on success. */
+static void grab_answer(uint32_t gen, bool ok, uint32_t frame, int64_t t_ms, int w, int h)
+{
+	k_mutex_lock(&grab_mtx, K_FOREVER);
+	if (grab_req_gen == gen) {
+		if (ok) {
+			for (int oy = 0; oy < h; oy++) {
+				for (int ox = 0; ox < w; ox++) { grab_buf[oy * w + ox] = box_avg(ox, oy, w, h); }
+			}
+		}
+		grab_done_gen = gen;
+		grab_done_ok = ok;
+		grab_done_frame = frame;
+		grab_done_t_ms = t_ms;
+	}
+	k_mutex_unlock(&grab_mtx);
+	k_sem_give(&grab_sem);
+}
+
 static void stream_snapshot(uint32_t seq, int w, int h)
 {
 	if (w < 8) w = 8;  if (w > SRC_W) w = SRC_W;
@@ -108,27 +179,8 @@ static void stream_snapshot(uint32_t seq, int w, int h)
 	int rn = 0, k = 0;
 
 	for (int oy = 0; oy < h; oy++) {
-		int sy0 = oy * SRC_H / h, sy1 = (oy + 1) * SRC_H / h;
-		if (sy1 <= sy0) { sy1 = sy0 + 1; }
-		/* Force an EVEN-length row span so the block holds equal even/odd source rows -- otherwise a
-		 * 3-row block (2:1 parity) leaves a residual of the period-2 row FPN. See column note below. */
-		if (((sy1 - sy0) & 1) && sy1 < SRC_H) { sy1++; }
 		for (int ox = 0; ox < w; ox++) {
-			int sx0 = ox * SRC_W / w, sx1 = (ox + 1) * SRC_W / w;
-			if (sx1 <= sx0) { sx1 = sx0 + 1; }
-			if (((sx1 - sx0) & 1) && sx1 < SRC_W) { sx1++; }
-			/* Box-average the whole source block into one output pixel (not nearest-neighbour). The
-			 * HM01B0 has period-2 fixed-pattern noise on BOTH axes -- even/odd row offsets (~92 vs 74)
-			 * AND even/odd column offsets (per-column ADCs) -- which together read as a checkerboard
-			 * grid. Averaging over an EVEN number of rows and columns puts equal even/odd members in
-			 * every block, cancelling both; a plain variable 2-or-3 span left a residual grid. It also
-			 * anti-aliases the downscale. (A single-row/col pick would alias the FPN into stripes.) */
-			uint32_t sum = 0, cnt = 0;
-			for (int sy = sy0; sy < sy1; sy++) {
-				const uint8_t *row = &cam_buf[(uint32_t)sy * SRC_W];
-				for (int sx = sx0; sx < sx1; sx++) { sum += row[sx]; cnt++; }
-			}
-			raw[rn++] = (uint8_t)(sum / cnt);
+			raw[rn++] = box_avg(ox, oy, w, h);
 			if (rn == RAW_PER) {
 				int off = snprintk(line, sizeof(line), "IMG s=%u k=%d/%d w=%d h=%d ",
 						   seq, k++, total, w, h);
@@ -220,18 +272,27 @@ static void cam_thread(void *a, void *b, void *c)
 		if (tick_ms < 2) { tick_ms = 2; }
 	}
 
+	const uint32_t grab_spin_cyc = k_us_to_cyc_ceil32(CAM_GRAB_EDGE_SPIN_US);
 	uint32_t iter = 0;
 	for (;;) {
-		/* cam_buf has no consumer other than the snapshot stream, and the aligned capture briefly locks
-		 * the scheduler -- so only capture when there's actually a snapshot to send. */
+		/* The aligned capture briefly locks the scheduler -- so only capture when there's actually a
+		 * snapshot to send or an on-board grab waiting. */
 		iter++;
 		uint32_t req = g_snap_req;
+		uint32_t ggen = 0;
+		int gw = 0, gh = 0;
+		k_mutex_lock(&grab_mtx, K_FOREVER);
+		if (grab_req_gen != 0 && grab_req_gen != grab_done_gen) {
+			ggen = grab_req_gen; gw = grab_req_w; gh = grab_req_h;
+		}
+		k_mutex_unlock(&grab_mtx);
+		bool grab = ggen != 0;
 		int sw = 0, sh = 0;
 		if (req)                                  { sw = g_snap_w;            sh = g_snap_h; }
 #if ROSE_CAM_AUTOSNAP
 		else if ((iter % ROSE_CAM_AUTOSNAP) == 0) { sw = ROSE_CAM_AUTOSNAP_W; sh = ROSE_CAM_AUTOSNAP_H; }
 #endif
-		if (sw == 0) { k_msleep(100); continue; }
+		if (sw == 0 && !grab) { k_sem_take(&cam_wake, K_MSEC(100)); continue; }
 
 		/* --- Frame-aligned bounded capture into the OSPI frame buffer. ---
 		 * The capture core starts filling the instant it is ARMed, so ARM must land right at a frame
@@ -240,18 +301,37 @@ static void cam_thread(void *a, void *b, void *c)
 		 * edge and arming -- a variable ms of pixels stream through in that gap -> intermittent roll.
 		 * Fix: pre-sleep most of the frame preemptibly, then k_sched_lock (interrupts stay live) only
 		 * while spinning for the exact edge and arming, so no thread can slip in between. */
+		/* DMA_CLEAR does not abort a transfer: one that timed out earlier may still be collecting,
+		 * and would swallow this frame's pixels and report its own completion as ours. A grab
+		 * never starts on a busy engine. */
+		if (grab && (r32(O_DMA_STATUS) & DMA_BUSY)) {
+			grab_answer(ggen, false, 0, 0, gw, gh);
+			if (sw == 0) { k_msleep(tick_ms); continue; }
+			grab = false;
+		}
 		w32(O_PIXTARGET, CAP_PIXELS);
 		uint32_t fv = r32(O_FVLDCNT);
 		for (int g = 0; g < 200 && r32(O_FVLDCNT) == fv; g++) { k_msleep(1); }   /* phase-lock to a frame */
 		if (tick_ms > 4) { k_msleep(tick_ms - 3); }                             /* skip most of it */
 		k_sched_lock();
 		fv = r32(O_FVLDCNT);
-		for (int g = 0; g < 500000 && r32(O_FVLDCNT) == fv; g++) { }            /* catch the exact edge */
+		const uint32_t spin_c0 = k_cycle_get_32();
+		for (int g = 0; g < 500000 && r32(O_FVLDCNT) == fv; g++) {                /* catch the exact edge */
+			if (grab && k_cycle_get_32() - spin_c0 >= grab_spin_cyc) { break; }
+		}
+		const bool edge_ok = r32(O_FVLDCNT) != fv;
+		if (!edge_ok && sw == 0) {
+			k_sched_unlock();                   /* grab only: fail it rather than arm mid-frame */
+			grab_answer(ggen, false, 0, 0, gw, gh);
+			continue;
+		}
 		w32(O_CTRL, CTRL_EN | CTRL_CLR | CTRL_FLU);                             /* drop any pre-edge pixels */
 		w32(O_CTRL, CTRL_EN | CTRL_ARM);                                        /* arm at the frame start */
 		w32(O_CTRL, CTRL_EN);
+		const int64_t t_capture = k_uptime_get();   /* the frame starts now, not when we resume */
 		k_sched_unlock();
 		for (int t = 0; t < 60 && r32(O_FIFOCOUNT) < (CAP_PIXELS - 4096); t++) { k_msleep(1); }
+		const bool fill_ok = r32(O_FIFOCOUNT) >= (CAP_PIXELS - 4096);
 
 		/* Kick the DMA to drain the frame buffer to DDR (HW moves the bytes; CPU just waits). */
 		w32(O_DMA_ADDR_LO, (uint32_t)(dst & 0xffffffffu));
@@ -262,9 +342,14 @@ static void cam_thread(void *a, void *b, void *c)
 		uint32_t st = 0;
 		for (int d = 0; d < 40; d++) {
 			st = r32(O_DMA_STATUS);
-			if (!(st & DMA_BUSY) || (st & DMA_DONE)) break;
+			/* A grab waits for DONE itself: not-busy can also be read before the start is taken. */
+			if ((!grab && !(st & DMA_BUSY)) || (st & DMA_DONE)) break;
 			k_msleep(1);
 		}
+		/* A usable frame: the transfer finished, no bus error, and it stopped at the length cap -- an
+		 * early EOF leaves the tail of cam_buf holding the previous frame. */
+		const bool dma_ok = (st & DMA_DONE) && !(st & DMA_ERROR) &&
+				    r32(O_DMA_BYTES) == CAP_PIXELS;
 		w32(O_DMA_CTRL, DMA_EN | DMA_CLEAR);
 
 		/* Cheap liveness signal: mean of a sparse sample of the DDR frame (don't read every pixel). */
@@ -273,8 +358,13 @@ static void cam_thread(void *a, void *b, void *c)
 		g_last_mean = n ? sum / n : 0;
 		g_frames++;
 
+		if (grab) {
+			/* Only a frame that was edge-aligned, filled and fully DMA'd is handed to a consumer. */
+			grab_answer(ggen, edge_ok && fill_ok && dma_ok, g_frames, t_capture, gw, gh);
+		}
+
 		/* Send it. High seq bit marks an auto-snapshot vs an on-demand one. */
-		stream_snapshot(req ? req : (0x80000000u | g_frames), sw, sh);
+		if (sw != 0) { stream_snapshot(req ? req : (0x80000000u | g_frames), sw, sh); }
 		if (req) { g_snap_req = 0; }
 	}
 }
@@ -293,11 +383,56 @@ void camera_dma_request_snapshot(uint32_t seq, int w, int h)
 	g_snap_req = seq ? seq : 1;   /* nonzero -> serviced by the camera thread */
 }
 
+int32_t camera_dma_grab_gray(uint8_t *dst, int w, int h, int32_t timeout_ms, int64_t *t_capture_ms)
+{
+	static uint32_t gen;
+
+	if (w < 1 || h < 1 || w > SRC_W || h > SRC_H || w * h > CAMERA_DMA_GRAB_MAX) {
+		return -EINVAL;
+	}
+	if (++gen == 0) { gen = 1; }
+	k_mutex_lock(&grab_mtx, K_FOREVER);
+	grab_req_gen = gen;
+	grab_req_w = w;
+	grab_req_h = h;
+	k_mutex_unlock(&grab_mtx);
+	k_sem_give(&cam_wake);
+
+	const int64_t deadline = k_uptime_get() + timeout_ms;
+	for (;;) {
+		const int64_t left = deadline - k_uptime_get();
+		if (left <= 0 || k_sem_take(&grab_sem, K_MSEC(left)) != 0) {
+			k_mutex_lock(&grab_mtx, K_FOREVER);
+			if (grab_req_gen == gen) { grab_req_gen = 0; }   /* cancel: a late answer is dropped */
+			k_mutex_unlock(&grab_mtx);
+			return -EAGAIN;
+		}
+		k_mutex_lock(&grab_mtx, K_FOREVER);
+		if (grab_done_gen != gen) {          /* an answer to an older, abandoned request */
+			k_mutex_unlock(&grab_mtx);
+			continue;
+		}
+		const bool ok = grab_done_ok;
+		const uint32_t frame = grab_done_frame;
+		if (ok) {
+			memcpy(dst, grab_buf, (size_t)w * (size_t)h);
+			*t_capture_ms = grab_done_t_ms;
+		}
+		k_mutex_unlock(&grab_mtx);
+		return ok ? (int32_t)frame : -EIO;
+	}
+}
+
 #else  /* ROSE_CAMERA_DMA == 0 */
 
 void camera_dma_init(void) {}
 uint32_t camera_dma_frames(void) { return 0; }
 uint32_t camera_dma_last_mean(void) { return 0; }
 void camera_dma_request_snapshot(uint32_t seq, int w, int h) { (void)seq; (void)w; (void)h; }
+int32_t camera_dma_grab_gray(uint8_t *dst, int w, int h, int32_t timeout_ms, int64_t *t_capture_ms)
+{
+	(void)dst; (void)w; (void)h; (void)timeout_ms; (void)t_capture_ms;
+	return -1;
+}
 
 #endif

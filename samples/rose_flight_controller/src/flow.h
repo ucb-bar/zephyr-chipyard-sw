@@ -15,6 +15,7 @@
 #define ROSE_FLOW_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +33,10 @@ int flow_init(void);
  *                  require a valid ToF height before using it as velocity).
  */
 void flow_get(float *ang_x, float *ang_y, int *squal, bool *valid);
+
+/* k_uptime_get() of the latest sample in the cache (what flow_get() returns); very negative before
+ * the first one. flow_get()'s `valid` spans FLOW_STALE_MS after it, so an age budget must use this. */
+int64_t flow_sample_ms(void);
 
 #ifdef __cplusplus
 }
