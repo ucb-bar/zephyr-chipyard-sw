@@ -1446,6 +1446,10 @@ static bool motor_gate_permit(const float *duty)
 #include <rose/rose.h>
 #define ROSE_CMD_CONTROL 0x20u
 static const struct device *rose = DEVICE_DT_GET_ONE(ucbbar_roseadapter);
+/* Duty per motor as sent (u + 0.583, clamped to [0,1]), for the telemetry line's duty=[...]
+ * field. The PWM target keeps its own copy of what it wrote; without this one the RoSE build
+ * does not compile, because TELEM_LINE_ARGS names g_last_duty on both targets. */
+static volatile float g_last_duty[NACTIONS];
 static void send_control(const float *u)
 {
 	/* Emergency cutoff: send minimum thrust (u = -0.583 -> 0 duty) instead of the command. */
@@ -1457,6 +1461,8 @@ static void send_control(const float *u)
 		uint32_t w;
 		memcpy(&w, &cmd[i], sizeof(float));
 		rose_tx(rose, w);
+		const float d = cmd[i] + 0.583f;
+		g_last_duty[i] = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
 	}
 }
 static inline void motor_power_banner(void) { /* no physical motor on the RoSE target */ }
