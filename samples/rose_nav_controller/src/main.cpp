@@ -303,7 +303,7 @@ static bool read_nav_frame(struct nav_frame *f)
 /* Run the estimator on one frame -> state[NSTATES]. */
 static void run_estimator(const struct nav_frame *f, float *state)
 {
-	est.update(f->accel, f->gyro, f->flow, f->flow_valid, f->height, f->tof_valid, CTRL_DT);
+	est.update(f->accel, f->gyro, f->flow, f->flow_valid, f->height, f->tof_valid, 0.0f, false, CTRL_DT);
 	if (g_have_walls) {
 		est.fuse_walls(f->df, f->db, f->dl, f->dr, TOF_MAX_RANGE);   /* front,back,left,right */
 	}
