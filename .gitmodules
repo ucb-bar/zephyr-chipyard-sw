@@ -13,7 +13,7 @@
 [submodule "zephyr_ws/zephyr"]
 	path = zephyr_ws/zephyr
 	url = https://github.com/ucb-bar/zephyr.git
-	branch = integration/riskybird-20260928
+	branch = rb-clean
 [submodule "tools/pyuartsi"]
 	path = tools/pyuartsi
 	url = https://github.com/ucb-bar/pyuartsi.git
