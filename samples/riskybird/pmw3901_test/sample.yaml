@@ -1,0 +1,16 @@
+sample:
+  description: Test PMW3901 optical flow sensor connection
+  name: pmw3901 test
+common:
+  tags: spi sensor optical-flow
+  integration_platforms:
+    - esp32c6_devkitc_hpcore
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "PMW3901.*initialized successfully"
+tests:
+  sample.riskybird.pmw3901_test:
+    tags: spi sensor optical-flow
+    platform_allow: esp32c6_devkitc_hpcore
