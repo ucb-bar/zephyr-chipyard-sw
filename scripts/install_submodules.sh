@@ -103,12 +103,13 @@ main() {
   log "Using conda run to execute commands in zephyr environment..."
   CONDA_RUN="conda run -n zephyr --no-capture-output"
 
-  # Install CMake (pinned <4) + ninja into the env. Zephyr's dt_preprocess() breaks on cmake 4.x,
-  # and if the env has no cmake the build/SDK-setup falls back to a system cmake that may be missing
+  # Install CMake (pinned >=3.29,<4) + ninja into the env. Zephyr's dt_preprocess() breaks on cmake 4.x,
+  # and ExecuTorch 1.0.1 (third-party/executorch) requires cmake >= 3.29.
+  # If the env has no cmake, the build/SDK-setup falls back to a system cmake that may be missing
   # libidn (e.g. a Vitis cmake on PATH) and fail the "Register CMake package" step. Pin a known-good
   # conda-forge cmake so the documented setup works out of the box.
-  log "Installing cmake (<4) + ninja into the zephyr environment..."
-  run_cmd "conda install -yn zephyr -c conda-forge 'cmake<4' ninja"
+  log "Installing cmake (>=3.29,<4) + ninja into the zephyr environment..."
+  run_cmd "conda install -yn zephyr -c conda-forge 'cmake>=3.29,<4' ninja"
 
   # Install the west dependencies
   log "Installing west dependencies..."

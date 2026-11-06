@@ -106,31 +106,32 @@ spike build/zephyr/zephyr.elf
 
 
 ### Executorch Installation
-After the main installation, run the following:
+
+`third-party/executorch` is pinned to the `zephyr-1.0.1` branch of `ucb-bar/executorch`
+(ExecuTorch 1.0.1 + the RVV/Zephyr XNNPACK fork). Keep the recorded commit: do **not**
+`git checkout zephyr`, which is the old 0.5 line and no longer builds with the samples.
+ExecuTorch 1.0.1 also removed `install_requirements.sh --pybind`; the Python side is
+installed from the released wheels instead.
+
+After the main installation, with the `zephyr` env active:
 
 ```
-# Install executorch dependencies
-python -m pip install executorch==0.5.0 zstd
-
-# Setup Executorch repos
-cd zephyr-chipyard-sw
-
+# Initialize ExecuTorch's nested submodules (XNNPACK fork, flatbuffers, json, ...)
 cd ./third-party/executorch
-git checkout zephyr
 git submodule sync
-git submodule update --init
+git submodule update --init --recursive
 cd -
 
-cd ./third-party/executorch/backends/xnnpack/third-party/XNNPACK
-# git checkout zephyr
-git checkout e1515295a8fbd3a90a7264facc3703ae5c4463be # TODO have branch name
-cd -
-
-# Install additional executorch dependencies
-cd ./third-party/executorch/
-./install_requirements.sh --pybind xnnpack  # TODO just needs to install python deps, okay if there are CUDA errors
-cd -
+# Python deps, matched to the 1.0.1 runtime (torch 2.9 line, CPU wheels)
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.9.0 torchvision==0.24.0
+pip install executorch==1.0.1 torchao==0.14.0 zstd
 ```
+
+`install_submodules.sh` already installs a `cmake>=3.29,<4` into the env; ExecuTorch 1.0.1
+needs >= 3.29. Make sure the env's `bin` comes first on `PATH` (`which cmake`), since some
+machines have an older system or Vitis cmake ahead of it. The torchao warning
+"Skipping import of cpp extensions" is harmless for export.
+See `modelblaster/notes/flow_comparison.md` for more detail on the 1.0.1 port.
 
 To test an example using Executorch, inside `zephyr-chipyard-sw`:
 
@@ -139,7 +140,7 @@ To test an example using Executorch, inside `zephyr-chipyard-sw`:
 ./samples/executorch/generate_pte.sh --model mobilenetv3small
 
 # Build with the RVV XNNPACK Runtime
-# Note: Currently requires a patched version of RISCV toolchain
+# (rv64 ABI flags for the ExecuTorch/XNNPACK subbuild are set in the sample's CMakeLists.txt)
 west build -p -b spike_riscv64 ./samples/executorch/executor_runner/ -DXNNPACK_ENABLE_RISCV_VECTOR=ON -DXNNPACK_ENABLE_RISCV_GEMMINI=OFF
 
 # Run using spike
