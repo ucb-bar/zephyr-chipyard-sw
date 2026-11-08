@@ -7,8 +7,7 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/arch/riscv/zvt.h>
 
-#define TE        CONFIG_RISCV_ZVT_TE
-#define WORDS     (Z_RISCV_ZVT_SAVE_SIZE / 4)
+#define MAXWORDS  (Z_RISCV_ZVT_SAVE_SIZE / 4)
 #define NTHREADS  3
 #define ROUNDS    6
 #define STACK     4096
@@ -17,8 +16,10 @@ K_THREAD_STACK_ARRAY_DEFINE(stacks, NTHREADS + 1, STACK);
 static struct k_thread threads[NTHREADS + 1];
 
 static Z_RISCV_ZVT_SAVE_AREA_DEFINE(save_area[NTHREADS]);
-static uint32_t pattern[NTHREADS][WORDS] __aligned(64);
-static uint32_t readback[NTHREADS][WORDS] __aligned(64);
+static uint32_t pattern[NTHREADS][MAXWORDS] __aligned(64);
+static uint32_t readback[NTHREADS][MAXWORDS] __aligned(64);
+static unsigned int TE, COLS, WORDS;     /* runtime geometry */
+static volatile unsigned int migrations;
 
 static volatile int last_runner = -1;
 static volatile unsigned int interleavings;
@@ -29,15 +30,15 @@ static volatile int faulting_tid = -1;
 /* Full-tile transfer in the e32 view: 4 tile groups x TE rows. */
 static void tiles_xfer(uint32_t *buf, bool store)
 {
-	zvt_msetmtype(ZVT_MTYPE(1, 0, TE), ZVT_VTYPE_E32);
-	if (zvt_msettn(TE) != TE) {
-		printk("tn != TE\n");
+	zvt_msetmtype(ZVT_MTYPE(1, 0, COLS), ZVT_VTYPE_E32);
+	if (zvt_msettn(COLS) != COLS) {
+		printk("tn != COLS\n");
 		errors++;
 		return;
 	}
 	for (unsigned int g = 0; g < 4; g++) {
 		for (unsigned int r = 0; r < TE; r++) {
-			uint32_t *row = buf + ((g * TE) + r) * TE;
+			uint32_t *row = buf + ((g * TE) + r) * COLS;
 
 			if (store) {
 				zvt_vtse32(row, ZVT_TSS(g * 4, 0, r));
@@ -51,7 +52,13 @@ static void tiles_xfer(uint32_t *buf, bool store)
 /* Spin long enough to be time-sliced, recording whether we were. */
 static void spin(int tid)
 {
+	unsigned int cpu = arch_curr_cpu()->id;
+
 	for (volatile int i = 0; i < 400000; i++) {
+		if (arch_curr_cpu()->id != cpu) {
+			cpu = arch_curr_cpu()->id;
+			migrations++;
+		}
 		if (last_runner != tid) {
 			if (last_runner >= 0) {
 				interleavings++;
@@ -66,6 +73,10 @@ static void tile_thread(void *p1, void *p2, void *p3)
 	int tid = (int)(uintptr_t)p1;
 	int rc = arch_riscv_zvt_enable(save_area[tid], sizeof(save_area[tid]));
 
+	if (WORDS == 0) {
+		WORDS = (unsigned int)(arch_riscv_zvt_save_size() / 4);
+	}
+
 	if (rc != 0) {
 		printk("T%d: arch_riscv_zvt_enable failed: %d\n", tid, rc);
 		errors++;
@@ -79,7 +90,7 @@ static void tile_thread(void *p1, void *p2, void *p3)
 		tiles_xfer(pattern[tid], false);
 
 		/* A thread-specific tile config that must survive switches. */
-		unsigned long tm = 4 + tid, tn = 8 + 2 * tid;
+		unsigned long tm = 2 + tid, tn = 2 + 2 * tid; /* <= COLS for TE >= 8 */
 		unsigned long want_mtype = ZVT_MTYPE(1, 0, tm);
 
 		zvt_msetmtype(want_mtype, ZVT_VTYPE_E32);
@@ -134,7 +145,14 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 
 int main(void)
 {
-	printk("ZVT_CONTEXT: TE=%d, %d threads x %d rounds\n", TE, NTHREADS, ROUNDS);
+	if (arch_riscv_zvt_geometry(&TE, &COLS) != 0) {
+		printk("ZVT_CONTEXT: no usable Zvt\nZVT_CONTEXT: FAIL\n");
+		return 0;
+	}
+	WORDS = 4 * TE * COLS;
+	printk("ZVT_CONTEXT: TE=%u cols=%u save=%u B, %s, %u CPU(s), %d threads x %d rounds\n",
+	       TE, COLS, WORDS * 4, IS_ENABLED(CONFIG_RISCV_ZVT_LAZY) ? "lazy" : "eager",
+	       arch_num_cpus(), NTHREADS, ROUNDS);
 
 	for (int t = 0; t < NTHREADS; t++) {
 		k_thread_create(&threads[t], stacks[t], STACK, tile_thread,
@@ -148,7 +166,11 @@ int main(void)
 		k_thread_join(&threads[t], K_FOREVER);
 	}
 
-	printk("interleavings=%u fault_seen=%d errors=%d\n", interleavings, fault_seen, errors);
+	printk("interleavings=%u migrations=%u fault_seen=%d errors=%d\n", interleavings,
+	       migrations, fault_seen, errors);
+	printk("tile stats: nested_traps=%u lazy_traps=%u stores=%u loads=%u\n",
+	       z_riscv_zvt_stats.nested, z_riscv_zvt_stats.lazy_traps, z_riscv_zvt_stats.stores,
+	       z_riscv_zvt_stats.loads);
 	if (!fault_seen) {
 		errors++;
 	}
