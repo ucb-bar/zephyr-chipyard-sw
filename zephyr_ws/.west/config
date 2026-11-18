@@ -1,0 +1,7 @@
+[manifest]
+path = zephyr
+file = west-riscv.yml
+
+[zephyr]
+base = zephyr
+
