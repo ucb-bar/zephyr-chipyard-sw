@@ -38,4 +38,4 @@
 [submodule "modelblaster"]
 	path = modelblaster
 	url = https://github.com/ucb-bar/ModelBlaster.git
-	branch = riskybirdv3
+	branch = rb-clean
