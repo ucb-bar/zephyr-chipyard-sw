@@ -1,0 +1,35 @@
+/*
+ * Memory/console overlay for the riskybird v3 FPGA Rocket combined config
+ * RocketArty200TDroneGemminiSaturnFp16At35Config. Auto-applied by Zephyr for
+ * board chipyard_riscv64. Values from the config's generated DTS:
+ *   main DDR  memory@80000000 (1 GiB)   -> zephyr,sram = ram0
+ *   uart0     serial@10020000           -> console -> /dev/ttyUSB1
+ *   peripheral clk 35 MHz, plic ndev 16
+ * The base dtsi defaults the console to HTIF; move it to the SiFive uart0.
+ */
+/ {
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,sram = &ram0;
+	};
+};
+
+&{/cpus/cpu@0} { clock-frequency = <35000000>; };
+&{/cpus/cpu@1} { status = "disabled"; };
+&{/cpus/cpu@2} { status = "disabled"; };
+&{/cpus/cpu@3} { status = "disabled"; };
+&{/cpus/cpu@4} { status = "disabled"; };
+&{/cpus/cpu@5} { status = "disabled"; };
+&{/cpus/cpu@6} { status = "disabled"; };
+&{/cpus/cpu@7} { status = "disabled"; };
+
+&plic { riscv,max-priority = <7>; riscv,ndev = <16>; };
+
+&ram0 { reg = <0x80000000 0x40000000>; status = "okay"; };
+
+&uart0 { status = "okay"; current-speed = <115200>; interrupts = <10 1>; };
+
+&htif  { status = "disabled"; };
+&flash0 { status = "disabled"; };
+&spad0 { status = "disabled"; };

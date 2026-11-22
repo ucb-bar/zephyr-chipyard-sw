@@ -48,6 +48,13 @@ endif()
 if(DEFINED CTRL_HZ)
   target_compile_definitions(app PRIVATE CTRL_HZ=${CTRL_HZ})
 endif()
+# Estimator-init / hover-target altitude (match the sim spawn to avoid a filter transient).
+if(DEFINED START_Z)
+  target_compile_definitions(app PRIVATE START_Z=${START_Z})
+endif()
+if(DEFINED TARGET_Z)
+  target_compile_definitions(app PRIVATE TARGET_Z=${TARGET_Z})
+endif()
 
 # Threaded producer/consumer build (-DROSE_THREADED=1): io/est/ctrl/vision/keepalive threads.
 set(ROSE_THREADED 0 CACHE STRING "1=threaded producer/consumer controller, 0=single loop")

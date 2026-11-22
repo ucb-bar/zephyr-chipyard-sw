@@ -1,0 +1,93 @@
+/* RoSE co-sim overlay for the navigation controller: the RoSE bridge adapter + the full
+ * flight sensor set (IMU accel/gyro, optical flow, downward ToF) AND the four horizontal
+ * VL53L5CX multizone ToFs. Command IDs / reqrsp channels match
+ * config_gym_IsaacCrazyflieMultiSensorEnv-v0.yaml. Aliases match the shared app / a real
+ * riskybird board (bmi088-accel/-gyro, flow, tof, tof-front/right/back/left).
+ */
+/ {
+	rose0: rose@2000 {
+		compatible = "ucbbar,RoseAdapter";
+		reg = <0x2000 0x1000>;
+		interrupt-parent = <&plic>;
+		interrupts = <3 1>;
+		num-reqrsp-channels = <2>;
+		num-dma-channels = <1>;
+		/* DMA landing zone. On SPIKE this is 0x90000000 (above the 256 MB SRAM), matching
+		 * run_spike_rose_lockstep.sh --rose-dma-base. On the FPGA the RTL RoSEDMA hard-codes
+		 * DMA_address=0x88000000 (RoSEConfigs.scala DstParams) and was never synced to this DT —
+		 * so the guest read 0x90000000 (never written) and saw a FROZEN camera while the DMA wrote
+		 * fresh frames to 0x88000000 (proven by the DMADIAG counter probe: curr_counter ping-pongs
+		 * 5400<->0). Point the guest where the DMA actually writes. The DMA already writes here
+		 * without destabilizing the guest, so 0x88000000 is a safe unused SRAM region on FPGA.
+		 * (Proper long-term fix: change the RTL DMA_address to 0x90000000 + rebuild.) */
+		dma-base-address = <0x88000000>;
+		status = "okay";
+	};
+
+	/* Forward FPV camera (HM01B0-ANA-00FT870, RGB) for DroNet vision nav (ROSE_DRONET_NAV=1).
+	 * Frame requested over the bridge (cmd 0x11) and delivered via DMA0. Real HW binds
+	 * himax,hm01b0 on DT_ALIAS(fpv) with no app change. */
+	rose_cam: rose-cam {
+		compatible = "ucbbar,rose-camera";
+		rose = <&rose0>;
+		rose-cmd = <0x11>;
+		dma-channel = <0>;
+		width = <90>;
+		height = <60>;
+		status = "okay";
+	};
+
+	rose_imu_accel: rose-imu-accel {
+		compatible = "ucbbar,rose-imu";
+		rose = <&rose0>; rose-cmd = <0x12>; rose-channel = <2>;
+		status = "okay";
+	};
+	rose_imu_gyro: rose-imu-gyro {
+		compatible = "ucbbar,rose-imu";
+		rose = <&rose0>; rose-cmd = <0x15>; rose-channel = <2>; is-gyro;
+		status = "okay";
+	};
+	rose_flow: rose-flow {
+		compatible = "ucbbar,rose-flow";
+		rose = <&rose0>; rose-cmd = <0x13>; rose-channel = <1>;
+		status = "okay";
+	};
+	rose_tof: rose-tof {
+		compatible = "ucbbar,rose-tof";
+		rose = <&rose0>; rose-cmd = <0x14>; rose-channel = <1>; decimation = <6>;
+		status = "okay";
+	};
+
+	rose_tof_front: rose-tof-front {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x30>; rose-channel = <1>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_right: rose-tof-right {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x31>; rose-channel = <2>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_back: rose-tof-back {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x32>; rose-channel = <1>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+	rose_tof_left: rose-tof-left {
+		compatible = "ucbbar,rose-tof-zone";
+		rose = <&rose0>; rose-cmd = <0x33>; rose-channel = <2>; zones = <64>; decimation = <13>;
+		status = "okay";
+	};
+
+	aliases {
+		bmi088-accel = &rose_imu_accel;
+		bmi088-gyro  = &rose_imu_gyro;
+		flow         = &rose_flow;
+		tof          = &rose_tof;
+		tof-front    = &rose_tof_front;
+		tof-right    = &rose_tof_right;
+		tof-back     = &rose_tof_back;
+		tof-left     = &rose_tof_left;
+		fpv          = &rose_cam;
+	};
+};

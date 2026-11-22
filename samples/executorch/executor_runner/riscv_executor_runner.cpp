@@ -19,6 +19,7 @@
 #if defined(__ZEPHYR__)
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/arch/cpu.h>   /* arch_curr_cpu() -> hart id */
 #endif
 
 struct _reent * _impure_ptr = nullptr;
@@ -29,6 +30,32 @@ void *__dso_handle = nullptr;
 #include "models_pte.h"   /* registry of N baked .pte models (batched run) */
 #else
 #include "model_pte.h"
+#endif
+
+/* --- Heterogeneous-bitstream support (f2_quad_hetero_norose_tacit_q31_60mhz)
+ *
+ * On the quad hetero SoC the tiles are NOT interchangeable: harts 0,1 are
+ * Rocket+Gemmini elaborated as rv64imafdc (NO vector unit) and harts 2,3 are
+ * Rocket+Saturn V256/D128 (rv64imafdcv, no Gemmini). XNNPACK's RVV
+ * micro-kernels therefore take an illegal-instruction trap anywhere except
+ * harts 2/3, and Zephyr starts main() on hart 0.
+ *
+ * Two things are needed, and BOTH are needed:
+ *   MB_ET_PIN_HART=<n>  run the whole ExecuTorch region on a thread pinned to
+ *                       hart n (k_thread_cpu_pin on a not-yet-started thread;
+ *                       calling it on the running thread is a silent no-op --
+ *                       see modelblaster/harness_tacit/src/main.c).
+ *   MB_ET_THREADS=<n>   clamp the ExecuTorch/XNNPACK pthreadpool. It is sized
+ *                       from sysconf(_SC_NPROCESSORS_ONLN) (= MP_MAX_NUM_CPUS,
+ *                       4 here), and pthreadpool's workers carry no affinity,
+ *                       so a parallelized op would hand vector work to hart 0.
+ *                       n=1 makes every parallelize_* run INLINE on the pinned
+ *                       caller -- which is also the known-good ET config
+ *                       (2-core was ~175x slower on LeNet and faulted in
+ *                       XNNPACK weight packing on MobileNetV2).
+ */
+#if defined(MB_ET_THREADS)
+#include <executorch/extension/threadpool/threadpool.h>
 #endif
 
 /* Opt-in TACIT / L-Trace of just the model execute() (the final, warm
@@ -69,9 +96,22 @@ using executorch::runtime::TensorInfo;
  * used and other data used like the planned memory pool (e.g. memory-planned
  * buffers to use for mutable tensor data).
  */
-const size_t method_allocation_pool_size = 96 * 1024 * 1024;  // bumped from 20MB for MobileNetV2-224 planned activations
+// Sized to hold the (largest, when batched) model's planned activations +
+// setup + inputs. Bump via -DMB_ET_POOL_MB for the utilization-aware default
+// sizing (256 MB baked io needs >96 MB of activations). Needs ram0 to hold it.
+#ifndef MB_ET_POOL_MB
+#define MB_ET_POOL_MB 96
+#endif
+const size_t method_allocation_pool_size = (size_t)MB_ET_POOL_MB * 1024 * 1024;
+// .bss (zeroed, NOLOAD): the previous `input_data_sec` was a LOADED section, so
+// MB_ET_POOL_MB of zeros got baked into the ELF and streamed over the (per-word
+// MMIO) FireSim loader — a 256 MB pool turned a ~12 MB code image into a 268 MB
+// load (~15 min). Plain .bss is NOLOAD (only real code/model bytes transfer) AND
+// boot-zeroed. Zeroing matters: the ET allocator/planner reads pool memory that
+// must start zero — an unzeroed (.noinit) pool faults with a NULL-deref
+// (mcause 5, mtval 0) mid-execute once allocations succeed.
 unsigned char
-	__attribute__((section("input_data_sec"), aligned(16))) method_allocation_pool[method_allocation_pool_size];
+	__attribute__((aligned(16))) method_allocation_pool[method_allocation_pool_size];
 
 /**
  * The temp_allocation_pool is used for allocating temporary data during kernel
@@ -79,8 +119,27 @@ unsigned char
  * Currently a MemoryAllocator is used but a PlatformMemoryAllocator is probably
  * a better fit
  */
-const size_t temp_allocation_pool_size = 1 * 1024 * 1024;
-unsigned char __attribute__((section("input_data_sec"), aligned(16))) temp_allocation_pool[temp_allocation_pool_size];
+#ifndef MB_ET_TEMP_MB
+#define MB_ET_TEMP_MB 1
+#endif
+const size_t temp_allocation_pool_size = (size_t)MB_ET_TEMP_MB * 1024 * 1024;
+unsigned char __attribute__((aligned(16))) temp_allocation_pool[temp_allocation_pool_size];
+
+#ifdef MB_TACIT_TRACE_DMA
+/* On FireSim the TACIT encoder can't print over HTIF (TARGET_PRINT is a spike-sim
+ * hook); it streams to DRAM via the TraceSinkDMA. We reserve a fixed .bss buffer
+ * here — its address is a stable ELF symbol the HOST driver reads back after the
+ * run (`+dump-mem=<addr>:<len>:<file>`), so the trace survives even a target
+ * crash (the DMA already landed the bytes). See samples/tacit/TACIT_TRACING.md. */
+#ifndef MB_TACIT_DMA_BUF_MB
+#define MB_TACIT_DMA_BUF_MB 32
+#endif
+#ifndef MB_TACIT_DMA_BYPASS
+#define MB_TACIT_DMA_BYPASS 0   /* set 1 if the DMA sink needs the SBUS bypass path */
+#endif
+unsigned char __attribute__((aligned(64)))
+	mb_tacit_dma_buf[(size_t)MB_TACIT_DMA_BUF_MB * 1024 * 1024];
+#endif
 
 /* void et_pal_init(void)
 {
@@ -185,7 +244,10 @@ Result<BufferCleanup> prepare_input_tensors(Method &method, MemoryAllocator &all
 		inputs[num_allocated++] = data_ptr;
 
 		Error err = Error::Ok;
-		if (input_buffers.size() > 0)
+		/* `i < size` rather than `size > 0`: .at() would throw past the end,
+		 * and a model whose baked-input count disagrees with its method
+		 * signature must fail loudly, not by unwinding on bare metal. */
+		if (i < input_buffers.size())
 		{
 			auto [buffer, buffer_size] = input_buffers.at(i);
 			if (buffer_size != tensor_meta->nbytes())
@@ -222,6 +284,21 @@ Result<BufferCleanup> prepare_input_tensors(Method &method, MemoryAllocator &all
 			}
 		}
 
+#ifdef MB_MEMDBG
+		// EXPERIMENT (ITERS=1 zero-output culprit): input-side fence + scalar
+		// readback. If adding this fence alone makes convs correct, the failing
+		// edge is scalar-input-fill -> vector-load visibility. The printed addr
+		// vs the output addr (MB_OUTPUT_DBG) tests buffer aliasing.
+		__asm__ volatile("fence rw, rw" ::: "memory");
+		if (t.scalar_type() == ScalarType::Float && t.numel() > 0) {
+			const float* ip = t.const_data_ptr<float>();
+			volatile float v0 = ip[0], vm = ip[t.numel()/2], vl = ip[t.numel()-1];
+			printf("MB_INPUT_DBG idx=%zu addr=%p numel=%zu in[0]=%f in[mid]=%f in[last]=%f\n",
+			       (size_t)i, (const void*)ip, (size_t)t.numel(), (double)v0, (double)vm, (double)vl);
+			fflush(stdout);
+		}
+#endif
+
 		err = method.set_input(t, i);
 
 		if (err != Error::Ok)
@@ -242,9 +319,23 @@ Result<BufferCleanup> prepare_input_tensors(Method &method, MemoryAllocator &all
 // an output checksum. All allocators are constructed fresh on entry, so they
 // reset the shared static pools — a multi-model loop reuses one pool
 // sequentially (only one model's activations are live at a time).
+/* Baked real inputs for the model about to run (set by the MB_MULTI_MODEL loop).
+ * NULL => fall back to the historical all-ones fill. Feeding the SAME input the
+ * PyTorch/ModelBlaster golden was computed from is what makes the on-hardware
+ * output comparable to that golden at all. */
+static const void *const *g_in_data = nullptr;
+static const unsigned int *g_in_size = nullptr;
+static unsigned int g_n_inputs = 0;
+
 static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_size, const char *_mb_tag)
 {
 	std::vector<std::pair<char *, size_t>> input_buffers;
+	for (unsigned int _k = 0; _k < g_n_inputs; ++_k)
+		input_buffers.emplace_back(
+			const_cast<char *>(static_cast<const char *>(g_in_data[_k])),
+			(size_t)g_in_size[_k]);
+	if (g_n_inputs)
+		printf("MB_INPUT_BAKED=%s n=%u bytes0=%u\n", _mb_tag, g_n_inputs, g_in_size[0]);
 	size_t pte_size = model_pte_size;
 
 	ET_LOG(Info, "Model in %p %c", model_pte, model_pte[0]);
@@ -345,7 +436,15 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 	const int _mb_iters = MB_EXEC_ITERS;
 #if defined(MB_TACIT_TRACE_MODEL)
 	LTraceEncoderType *_tacit_enc = l_trace_encoder_get(0);
+#ifdef MB_TACIT_TRACE_DMA
+	/* FireSim: point the encoder at the DMA sink, targeted at our .bss buffer. */
+	LTraceSinkDmaType *_tacit_sink = l_trace_sink_dma_get(0);
+	l_trace_sink_dma_configure_addr(_tacit_sink, (uint64_t)(uintptr_t)mb_tacit_dma_buf,
+									MB_TACIT_DMA_BYPASS);
+	l_trace_encoder_configure_target(_tacit_enc, TARGET_DMA);
+#else
 	l_trace_encoder_configure_target(_tacit_enc, TARGET_PRINT);
+#endif
 #endif
 	for (int _it = 0; _it < _mb_iters; _it++) {
 		unsigned long _mb_cyc_begin, _mb_cyc_end;
@@ -355,6 +454,18 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 		bool _tacit_on = (_it == _mb_iters - 1);
 		if (_tacit_on) l_trace_encoder_start(_tacit_enc);
 #endif
+		// Re-establish inputs before EVERY execute (via set_input, which re-copies
+		// into the method's PLANNED input buffers): the memory planner may reuse a
+		// dead input buffer as scratch/output within an execute, so a repeated
+		// execute would otherwise read stale output as input (the ITERS>1 warm
+		// iterations were reading the previous output => wrong checksums). Writing
+		// get_input()'s buffer is NOT enough — set_input is what lands in the plan.
+#ifndef MB_NO_INPUT_REINIT
+		if (_it > 0) {
+			auto &_reinit = *(new auto(::prepare_input_tensors(*method, method_allocator, input_buffers)));  // leaked
+			(void)_reinit;
+		}
+#endif
 		__asm__ volatile("rdcycle %0" : "=r"(_mb_cyc_begin));
 		status = method->execute();
 		__asm__ volatile("rdcycle %0" : "=r"(_mb_cyc_end));
@@ -362,11 +473,31 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 		if (_tacit_on) {
 			l_trace_encoder_stop(_tacit_enc);
 			for (int _i = 0; _i < 16; _i++) __asm__ volatile("nop"); /* flush */
+#ifdef MB_TACIT_TRACE_DMA
+			/* Drain the sink FIFO to DRAM, then announce the region so the host
+			 * (+dump-mem) knows exactly what to read back. Printed BEFORE any
+			 * post-execute work so it's on the console even if a later model
+			 * faults; the DMA'd bytes are already in DRAM regardless. */
+			_tacit_sink->TR_SK_DMA_FLUSH = 1;
+			while (_tacit_sink->TR_SK_DMA_FLUSH_DONE == 0) { }
+			unsigned long _tr_bytes = (unsigned long)_tacit_sink->TR_SK_DMA_COUNT;
+			printf("MB_TACIT_DMA_TRACE tag=%s addr=0x%lx bytes=%lu bufsz=%lu\n",
+				   _mb_tag, (unsigned long)(uintptr_t)mb_tacit_dma_buf, _tr_bytes,
+				   (unsigned long)sizeof(mb_tacit_dma_buf));
+			fflush(stdout);
+#endif
 		}
 #endif
 		printf("EXECUTORCH_EXECUTE_CYCLES[%s][%d]=%lu\n", _mb_tag, _it, _mb_cyc_end - _mb_cyc_begin);
 		fflush(stdout);
 	}
+	// The final execute()'s outputs are written by the Saturn vector unit (RVV
+	// stores). Make them visible to the scalar reads below (get_outputs/checksum)
+	// with a full memory fence. Without this, a single iteration (MB_EXEC_ITERS=1)
+	// reads all-zeros on FireSim; a 2nd iteration only "fixed" it by incidentally
+	// forcing the prior stores through. (This SoC has no CBO/cache-mgmt config, so
+	// rely on the RVV/scalar coherence + fence ordering.)
+	__asm__ volatile("fence rw, rw" ::: "memory");
 	size_t executor_memsize = method_allocator.used_size() - executor_membase;
 
 	ET_LOG(Info, "model_pte_loaded_size:     %lu bytes.", pte_size);
@@ -406,6 +537,16 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 	{
 		Tensor t = outputs[i].toTensor();
 		const int n = (int)t.numel();
+#ifdef MB_MEMDBG
+		// Output buffer address (compare to MB_INPUT_DBG addr for aliasing) + a
+		// scalar readback of the raw output region right here (before the checksum).
+		if (t.scalar_type() == ScalarType::Float && n > 0) {
+			const float* op = t.const_data_ptr<float>();
+			printf("MB_OUTPUT_DBG idx=%d addr=%p numel=%d out[0]=%f out[mid]=%f out[last]=%f\n",
+			       i, (const void*)op, n, (double)op[0], (double)op[n/2], (double)op[n-1]);
+			fflush(stdout);
+		}
+#endif
 		// The output might be collected and parsed so printf() is used instead
 		// of ET_LOG() here.
 		// FireSim's HTIF console costs ~millions of cycles per char, so dumping
@@ -422,14 +563,24 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 				printf("Output[%d][%d]: %f\n", i, j, t.const_data_ptr<float>()[j]);
 		}
 #else
+		// The checksum alone is enough to validate against the host golden; the
+		// first-few-element dump is pure HTIF overhead on FireSim (each line
+		// ~millions of cycles). Gate it behind MB_ET_SAMPLE_OUTPUT for debugging.
 		if (t.scalar_type() == ScalarType::Int)
 		{
 			const int *p = t.const_data_ptr<int>();
 			long long sum = 0;
 			for (int j = 0; j < n; ++j) sum += p[j];
 			printf("Output[%d] numel=%d checksum=%lld\n", i, n, sum);
-			for (int j = 0; j < n && j < 8; ++j)
-				printf("Output[%d][%d]: %d\n", i, j, p[j]);
+#ifdef MB_ET_SAMPLE_OUTPUT
+#ifndef MB_ET_SAMPLE_N
+#define MB_ET_SAMPLE_N 64
+#endif
+			{ int _sn = n < MB_ET_SAMPLE_N ? n : MB_ET_SAMPLE_N;
+			  for (int j = 0; j < _sn; ++j) printf("O[%d][%d]=%d\n", i, j, p[j]);
+			  int _st = n / 64; if (_st < 1) _st = 1;   // strided sample across the rest
+			  for (int j = _sn; j < n; j += _st) printf("O[%d][%d]=%d\n", i, j, p[j]); }
+#endif
 		}
 		else
 		{
@@ -437,8 +588,17 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 			double sum = 0.0;
 			for (int j = 0; j < n; ++j) sum += (double)p[j];
 			printf("Output[%d] numel=%d checksum=%f\n", i, n, sum);
-			for (int j = 0; j < n && j < 8; ++j)
-				printf("Output[%d][%d]: %f\n", i, j, p[j]);
+#ifdef MB_ET_SAMPLE_OUTPUT
+#ifndef MB_ET_SAMPLE_N
+#define MB_ET_SAMPLE_N 64
+#endif
+			// Dump first MB_ET_SAMPLE_N output elems + a strided sample across the
+			// rest, so a spike-vs-FireSim diff shows WHERE the kernel diverges.
+			{ int _sn = n < MB_ET_SAMPLE_N ? n : MB_ET_SAMPLE_N;
+			  for (int j = 0; j < _sn; ++j) printf("O[%d][%d]=%.6f\n", i, j, p[j]);
+			  int _st = n / 64; if (_st < 1) _st = 1;
+			  for (int j = _sn; j < n; j += _st) printf("O[%d][%d]=%.6f\n", i, j, p[j]); }
+#endif
 		}
 #endif
 	}
@@ -446,9 +606,41 @@ static int run_one_pte(const unsigned char *model_pte, unsigned int model_pte_si
 	return 0; /* end run_one_pte — locals (method/program/allocators) destruct here */
 }
 
-int main()
+/* The whole ExecuTorch region, factored out of main() so it can be run on a
+ * hart-pinned thread (see the MB_ET_PIN_HART note at the top). */
+static void mb_et_region(void)
 {
 	executorch::runtime::runtime_init();
+
+#if defined(MB_ET_THREADS)
+	{
+		auto *tp = ::executorch::extension::threadpool::get_threadpool();
+		unsigned before = (unsigned)tp->get_thread_count();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+		bool ok = tp->_unsafe_reset_threadpool((uint32_t)(MB_ET_THREADS));
+#pragma GCC diagnostic pop
+		unsigned after = (unsigned)tp->get_thread_count();
+		printf("MB_ET_THREADPOOL from=%u to=%u ok=%d\n", before, after, (int)ok);
+		fflush(stdout);
+		/* Loud, not silent: with more than one pool thread on the hetero
+		 * bitstream a parallelized XNNPACK op runs vector code on a
+		 * Gemmini-only hart and traps mid-model. */
+		if (after != (unsigned)(MB_ET_THREADS)) {
+			printf("FATAL: threadpool clamp to %d failed (got %u)\n",
+			       (int)(MB_ET_THREADS), after);
+			fflush(stdout);
+#if defined(__ZEPHYR__)
+			k_panic();
+#endif
+		}
+	}
+#endif
+
+#if defined(__ZEPHYR__) && defined(CONFIG_SMP)
+	printf("MB_ET_HART=%d\n", (int)arch_curr_cpu()->id); fflush(stdout);
+#endif
+
 #ifdef MB_MULTI_MODEL
 	// Batched: run every baked model sequentially under ONE boot (and, on
 	// FireSim, ONE infrasetup). Every model's io lives in rodata; only the
@@ -456,11 +648,57 @@ int main()
 	// per call reset it), so N models cost N*io of RAM + one activation set.
 	for (unsigned _mi = 0; _mi < mb_num_models; ++_mi) {
 		printf("MB_MODEL_BEGIN=%s\n", mb_models[_mi].name); fflush(stdout);
+		g_n_inputs = mb_models[_mi].n_inputs;
+		static const void *_in_d[8]; static unsigned int _in_s[8];
+		if (g_n_inputs > 8) g_n_inputs = 8;
+		for (unsigned _k = 0; _k < g_n_inputs; ++_k) {
+			_in_d[_k] = (const void *)mb_models[_mi].inputs[_k].data;
+			_in_s[_k] = mb_models[_mi].inputs[_k].size;
+		}
+		g_in_data = _in_d; g_in_size = _in_s;
 		run_one_pte(mb_models[_mi].data, mb_models[_mi].size, mb_models[_mi].name);
+		g_n_inputs = 0; g_in_data = nullptr; g_in_size = nullptr;
 		printf("MB_MODEL_END=%s\n", mb_models[_mi].name); fflush(stdout);
 	}
 #else
 	run_one_pte(model_pte, model_pte_size, "model");
+#endif
+}
+
+#if defined(MB_ET_PIN_HART) && defined(__ZEPHYR__) && defined(CONFIG_SMP)
+/* 512 KB: the ET setup path (XNNPACK weight packing) is stack-hungry, and this
+ * thread replaces main(), whose stack CONFIG_MAIN_STACK_SIZE sized. */
+#ifndef MB_ET_PIN_STACK
+#define MB_ET_PIN_STACK 524288
+#endif
+K_THREAD_STACK_DEFINE(mb_et_stack, MB_ET_PIN_STACK);
+static struct k_thread mb_et_thread;
+static void mb_et_entry(void *a, void *b, void *c) { (void)a;(void)b;(void)c; mb_et_region(); }
+#endif
+
+int main()
+{
+#if defined(MB_ET_PIN_HART) && defined(__ZEPHYR__) && defined(CONFIG_SMP)
+	/* k_thread_cpu_pin() on the RUNNING thread is a silent no-op
+	 * (kernel/cpu_mask.c only sets the mask when the thread is prevented from
+	 * running), so create with K_FOREVER, pin, then start. Fail loudly: the
+	 * wrong hart is an illegal-instruction trap deep inside a micro-kernel,
+	 * which reads like a bitstream fault and is not. */
+	k_tid_t t = k_thread_create(&mb_et_thread, mb_et_stack,
+				    K_THREAD_STACK_SIZEOF(mb_et_stack),
+				    mb_et_entry, NULL, NULL, NULL,
+				    K_PRIO_PREEMPT(0), 0, K_FOREVER);
+	int rc = k_thread_cpu_pin(t, MB_ET_PIN_HART);
+	if (rc != 0) {
+		printf("FATAL: k_thread_cpu_pin(hart=%d) failed: %d\n",
+		       (int)(MB_ET_PIN_HART), rc);
+		fflush(stdout);
+		k_panic();
+	}
+	k_thread_start(t);
+	k_thread_join(t, K_FOREVER);
+#else
+	mb_et_region();
 #endif
 	ET_LOG(Info, "Program complete, exiting.");
 	ET_LOG(Info, "\04");
